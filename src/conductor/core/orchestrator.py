@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +37,51 @@ def _append_log(log_path: Path, message: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"{message}\n")
+
+
+def create_worktree(
+    state: ConductorState,
+    run_list_idx: int,
+    stage_idx: int,
+    repo_path: Path,
+    worktrees_base: Path,
+) -> None:
+    """Create a git worktree for a stage, chaining branches correctly.
+
+    Branch naming: conductor/<project>/<run>/<stage>
+    Start point priority:
+      1. Previous stage's branch (if stage_idx > 0)
+      2. Last dependency's last stage branch (if depends_on is set)
+      3. state.base_branch (independent first stage)
+
+    Updates stage.branch and stage.worktree in-place.
+    """
+    run = state.runs[run_list_idx]
+    stage = run.stages[stage_idx]
+
+    branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
+
+    if stage_idx > 0:
+        start_point = run.stages[stage_idx - 1].branch
+    elif run.depends_on:
+        run_by_index = {r.index: r for r in state.runs}
+        dep_run = run_by_index[run.depends_on[-1]]
+        start_point = dep_run.stages[-1].branch
+    else:
+        start_point = state.base_branch
+
+    worktree_path = worktrees_base / run.name / stage.name
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(worktree_path), start_point],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+    )
+
+    stage.branch = branch
+    stage.worktree = str(worktree_path)
 
 
 def activate_ready_runs(state: ConductorState) -> list[int]:
