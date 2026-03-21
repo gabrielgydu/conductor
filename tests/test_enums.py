@@ -57,3 +57,30 @@ def test_enum_from_string():
 def test_invalid_enum_value():
     with pytest.raises(ValueError):
         RunStatus("invalid")
+
+
+def test_stage_status_has_spec_stages():
+    assert StageStatus.SPEC_INIT in StageStatus
+    assert StageStatus.SPEC_RUNNING in StageStatus
+    assert StageStatus.SPEC_NEEDS_INPUT in StageStatus
+    assert StageStatus.SPEC_COMPLETE in StageStatus
+
+
+def test_stage_status_has_stalled():
+    assert StageStatus.STALLED in StageStatus
+
+
+def test_speccer_status_has_exploring():
+    assert SpeccerStatus.EXPLORING in SpeccerStatus
+
+
+def test_fixer_status_has_waiting_ci():
+    assert FixerStatus.WAITING_CI in FixerStatus
+
+
+def test_brain_action_has_steer():
+    assert BrainAction.STEER in BrainAction
+
+
+def test_integration_status_has_conflict_resolving():
+    assert IntegrationStatus.CONFLICT_RESOLVING in IntegrationStatus

@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from conductor.core.enums import RunStatus, StageStatus, IntegrationStatus
+from conductor.core.enums import RunStatus, StageStatus, IntegrationStatus, SpeccerStatus
 from conductor.core.models import (
     ConductorState,
     RunState,
@@ -14,33 +14,35 @@ from conductor.core.models import (
 )
 
 
+def make_run(index: int, name: str) -> RunState:
+    wiring = ContextWiring(sources=["feat-a"], targets=["feat-b"])
+    stages = [
+        StageState(name="speccing", spec_mode="full", context_wiring=wiring),
+        StageState(name="brain", spec_mode="full", status="active", context_wiring=wiring),
+        StageState(name="fixer", spec_mode="full", status="pending", context_wiring=wiring),
+    ]
+    monitor = MonitorState(stall_count=0, ci_pass_count=3, ci_fail_count=1)
+    return RunState(
+        index=index,
+        name=name,
+        description=f"{name} feature run",
+        depends_on=[],
+        stages=stages,
+        monitor=monitor,
+    )
+
+
 @pytest.fixture
 def sample_conductor_state() -> ConductorState:
-    wiring = ContextWiring(sources=["feat-a"], targets=["feat-b"])
-
-    def make_run(run_id: str, feature: str) -> RunState:
-        stages = [
-            StageState(id=f"{run_id}-s1", name="speccer", status="done", wiring=wiring),
-            StageState(id=f"{run_id}-s2", name="brain", status="active", wiring=wiring),
-            StageState(id=f"{run_id}-s3", name="fixer", status="pending", wiring=wiring),
-        ]
-        monitor = MonitorState(ci_pass_count=3, ci_fail_count=1)
-        return RunState(
-            id=run_id,
-            feature=feature,
-            status="active",
-            stages=stages,
-            monitor=monitor,
-        )
-
     runs = [
-        make_run("run-0", "feature-alpha"),
-        make_run("run-1", "feature-beta"),
+        make_run(0, "feature-alpha"),
+        make_run(1, "feature-beta"),
     ]
 
     integration = IntegrationState(
-        status="conflict",
-        conflicts=[
+        branch="integration/test",
+        conflicts_resolved=[],
+        conflicts_unresolved=[
             ConflictRecord(
                 file="src/shared.py",
                 feature_a="feature-alpha",
@@ -52,6 +54,7 @@ def sample_conductor_state() -> ConductorState:
     )
 
     return ConductorState(
+        project_name="test-project",
         check_interval_s=300,
         runs=runs,
         integration=integration,

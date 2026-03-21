@@ -66,49 +66,84 @@ KNOWN_KEY = "-home-user-dev-repo"
 CONDUCTOR_BASE = Path.home() / ".conductor" / "projects" / KNOWN_KEY
 
 
-def make_resolver(tmp_path):
+def make_resolver(tmp_path=None):
     """Create a StorageResolver with _resolve_repo_root mocked."""
     with patch("conductor.core.storage._resolve_repo_root", return_value=KNOWN_ROOT):
         return StorageResolver(KNOWN_ROOT)
 
 
 def test_base_dir_location():
-    resolver = make_resolver(None)
+    resolver = make_resolver()
     assert resolver.base_dir == CONDUCTOR_BASE
 
 
 def test_conductor_state_path(tmp_path):
     resolver = make_resolver(tmp_path)
-    path = resolver.conductor_state_path()
+    path = resolver.conductor_state("my-project")
+    assert "conductor/my-project" in str(path)
     assert path.name == "CONDUCTOR-STATE.json"
-    assert path.parent == CONDUCTOR_BASE
 
 
 def test_conductor_log_path(tmp_path):
     resolver = make_resolver(tmp_path)
-    path = resolver.conductor_log_path()
+    path = resolver.conductor_log("my-project")
+    assert "conductor/my-project" in str(path)
     assert path.name == "CONDUCTOR-LOG.md"
-    assert path.parent == CONDUCTOR_BASE
 
 
 def test_conductor_audit_path(tmp_path):
     resolver = make_resolver(tmp_path)
-    path = resolver.conductor_audit_path()
+    path = resolver.conductor_audit("my-project")
+    assert "conductor/my-project" in str(path)
     assert path.name == "CONDUCTOR-AUDIT.jsonl"
-    assert path.parent == CONDUCTOR_BASE
 
 
 def test_brain_calls_dir_path(tmp_path):
     resolver = make_resolver(tmp_path)
-    path = resolver.brain_calls_dir()
+    path = resolver.brain_calls_dir("my-project")
+    assert "conductor/my-project" in str(path)
     assert path.name == "brain-calls"
-    assert path.parent == CONDUCTOR_BASE
 
 
 def test_run_description_path(tmp_path):
     resolver = make_resolver(tmp_path)
-    path = resolver.run_description_path(0, "stage1")
-    assert path.name == "run-0-stage1-description.md"
+    path = resolver.run_description("my-project", 0, 1)
+    assert "conductor/my-project" in str(path)
+    assert "runs/run-0/stage-1" in str(path)
+    assert path.name == "DESCRIPTION.md"
+
+
+def test_conductor_dir_path(tmp_path):
+    resolver = make_resolver(tmp_path)
+    path = resolver.conductor_dir("proj")
+    assert str(path).endswith("conductor/proj")
+
+
+def test_conductor_stats_path(tmp_path):
+    resolver = make_resolver(tmp_path)
+    path = resolver.conductor_stats("proj")
+    assert str(path).endswith("conductor/proj/STATS.json")
+
+
+def test_conductor_brief_path(tmp_path):
+    resolver = make_resolver(tmp_path)
+    path = resolver.conductor_brief("proj")
+    assert str(path).endswith("conductor/proj/FEATURE-BRIEF.md")
+
+
+def test_prompts_dir_path(tmp_path):
+    resolver = make_resolver(tmp_path)
+    path = resolver.prompts_dir("feat")
+    assert str(path).endswith("features/feat/prompts")
+
+
+def test_multiple_projects_isolated(tmp_path):
+    resolver = make_resolver(tmp_path)
+    path_a = resolver.conductor_state("proj-a")
+    path_b = resolver.conductor_state("proj-b")
+    assert path_a != path_b
+    assert "proj-a" in str(path_a)
+    assert "proj-b" in str(path_b)
 
 
 def test_feature_dir_path(tmp_path):
@@ -146,5 +181,6 @@ def test_parent_dirs_created(tmp_path):
             return_value=tmp_path,
         ):
             resolver = StorageResolver(KNOWN_ROOT)
-            path = resolver.conductor_state_path()
+            # conductor_dir returns base_dir/conductor/proj; _path creates its parent (base_dir/conductor)
+            path = resolver.conductor_dir("my-project")
             assert path.parent.exists()
