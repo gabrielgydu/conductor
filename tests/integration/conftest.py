@@ -253,10 +253,13 @@ class MockSpeccer:
         self._invoke_count += 1
         self._invocations.append({"window": window_name, "cmd": cmd, "count": self._invoke_count})
 
-        # Determine status to write
+        # Determine status to write:
+        # - First fail_count invocations: FAILED (explicit failure, triggers retry)
+        # - Next invocation after fails: NEEDS_INPUT (if needs_input=True)
+        # - All subsequent: final_status
         if self._invoke_count <= self._fail_count:
             status = "FAILED"
-        elif self._needs_input:
+        elif self._needs_input and self._invoke_count == self._fail_count + 1:
             status = "NEEDS_INPUT"
         else:
             status = self._final_status
@@ -266,6 +269,18 @@ class MockSpeccer:
         if progress_path:
             progress_path.parent.mkdir(parents=True, exist_ok=True)
             progress_path.write_text(f"STATUS: {status}\n")
+            # Write QUESTIONS.md alongside for NEEDS_INPUT scenarios
+            if status == "NEEDS_INPUT":
+                questions_path = progress_path.parent / "QUESTIONS.md"
+                questions_path.write_text(
+                    "## Round 1 Questions\n\n"
+                    "### Q1: Scope\n"
+                    "**Question:** What scope should we cover?\n"
+                    "**Answer:**\n\n"
+                    "### Q2: Auth\n"
+                    "**Question:** What auth method?\n"
+                    "**Answer:**\n"
+                )
 
     def _find_progress_path(self, cmd: str, storage_path: Path | None) -> Path | None:
         """Try to extract or construct a PROGRESS.md path from the command."""
