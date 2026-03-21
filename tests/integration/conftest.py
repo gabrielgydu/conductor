@@ -403,6 +403,48 @@ def tmp_git_repo(tmp_path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# RealMergeRepo
+# ---------------------------------------------------------------------------
+
+
+class RealMergeRepo:
+    """A real git repo with helpers for creating feature branches."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def create_branch(self, name: str, files: dict[str, str]) -> None:
+        """Create a branch from main with the given file contents."""
+        subprocess.run(["git", "-C", str(self.path), "checkout", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.path), "checkout", "-b", name], check=True, capture_output=True)
+        for filename, content in files.items():
+            file_path = self.path / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content)
+            subprocess.run(["git", "-C", str(self.path), "add", filename], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.path), "commit", "-m", f"changes on {name}"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(self.path), "checkout", "main"], check=True, capture_output=True)
+
+
+@pytest.fixture
+def real_merge_repo(tmp_path) -> RealMergeRepo:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@test.com"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True, capture_output=True)
+    readme = repo / "README.md"
+    readme.write_text("# Test Repo\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    return RealMergeRepo(repo)
+
+
+# ---------------------------------------------------------------------------
 # TmpStorageDir
 # ---------------------------------------------------------------------------
 

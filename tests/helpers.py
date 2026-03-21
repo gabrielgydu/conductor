@@ -6,8 +6,8 @@ import asyncio
 import json
 from pathlib import Path
 
-from conductor.core.enums import RunStatus, StageStatus
-from conductor.core.models import ConductorState, RunState, StageState, load_state
+from conductor.core.enums import IntegrationStatus, RunStatus, StageStatus
+from conductor.core.models import ConductorState, IntegrationState, RunState, StageState, load_state
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +32,18 @@ def make_run_state(
         depends_on=depends_on or [],
         stages=stage_list,
         status=status,
+    )
+
+
+def make_integration_state(
+    status: IntegrationStatus = IntegrationStatus.PENDING,
+    branch: str = "integration/test",
+    merged_runs: list[int] | None = None,
+) -> IntegrationState:
+    return IntegrationState(
+        status=status,
+        branch=branch,
+        merged_runs=merged_runs or [],
     )
 
 
