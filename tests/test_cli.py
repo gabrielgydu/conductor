@@ -35,12 +35,12 @@ def test_conductor_help():
     )
 
 
-def test_conductor_init_stub():
+def test_conductor_init():
     from conductor.cli import main
 
     stdout, stderr, code = _run_main(main, ["conductor", "init", "--name", "test"])
     assert code == 0
-    assert "Not implemented yet" in stdout
+    assert "Initialized" in stdout
 
 
 def test_conductor_unknown_subcommand():

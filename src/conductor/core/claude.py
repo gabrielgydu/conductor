@@ -29,7 +29,13 @@ def _extract_tokens_from_stdout(stdout_text: str) -> dict[str, int] | None:
         except json.JSONDecodeError:
             continue
         if event.get("type") == "result":
-            usage = event.get("result", {}).get("usage", {})
+            result_val = event.get("result", {})
+            if isinstance(result_val, str):
+                # result can be a string in some stream-json formats
+                continue
+            usage = result_val.get("usage", {})
+            if isinstance(usage, str):
+                continue
             return {
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
