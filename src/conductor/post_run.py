@@ -38,7 +38,7 @@ async def review_learnings(state: ConductorState, storage) -> str | None:
     )
 
     try:
-        result = await run_claude(prompt, model="claude-opus-4-6", max_turns=1)
+        result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=1)
         return result.output
     except Exception:
         logger.exception("Learnings review failed")
@@ -76,7 +76,7 @@ async def generate_audit_report(state: ConductorState, storage) -> str | None:
     )
 
     try:
-        result = await run_claude(prompt, model="claude-opus-4-6", max_turns=1)
+        result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=1)
         return result.output
     except Exception:
         logger.exception("Audit report generation failed")

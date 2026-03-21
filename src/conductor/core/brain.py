@@ -37,7 +37,7 @@ async def brain_diagnose_runner(
         f"Please diagnos the issue and suggest an action (retry, steer, or block)."
     )
 
-    result = await run_claude(prompt, model="claude-opus-4-6")
+    result = await run_claude(prompt, model="claude-opus-4-6[1m]")
 
     answer_text = ""
     for line in result.output.splitlines():
@@ -110,7 +110,7 @@ async def brain_answer_questions(
         f"{questions_content}"
     )
 
-    result = await run_claude(prompt, model="claude-opus-4-6")
+    result = await run_claude(prompt, model="claude-opus-4-6[1m]")
 
     # Extract assistant content from stream-json output
     answer_text = ""
