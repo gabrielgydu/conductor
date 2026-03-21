@@ -35,22 +35,38 @@ class StorageResolver:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    def conductor_state_path(self) -> Path:
-        return self._path("CONDUCTOR-STATE.json")
+    def conductor_dir(self, project_name: str) -> Path:
+        return self._path("conductor", project_name)
 
-    def conductor_log_path(self) -> Path:
-        return self._path("CONDUCTOR-LOG.md")
+    def conductor_state(self, project_name: str) -> Path:
+        return self.conductor_dir(project_name) / "CONDUCTOR-STATE.json"
 
-    def conductor_audit_path(self) -> Path:
-        return self._path("CONDUCTOR-AUDIT.jsonl")
+    def conductor_log(self, project_name: str) -> Path:
+        return self.conductor_dir(project_name) / "CONDUCTOR-LOG.md"
 
-    def brain_calls_dir(self) -> Path:
-        d = self.base_dir / "brain-calls"
+    def conductor_audit(self, project_name: str) -> Path:
+        return self.conductor_dir(project_name) / "CONDUCTOR-AUDIT.jsonl"
+
+    def brain_calls_dir(self, project_name: str) -> Path:
+        d = self.conductor_dir(project_name) / "brain-calls"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def run_description_path(self, run_index: int, stage_name: str) -> Path:
-        return self._path(f"run-{run_index}-{stage_name}-description.md")
+    def run_description(self, project_name: str, run_index: int, stage_index: int) -> Path:
+        d = self.conductor_dir(project_name) / "runs" / f"run-{run_index}" / f"stage-{stage_index}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "DESCRIPTION.md"
+
+    def conductor_stats(self, project_name: str) -> Path:
+        return self.conductor_dir(project_name) / "STATS.json"
+
+    def conductor_brief(self, project_name: str) -> Path:
+        return self.conductor_dir(project_name) / "FEATURE-BRIEF.md"
+
+    def prompts_dir(self, feature_name: str) -> Path:
+        d = self.base_dir / "features" / feature_name / "prompts"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def feature_dir(self, feature: str) -> Path:
         d = self.base_dir / "features" / feature
