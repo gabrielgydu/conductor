@@ -21,6 +21,7 @@ dev = [
 [project.scripts]
 conductor = "conductor.cli:main"
 speccer = "speccer.cli:main"
+runner = "runner.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

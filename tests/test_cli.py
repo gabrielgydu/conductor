@@ -64,11 +64,12 @@ def test_speccer_help():
     )
 
 
-def test_speccer_init_stub():
+def test_speccer_init_creates_progress(tmp_path):
     from speccer.cli import main
 
+    spec_dir = tmp_path / "spec"
     stdout, stderr, code = _run_main(
-        main, ["speccer", "init", "--feature", "test", "--mode", "backend"]
+        main, ["speccer", "init", "--feature", "test", "--mode", "backend", "--spec-dir", str(spec_dir)]
     )
     assert code == 0
-    assert "Not implemented yet" in stdout
+    assert (spec_dir / "PROGRESS.md").exists()
