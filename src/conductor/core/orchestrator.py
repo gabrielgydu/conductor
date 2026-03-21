@@ -38,6 +38,42 @@ def _append_log(log_path: Path, message: str) -> None:
         f.write(f"{message}\n")
 
 
+def activate_ready_runs(state: ConductorState) -> list[int]:
+    """Activate runs whose dependencies are satisfied; block runs whose deps are blocked.
+
+    Returns a list of run indices that were activated in this call.
+    """
+    run_by_index: dict[int, object] = {run.index: run for run in state.runs}
+    activated: list[int] = []
+
+    for run in state.runs:
+        if run.status != RunStatus.PENDING:
+            continue
+
+        # Check dependency statuses
+        blocked = any(
+            run_by_index[dep].status == RunStatus.BLOCKED  # type: ignore[union-attr]
+            for dep in run.depends_on
+            if dep in run_by_index
+        )
+        if blocked:
+            run.status = RunStatus.BLOCKED
+            continue
+
+        all_done = all(
+            run_by_index[dep].status == RunStatus.DONE  # type: ignore[union-attr]
+            for dep in run.depends_on
+            if dep in run_by_index
+        )
+        if all_done:
+            run.status = RunStatus.ACTIVE
+            if run.stages:
+                run.stages[run.current_stage].status = StageStatus.SPEC_RUNNING
+            activated.append(run.index)
+
+    return activated
+
+
 async def conductor_run_loop(
     state: ConductorState,
     config: ConductorConfig,
