@@ -1,4 +1,5 @@
 """E2E pipeline tests — full lifecycle via conductor_run_loop with composed mocks."""
+
 from __future__ import annotations
 
 import sys
@@ -21,9 +22,11 @@ from helpers import (
 
 def _make_spawn_callback(mock_speccer, mock_tmux):
     """Return a spawn callback that drives MockSpeccer and marks window dead on each spawn."""
+
     def callback(name: str, cmd: str) -> None:
         mock_speccer._handle_spawn(name, cmd)
         mock_tmux.set_window_alive(name, False)
+
     return callback
 
 
@@ -62,7 +65,9 @@ async def test_single_run_full_pipeline(e2e_env, tmp_storage_dir):
     # CONDUCTOR-LOG.md contains lifecycle events
     conductor_log = tmp_storage_dir / "conductor" / "pipeline-test" / "CONDUCTOR-LOG.md"
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
-    assert_log_contains_events(conductor_log, ["SPEC_INIT", "SPEC_COMPLETE", "GENERATED"])
+    assert_log_contains_events(
+        conductor_log, ["SPEC_INIT", "SPEC_COMPLETE", "GENERATED"]
+    )
 
     # MockTmux shows at least one speccer spawn
     spawned = e2e_env.tmux.get_spawned_commands()
@@ -105,7 +110,9 @@ async def test_multi_run_with_deps(e2e_env, tmp_storage_dir):
         )
 
     # CONDUCTOR-LOG.md contains events for all runs
-    conductor_log = tmp_storage_dir / "conductor" / "multi-run-test" / "CONDUCTOR-LOG.md"
+    conductor_log = (
+        tmp_storage_dir / "conductor" / "multi-run-test" / "CONDUCTOR-LOG.md"
+    )
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
     log_content = conductor_log.read_text()
     for run_name in ("run-a", "run-b", "run-c"):

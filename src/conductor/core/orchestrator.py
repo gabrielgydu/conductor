@@ -10,7 +10,7 @@ from pathlib import Path
 import conductor.core.tmux as _tmux_module
 from conductor.core.brain import brain_answer_questions, brain_diagnose_runner
 from conductor.core.enums import RunStatus, StageStatus
-from conductor.core.models import ConductorState
+from conductor.core.models import ConductorState, atomic_save
 from conductor.core.storage import StorageResolver
 
 
@@ -316,6 +316,29 @@ async def conductor_run_loop(
                     else:
                         run.monitor.stall_count = 0
                         run.monitor.last_progress_hash = current_hash
+
+        # Integration merge trigger
+        all_terminal = all(
+            r.status in (RunStatus.DONE, RunStatus.BLOCKED) for r in state.runs
+        )
+        done_count = sum(1 for r in state.runs if r.status == RunStatus.DONE)
+
+        if all_terminal and done_count >= 2 and state.integration is None:
+            try:
+                from conductor.integration.merge import run_integration_merge
+
+                state.integration = await run_integration_merge(state, storage)
+                atomic_save(state, storage.conductor_state(state.project_name))
+                _append_log(
+                    conductor_log,
+                    f"INTEGRATION_MERGE: status={state.integration.status}",
+                )
+            except Exception as exc:
+                from conductor.core.models import IntegrationState
+
+                state.integration = IntegrationState(status="failed", branch="")
+                atomic_save(state, storage.conductor_state(state.project_name))
+                _append_log(conductor_log, f"INTEGRATION_MERGE_FAILED: {exc}")
 
         if not has_active_work:
             break

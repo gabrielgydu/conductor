@@ -1,10 +1,11 @@
 """Tests for conductor.core.claude — TDD Phase 2."""
+
 import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from conductor.core.claude import ClaudeResult, run_claude, run_claude_steerable, SteerableSession
+from conductor.core.claude import ClaudeResult, run_claude, run_claude_steerable
 
 
 # ---------------------------------------------------------------------------
@@ -19,7 +20,9 @@ SAMPLE_STREAM_JSON_LINES = [
 SAMPLE_STREAM_JSON_OUTPUT = b"".join(SAMPLE_STREAM_JSON_LINES)
 
 
-def make_mock_proc(stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readline_lines=None):
+def make_mock_proc(
+    stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readline_lines=None
+):
     """Build a mock asyncio subprocess."""
     proc = MagicMock()
     proc.returncode = returncode
@@ -41,8 +44,10 @@ def make_mock_proc(stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readlin
     if readline_lines is not None:
         stdout = MagicMock()
         lines_iter = iter(readline_lines + [b""])
+
         async def readline():
             return next(lines_iter)
+
         stdout.readline = readline
         proc.stdout = stdout
 
@@ -53,10 +58,11 @@ def make_mock_proc(stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readlin
 # run_claude tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_run_claude_basic():
     proc = make_mock_proc()
-    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_claude("Say hello")
     assert isinstance(result, ClaudeResult)
     assert result.exit_code == 0
@@ -68,7 +74,9 @@ async def test_run_claude_basic():
 @pytest.mark.asyncio
 async def test_run_claude_with_model():
     proc = make_mock_proc()
-    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
         await run_claude("hello", model="claude-opus-4-6")
     call_args = mock_exec.call_args[0]
     assert "--model" in call_args
@@ -79,7 +87,9 @@ async def test_run_claude_with_model():
 @pytest.mark.asyncio
 async def test_run_claude_prompt_via_stdin():
     proc = make_mock_proc()
-    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
         await run_claude("my prompt text")
     # prompt must NOT appear in command args
     call_args = mock_exec.call_args[0]
@@ -100,7 +110,9 @@ async def test_run_claude_nonzero_exit():
 @pytest.mark.asyncio
 async def test_run_claude_append_args():
     proc = make_mock_proc()
-    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
         await run_claude("hello", append_args=["--flag", "value"])
     call_args = list(mock_exec.call_args[0])
     assert "--flag" in call_args
@@ -110,6 +122,7 @@ async def test_run_claude_append_args():
 # ---------------------------------------------------------------------------
 # SteerableSession tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_steerable_session_send():
@@ -138,7 +151,7 @@ async def test_steerable_session_send():
 async def test_steerable_session_poll():
     lines = [
         b'{"type":"assistant","content":"Hello"}\n',
-        b'not-json\n',
+        b"not-json\n",
         b'{"type":"ping"}\n',
         b"",
     ]
@@ -189,9 +202,11 @@ async def test_steerable_session_idle_timeout():
     proc.stdin = stdin
 
     stdout = MagicMock()
+
     async def slow_readline():
         await asyncio.sleep(100)  # never returns in time
         return b""
+
     stdout.readline = slow_readline
     proc.stdout = stdout
 
@@ -239,7 +254,7 @@ async def test_ndjson_format():
     ]
     proc = make_mock_proc(readline_lines=lines)
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
-        session = await run_claude_steerable("hello world")
+        await run_claude_steerable("hello world")
 
     # The initial prompt write
     first_write = proc.stdin.write.call_args_list[0][0][0]

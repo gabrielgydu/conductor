@@ -4,12 +4,17 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from conductor.core.storage import StorageResolver, _resolve_repo_root, _derive_project_key
+from conductor.core.storage import (
+    StorageResolver,
+    _resolve_repo_root,
+    _derive_project_key,
+)
 
 
 # ---------------------------------------------------------------------------
 # _derive_project_key tests
 # ---------------------------------------------------------------------------
+
 
 def test_project_key_simple_path():
     key = _derive_project_key(Path("/home/user/dev/repo"))
@@ -30,11 +35,12 @@ def test_project_key_deep_path():
 # _resolve_repo_root tests
 # ---------------------------------------------------------------------------
 
+
 def test_repo_root_from_main_checkout():
     fake_path = Path("/home/user/dev/myproject")
     mock_result = MagicMock()
     mock_result.stdout = "/home/user/dev/myproject/.git\n"
-    with patch("subprocess.run", return_value=mock_result) as mock_run:
+    with patch("subprocess.run", return_value=mock_result):
         result = _resolve_repo_root(fake_path)
     assert result == Path("/home/user/dev/myproject")
 

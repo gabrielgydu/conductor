@@ -184,6 +184,7 @@ def validate_dag(runs: list[RunState]) -> None:
 
 def atomic_save(state: BaseModel, path: Path) -> None:
     json_bytes = state.model_dump_json(indent=2).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(

@@ -1,4 +1,5 @@
 """Integration tests: conductor driving speccer through spec generation lifecycle."""
+
 from __future__ import annotations
 
 import sys
@@ -11,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from conductor.core.enums import StageStatus
 from conductor.core.orchestrator import ConductorConfig, conductor_run_loop
-from conductor.core.storage import StorageResolver
 
 # Helpers from shared module
 sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
@@ -67,7 +67,9 @@ async def test_conductor_advances_through_spec_stages(
     # CONDUCTOR-LOG.md contains transition events
     conductor_log = tmp_storage_dir / "conductor" / "test-project" / "CONDUCTOR-LOG.md"
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
-    assert_log_contains_events(conductor_log, ["SPEC_INIT", "SPEC_COMPLETE", "GENERATED"])
+    assert_log_contains_events(
+        conductor_log, ["SPEC_INIT", "SPEC_COMPLETE", "GENERATED"]
+    )
 
 
 # ---------------------------------------------------------------------------

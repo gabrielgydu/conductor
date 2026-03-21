@@ -1,4 +1,5 @@
 """Shared test helpers — state factories, manipulation helpers, assertion helpers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +7,7 @@ import json
 from pathlib import Path
 
 from conductor.core.enums import RunStatus, StageStatus
-from conductor.core.models import ConductorState, RunState, StageState, atomic_save, load_state
+from conductor.core.models import ConductorState, RunState, StageState, load_state
 
 
 # ---------------------------------------------------------------------------
@@ -22,8 +23,7 @@ def make_run_state(
     status: RunStatus = RunStatus.PENDING,
 ) -> RunState:
     stage_list = [
-        StageState(name=f"stage-{i}", spec_mode="full")
-        for i in range(stages)
+        StageState(name=f"stage-{i}", spec_mode="full") for i in range(stages)
     ]
     return RunState(
         index=index,
@@ -106,7 +106,9 @@ def assert_log_contains_events(log_path: Path, events: list[str]) -> None:
 
 
 def assert_audit_has_entries(audit_path: Path, min_count: int) -> None:
-    lines = [l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [
+        ln for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
     assert len(lines) >= min_count, (
         f"Audit at {audit_path} has {len(lines)} entries, expected at least {min_count}"
     )

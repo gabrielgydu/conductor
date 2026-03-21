@@ -1,9 +1,7 @@
 """Tests for conductor.cli and speccer.cli"""
-import sys
+
 from io import StringIO
 from unittest.mock import patch
-
-import pytest
 
 
 def _run_main(main_fn, args):
@@ -23,16 +21,23 @@ def _run_main(main_fn, args):
 
 # ── conductor CLI ──────────────────────────────────────────────────────────────
 
+
 def test_conductor_help():
     from conductor.cli import main
+
     stdout, stderr, code = _run_main(main, ["conductor", "--help"])
     assert code == 0
     combined = stdout + stderr
-    assert "init" in combined or "subcommand" in combined.lower() or "conductor" in combined
+    assert (
+        "init" in combined
+        or "subcommand" in combined.lower()
+        or "conductor" in combined
+    )
 
 
 def test_conductor_init_stub():
     from conductor.cli import main
+
     stdout, stderr, code = _run_main(main, ["conductor", "init", "--name", "test"])
     assert code == 0
     assert "Not implemented yet" in stdout
@@ -40,22 +45,28 @@ def test_conductor_init_stub():
 
 def test_conductor_unknown_subcommand():
     from conductor.cli import main
+
     _, _, code = _run_main(main, ["conductor", "bogus"])
     assert code != 0
 
 
 # ── speccer CLI ────────────────────────────────────────────────────────────────
 
+
 def test_speccer_help():
     from speccer.cli import main
+
     stdout, stderr, code = _run_main(main, ["speccer", "--help"])
     assert code == 0
     combined = stdout + stderr
-    assert "init" in combined or "subcommand" in combined.lower() or "speccer" in combined
+    assert (
+        "init" in combined or "subcommand" in combined.lower() or "speccer" in combined
+    )
 
 
 def test_speccer_init_stub():
     from speccer.cli import main
+
     stdout, stderr, code = _run_main(
         main, ["speccer", "init", "--feature", "test", "--mode", "backend"]
     )

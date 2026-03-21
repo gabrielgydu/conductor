@@ -1,7 +1,6 @@
 """Tests for get_activation_order (DAG topological sort over DONE runs)."""
-from __future__ import annotations
 
-import pytest
+from __future__ import annotations
 
 from conductor.core.enums import RunStatus
 from conductor.integration.merge import get_activation_order
@@ -58,7 +57,7 @@ def test_diamond_dag():
     result = get_activation_order(state)
     assert len(result) == 4
     indices = [r.index for r in result]
-    assert indices[0] == 0   # A first
+    assert indices[0] == 0  # A first
     assert indices[-1] == 3  # D last
     # B and C are in the middle
     assert set(indices[1:3]) == {1, 2}

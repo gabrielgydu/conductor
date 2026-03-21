@@ -1,16 +1,13 @@
 """DAG execution tests — verify dependency-based run scheduling."""
+
 from __future__ import annotations
 
-import pytest
 
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.orchestrator import activate_ready_runs
 from tests.helpers import (
     block_run,
     complete_run,
-    get_active_runs,
-    get_blocked_runs,
-    get_pending_runs,
     make_conductor_state,
     make_run_state,
 )

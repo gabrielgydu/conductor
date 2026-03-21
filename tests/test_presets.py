@@ -1,4 +1,5 @@
 """Tests for conductor.core.presets"""
+
 import json
 import subprocess
 from pathlib import Path
@@ -9,14 +10,13 @@ import pytest
 from conductor.core.presets import (
     AcmePreset,
     BasePreset,
-    GateResult,
-    PresetConfig,
     NodeappPreset,
     load_preset,
 )
 
 
 # ── load_preset factory ────────────────────────────────────────────────────────
+
 
 def test_load_preset_base():
     assert isinstance(load_preset(""), BasePreset)
@@ -45,6 +45,7 @@ def test_load_preset_unknown():
 
 # ── BasePreset ─────────────────────────────────────────────────────────────────
 
+
 def test_base_quality_gate_passes(tmp_path):
     preset = BasePreset()
     result = preset.quality_gate(tmp_path)
@@ -65,6 +66,7 @@ def test_base_preflight_claude_missing(tmp_path):
 
 # ── AcmePreset config ────────────────────────────────────────────────────────
 
+
 def test_acme_config_flags():
     preset = load_preset("acme")
     cfg = preset.config
@@ -73,6 +75,7 @@ def test_acme_config_flags():
 
 
 # ── AcmePreset quality_gate ──────────────────────────────────────────────────
+
 
 def test_acme_quality_gate_phpstan_pass(tmp_path):
     preset = AcmePreset()
@@ -103,6 +106,7 @@ def test_acme_quality_gate_timeout(tmp_path):
 
 # ── AcmePreset preflight ─────────────────────────────────────────────────────
 
+
 def test_acme_preflight_docker_missing(tmp_path):
     preset = AcmePreset()
     with patch("shutil.which", return_value="/usr/bin/claude"):
@@ -111,6 +115,7 @@ def test_acme_preflight_docker_missing(tmp_path):
 
 
 # ── NodeappPreset quality_gate ───────────────────────────────────────────────
+
 
 def _make_package(tmp_path: Path, name: str) -> Path:
     pkg_dir = tmp_path / "packages" / name

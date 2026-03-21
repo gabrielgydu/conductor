@@ -2,6 +2,7 @@
 Constitution compliance tests — verify that the data model satisfies
 all constitution principles at the type level.
 """
+
 import pytest
 from conductor.core.models import MonitorState, RunState, StageState, validate_dag
 from conductor.core.storage import StorageResolver
@@ -34,6 +35,7 @@ def test_dag_validation_rejects_cycles():
 
 def test_dag_validation_importable():
     from conductor.core.models import validate_dag as _vd
+
     assert callable(_vd)
 
 

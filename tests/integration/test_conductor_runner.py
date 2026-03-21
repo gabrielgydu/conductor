@@ -1,4 +1,5 @@
 """Integration tests: conductor driving runner through execution lifecycle."""
+
 from __future__ import annotations
 
 import sys
@@ -17,7 +18,6 @@ from conductor.core.storage import StorageResolver
 sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
 from helpers import (
     assert_brain_call_logged,
-    assert_log_contains_events,
     make_conductor_state,
     make_run_state,
 )
@@ -183,8 +183,7 @@ async def test_conductor_detects_runner_stall(
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
     log_content = conductor_log.read_text()
     assert any(
-        keyword in log_content.lower()
-        for keyword in ["stall", "failed", "stalled"]
+        keyword in log_content.lower() for keyword in ["stall", "failed", "stalled"]
     ), f"Expected stall event in log, got: {log_content}"
 
 
@@ -225,7 +224,7 @@ async def test_conductor_steers_stalled_runner(
         f'{{"action": "steer", "message": "{steer_message}"}}',
     )
 
-    result = await conductor_run_loop(state, config)
+    await conductor_run_loop(state, config)
 
     # Brain should have been called (steer action logged to brain_calls_dir)
     brain_calls_dir = tmp_storage_dir / "conductor" / "test-project" / "brain-calls"

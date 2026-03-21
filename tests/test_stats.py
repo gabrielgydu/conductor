@@ -1,6 +1,6 @@
 """Tests for conductor.core.stats — TDD Phase 2."""
+
 import json
-import pytest
 
 from conductor.core.stats import (
     ModelPricing,
@@ -19,15 +19,18 @@ from conductor.core.stats import (
 # Sample fixture
 # ---------------------------------------------------------------------------
 
-SAMPLE_STREAM_JSON = "\n".join([
-    '{"type":"assistant","content":"Hello"}',
-    '{"type":"result","result":{"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":100}}}',
-])
+SAMPLE_STREAM_JSON = "\n".join(
+    [
+        '{"type":"assistant","content":"Hello"}',
+        '{"type":"result","result":{"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":100}}}',
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
 # resolve_model
 # ---------------------------------------------------------------------------
+
 
 def test_resolve_model_opus():
     assert resolve_model("opus") == "claude-opus-4-6"
@@ -49,6 +52,7 @@ def test_resolve_model_passthrough():
 # get_pricing
 # ---------------------------------------------------------------------------
 
+
 def test_get_pricing_opus():
     pricing = get_pricing("claude-opus-4-6")
     assert pricing.input_per_mtok == 15.00
@@ -69,6 +73,7 @@ def test_get_pricing_sonnet_default():
 # extract_stats
 # ---------------------------------------------------------------------------
 
+
 def test_extract_stats_from_stream_json():
     stats = extract_stats(SAMPLE_STREAM_JSON)
     assert stats.input == 1000
@@ -87,12 +92,14 @@ def test_extract_stats_no_result_event():
 
 
 def test_extract_stats_mixed_content():
-    output = "\n".join([
-        "not-json",
-        '{"type":"assistant","content":"hi"}',
-        "also not json",
-        '{"type":"result","result":{"usage":{"input_tokens":42,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
-    ])
+    output = "\n".join(
+        [
+            "not-json",
+            '{"type":"assistant","content":"hi"}',
+            "also not json",
+            '{"type":"result","result":{"usage":{"input_tokens":42,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
+        ]
+    )
     stats = extract_stats(output)
     assert stats.input == 42
     assert stats.output == 7
@@ -102,6 +109,7 @@ def test_extract_stats_mixed_content():
 # calculate_cost
 # ---------------------------------------------------------------------------
 
+
 def test_calculate_cost():
     pricing = ModelPricing(
         input_per_mtok=3.00,
@@ -109,9 +117,13 @@ def test_calculate_cost():
         cache_read_per_mtok=0.30,
         cache_write_per_mtok=3.75,
     )
-    tokens = TokenStats(input=1_000_000, output=500_000, cache_read=200_000, cache_write=100_000)
+    tokens = TokenStats(
+        input=1_000_000, output=500_000, cache_read=200_000, cache_write=100_000
+    )
     cost = calculate_cost(tokens, pricing)
-    expected = (1_000_000 * 3.00 + 500_000 * 15.00 + 200_000 * 0.30 + 100_000 * 3.75) / 1_000_000
+    expected = (
+        1_000_000 * 3.00 + 500_000 * 15.00 + 200_000 * 0.30 + 100_000 * 3.75
+    ) / 1_000_000
     assert abs(cost - expected) < 1e-9
 
 
@@ -129,6 +141,7 @@ def test_calculate_cost_zero_tokens():
 # ---------------------------------------------------------------------------
 # record_stats
 # ---------------------------------------------------------------------------
+
 
 def test_record_stats_new_file(tmp_path):
     stats_path = tmp_path / "stats.json"
@@ -183,6 +196,7 @@ def test_record_stats_append(tmp_path):
 # format_tokens
 # ---------------------------------------------------------------------------
 
+
 def test_format_tokens_millions():
     assert format_tokens(1_500_000) == "1.5M"
 
@@ -198,6 +212,7 @@ def test_format_tokens_small():
 # ---------------------------------------------------------------------------
 # format_duration
 # ---------------------------------------------------------------------------
+
 
 def test_format_duration_hours():
     assert format_duration(3720) == "1h02m"

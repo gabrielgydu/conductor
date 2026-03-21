@@ -1,4 +1,5 @@
 """Integration test fixtures: mocks for Claude CLI, Tmux, Speccer, Runner, and git/storage helpers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +9,7 @@ import stat
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import pytest
 
@@ -84,10 +85,14 @@ class MockClaudeCLI:
         # Write mock executable
         script_path = tmp_path / "claude"
         script_path.write_text(_MOCK_CLAUDE_SCRIPT)
-        script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        script_path.chmod(
+            script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
 
         # Prepend tmp_path to PATH and set env var for script to find its tmp dir
-        monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+        monkeypatch.setenv(
+            "PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", "")
+        )
         monkeypatch.setenv("MOCK_CLAUDE_TMP", str(tmp_path))
 
         # Initialize empty response map
@@ -127,6 +132,7 @@ def mock_claude_cli(tmp_path, monkeypatch) -> MockClaudeCLI:
 # ---------------------------------------------------------------------------
 # MockTmux
 # ---------------------------------------------------------------------------
+
 
 class MockTmux:
     def __init__(self) -> None:
@@ -219,6 +225,7 @@ def mock_tmux(monkeypatch) -> MockTmux:
 # MockSpeccer
 # ---------------------------------------------------------------------------
 
+
 class MockSpeccer:
     def __init__(self, tmp_path: Path) -> None:
         self._tmp_path = tmp_path
@@ -249,9 +256,13 @@ class MockSpeccer:
     def invocation_count(self) -> int:
         return self._invoke_count
 
-    def _handle_spawn(self, window_name: str, cmd: str, storage_path: Path | None = None) -> None:
+    def _handle_spawn(
+        self, window_name: str, cmd: str, storage_path: Path | None = None
+    ) -> None:
         self._invoke_count += 1
-        self._invocations.append({"window": window_name, "cmd": cmd, "count": self._invoke_count})
+        self._invocations.append(
+            {"window": window_name, "cmd": cmd, "count": self._invoke_count}
+        )
 
         # Determine status to write:
         # - First fail_count invocations: FAILED (explicit failure, triggers retry)
@@ -305,6 +316,7 @@ def mock_speccer(tmp_path, monkeypatch) -> MockSpeccer:
 # MockRunner
 # ---------------------------------------------------------------------------
 
+
 class MockRunner:
     def __init__(self, tmp_path: Path) -> None:
         self._tmp_path = tmp_path
@@ -314,7 +326,9 @@ class MockRunner:
         self._steer_messages: list[str] = []
         self._invocations: list[dict] = []
 
-    def write_run_sh(self, feature_dir: Path, stall: bool = False, fail: bool = False) -> None:
+    def write_run_sh(
+        self, feature_dir: Path, stall: bool = False, fail: bool = False
+    ) -> None:
         self._stall = stall
         self._fail = fail
         run_sh = feature_dir / "run.sh"
@@ -334,7 +348,9 @@ class MockRunner:
     def steer_messages_received(self) -> list[str]:
         return self._steer_messages
 
-    def _handle_spawn(self, window_name: str, cmd: str, storage_path: Path | None = None) -> None:
+    def _handle_spawn(
+        self, window_name: str, cmd: str, storage_path: Path | None = None
+    ) -> None:
         self._invocations.append({"window": window_name, "cmd": cmd})
 
         if storage_path:
@@ -357,6 +373,7 @@ def mock_runner(tmp_path) -> MockRunner:
 # TmpGitRepo
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def tmp_git_repo(tmp_path) -> Path:
     repo = tmp_path / "repo"
@@ -364,18 +381,23 @@ def tmp_git_repo(tmp_path) -> Path:
     subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.name", "Test User"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     readme = repo / "README.md"
     readme.write_text("# Test Repo\n")
-    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True
+    )
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "initial"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     return repo
 
@@ -384,12 +406,11 @@ def tmp_git_repo(tmp_path) -> Path:
 # TmpStorageDir
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def tmp_storage_dir(tmp_path, monkeypatch) -> Path:
     storage_base = tmp_path / "storage"
     storage_base.mkdir(parents=True, exist_ok=True)
-
-    original_init = StorageResolver.__init__
 
     def patched_init(self, repo_path: Path) -> None:
         # Use a fixed key so storage is predictable in tests
@@ -404,6 +425,7 @@ def tmp_storage_dir(tmp_path, monkeypatch) -> Path:
 # ---------------------------------------------------------------------------
 # State file helpers
 # ---------------------------------------------------------------------------
+
 
 def write_speccer_progress(path: Path, status: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

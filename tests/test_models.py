@@ -1,8 +1,7 @@
 import json
 import pytest
-from pathlib import Path
 from pydantic import ValidationError
-from conductor.core.enums import RunStatus, StageStatus, SpeccerStatus, IntegrationStatus
+from conductor.core.enums import RunStatus
 from conductor.core.models import (
     ConductorState,
     RunState,
@@ -32,7 +31,9 @@ def test_conductor_state_requires_project_name():
 
 
 def test_conductor_state_roundtrip():
-    state = ConductorState(project_name="my-project", base_branch="main", check_interval_s=60)
+    state = ConductorState(
+        project_name="my-project", base_branch="main", check_interval_s=60
+    )
     json_str = state.model_dump_json()
     restored = ConductorState.model_validate_json(json_str)
     assert restored.project_name == "my-project"
@@ -52,7 +53,9 @@ def test_run_state_depends_on_serialization():
 
 
 def test_run_state_constitution_field():
-    run = RunState(index=0, name="run-0", description="run zero", constitution=["rule1", "rule2"])
+    run = RunState(
+        index=0, name="run-0", description="run zero", constitution=["rule1", "rule2"]
+    )
     json_str = run.model_dump_json()
     restored = RunState.model_validate_json(json_str)
     assert restored.constitution == ["rule1", "rule2"]
@@ -73,7 +76,9 @@ def test_stage_state_all_fields():
 
 
 def test_stage_state_worktree_branch():
-    stage = StageState(name="speccing", spec_mode="full", worktree="/path", branch="feat/x")
+    stage = StageState(
+        name="speccing", spec_mode="full", worktree="/path", branch="feat/x"
+    )
     json_str = stage.model_dump_json()
     restored = StageState.model_validate_json(json_str)
     assert restored.worktree == "/path"
@@ -147,8 +152,12 @@ def test_integration_state_merged_runs():
 
 
 def test_integration_state_split_conflicts():
-    resolved = ConflictRecord(file="a.py", feature_a="fa", feature_b="fb", description="resolved")
-    unresolved = ConflictRecord(file="b.py", feature_a="fa", feature_b="fb", description="unresolved")
+    resolved = ConflictRecord(
+        file="a.py", feature_a="fa", feature_b="fb", description="resolved"
+    )
+    unresolved = ConflictRecord(
+        file="b.py", feature_a="fa", feature_b="fb", description="unresolved"
+    )
     state = IntegrationState(
         branch="int/test",
         conflicts_resolved=[resolved],
@@ -188,7 +197,9 @@ def test_invalid_enum_in_model():
 
 def test_nested_model_validation():
     wiring = ContextWiring(sources=[], targets=[])
-    stage = StageState(name="speccing", spec_mode="full", status="pending", context_wiring=wiring)
+    stage = StageState(
+        name="speccing", spec_mode="full", status="pending", context_wiring=wiring
+    )
     run = RunState(index=0, name="run-0", description="run zero", stages=[stage])
     state = ConductorState(project_name="proj", runs=[run])
     assert len(state.runs) == 1
@@ -224,7 +235,6 @@ def test_atomic_save_no_partial_write(tmp_path, monkeypatch):
     original_content = path.read_text()
 
     import os
-    original_replace = os.replace
 
     def fail_replace(src, dst):
         raise OSError("simulated failure")

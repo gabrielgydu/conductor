@@ -1,6 +1,6 @@
 """Tests for conductor.core.templates — TDD Phase 2."""
+
 import pytest
-from pathlib import Path
 
 from conductor.core.templates import load_template, render_template
 
@@ -8,6 +8,7 @@ from conductor.core.templates import load_template, render_template
 # ---------------------------------------------------------------------------
 # load_template
 # ---------------------------------------------------------------------------
+
 
 def test_load_template(tmp_path):
     tpl = tmp_path / "my.tpl"
@@ -25,6 +26,7 @@ def test_load_template_missing(tmp_path):
 # Variable substitution
 # ---------------------------------------------------------------------------
 
+
 def test_variable_substitution():
     result = render_template("Hello {NAME}", variables={"NAME": "world"})
     assert result == "Hello world"
@@ -38,6 +40,7 @@ def test_variable_unmatched_left_as_is():
 # ---------------------------------------------------------------------------
 # Conditionals
 # ---------------------------------------------------------------------------
+
 
 def test_conditional_true():
     result = render_template("{IF INIT}content{ENDIF INIT}", conditions={"INIT": True})
@@ -58,6 +61,7 @@ def test_conditional_missing():
 # Injections
 # ---------------------------------------------------------------------------
 
+
 def test_injection():
     result = render_template("{INJECT:SPEC}", injections={"SPEC": "injected content"})
     assert result == "injected content"
@@ -77,6 +81,7 @@ def test_injection_multiline():
 # ---------------------------------------------------------------------------
 # Combined / ordering
 # ---------------------------------------------------------------------------
+
 
 def test_combined():
     template = "{IF SHOW}Hello {NAME}{ENDIF SHOW}\n{INJECT:FOOTER}"

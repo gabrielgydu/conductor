@@ -1,9 +1,8 @@
 """Tests for conductor.core.logging — TDD Phase 2."""
+
 import io
 import json
-import sys
 import pytest
-from pathlib import Path
 from unittest.mock import patch
 
 from conductor.core.logging import live_log, header, error, die, EVENT_REGISTRY
@@ -12,6 +11,7 @@ from conductor.core.logging import live_log, header, error, die, EVENT_REGISTRY
 # ---------------------------------------------------------------------------
 # live_log — terminal output
 # ---------------------------------------------------------------------------
+
 
 def test_live_log_terminal_output(tmp_path):
     buf = io.StringIO()
@@ -74,7 +74,12 @@ def test_live_log_audit_extra_data(tmp_path):
     buf = io.StringIO()
     with patch("sys.stderr", buf):
         with patch.object(buf, "isatty", return_value=False):
-            live_log("BRAIN_CALL", "calling brain", audit_path=audit_path, audit_data={"model": "opus", "tokens": 100})
+            live_log(
+                "BRAIN_CALL",
+                "calling brain",
+                audit_path=audit_path,
+                audit_data={"model": "opus", "tokens": 100},
+            )
     data = json.loads(audit_path.read_text().strip())
     assert data["model"] == "opus"
     assert data["tokens"] == 100
@@ -92,6 +97,7 @@ def test_live_log_no_paths():
 # ---------------------------------------------------------------------------
 # header / error / die
 # ---------------------------------------------------------------------------
+
 
 def test_header_output():
     buf = io.StringIO()
@@ -127,6 +133,7 @@ def test_die_exits():
 # ANSI stripping when not TTY
 # ---------------------------------------------------------------------------
 
+
 def test_ansi_stripped_when_not_tty():
     buf = io.StringIO()
     with patch("sys.stderr", buf):
@@ -140,6 +147,7 @@ def test_ansi_stripped_when_not_tty():
 # ---------------------------------------------------------------------------
 # Event registry completeness
 # ---------------------------------------------------------------------------
+
 
 def test_event_registry_completeness():
     """All registered events must have icon and log_to_markdown attributes."""

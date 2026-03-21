@@ -1,4 +1,5 @@
 """E2E test fixtures: E2EEnvironment wrapping all mock infrastructure."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -62,11 +63,14 @@ class E2EEnvironment:
     def get_state(self, project_name: str) -> ConductorState:
         """Load state from storage."""
         from conductor.core.models import load_state
+
         storage = StorageResolver(self.repo_path)
         state_path = storage.conductor_state(project_name)
         return load_state(state_path, ConductorState)
 
-    def make_config(self, check_interval_s: float = 0.1, max_iterations: int = 50) -> dict[str, Any]:
+    def make_config(
+        self, check_interval_s: float = 0.1, max_iterations: int = 50
+    ) -> dict[str, Any]:
         """Return a config dict with test-appropriate defaults."""
         return {
             "check_interval_s": check_interval_s,
@@ -75,13 +79,13 @@ class E2EEnvironment:
 
 
 @pytest.fixture
-def e2e_env(
-    tmp_git_repo,
-    tmp_storage_dir,
-    mock_claude_cli,
-    mock_tmux,
-    mock_speccer,
-    mock_runner,
+def e2e_env(  # noqa: F811
+    tmp_git_repo,  # noqa: F811
+    tmp_storage_dir,  # noqa: F811
+    mock_claude_cli,  # noqa: F811
+    mock_tmux,  # noqa: F811
+    mock_speccer,  # noqa: F811
+    mock_runner,  # noqa: F811
 ) -> E2EEnvironment:
     return E2EEnvironment(
         repo_path=tmp_git_repo,

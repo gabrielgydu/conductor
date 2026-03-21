@@ -1,10 +1,10 @@
 """Worktree chaining integration tests (WC-1 through WC-4)."""
+
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
 
-import pytest
 
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState, RunState, StageState
@@ -71,13 +71,17 @@ def get_branch_tip_sha(repo_path: Path, branch: str) -> str:
     return result.stdout.strip()
 
 
-def assert_branch_derives_from(repo_path: Path, child_branch: str, parent_branch: str) -> None:
+def assert_branch_derives_from(
+    repo_path: Path, child_branch: str, parent_branch: str
+) -> None:
     parent_sha = get_branch_tip_sha(repo_path, parent_branch)
     result = subprocess.run(
         ["git", "merge-base", "--is-ancestor", parent_sha, child_branch],
         cwd=repo_path,
     )
-    assert result.returncode == 0, f"{child_branch} does not derive from {parent_branch}"
+    assert result.returncode == 0, (
+        f"{child_branch} does not derive from {parent_branch}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +121,9 @@ def test_first_stage_branches_from_base(tmp_git_repo: Path, tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 
 
-def test_subsequent_stage_branches_from_previous(tmp_git_repo: Path, tmp_path: Path) -> None:
+def test_subsequent_stage_branches_from_previous(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
     repo = tmp_git_repo
     base_branch = get_default_branch(repo)
 
