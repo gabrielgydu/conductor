@@ -19,10 +19,32 @@ class GateResult:
 @dataclass
 class PresetConfig:
     push_enabled: bool = False
+    push_remote: str = "origin"
     fixer_enabled: bool = False
-    max_retries: int = 3
-    max_iterations: int = 10
+    fixer_async: bool = False
+    sync_enabled: bool = False
+    sync_base_branch: str = "master"
+    sync_dump_regen: list[tuple[str, str]] = field(default_factory=list)  # [(glob_pattern, regen_command)]
+    testing_mode: bool = False
+    local_ci_enabled: bool = False
+    local_ci_command: str = ""
+    local_ci_full_command: str = ""
+    local_ci_max_retries: int = 3
+    local_review_enabled: bool = False
+    local_review_command: str = ""
+    local_review_full_command: str = ""
+    local_review_max_retries: int = 2
+    max_turns: int = 200
+    max_iterations_per_phase: int = 8
+    max_gate_retries: int = 5
+    model: str = ""
+    fix_model: str = ""
+    phase_models: dict[int, str] = field(default_factory=dict)
+    fixer_ci_poll_interval: int = 60
+    fixer_ci_max_wait: int = 5400
+    fixer_skip_patterns: str = "coverage|Coverage|codecov|Codecov"
     overnight_cap_hours: int = 8
+    max_retries: int = 3
 
 
 class Preset(ABC):
@@ -58,7 +80,23 @@ class BasePreset(Preset):
 
 class AcmePreset(BasePreset):
     def __init__(self) -> None:
-        self.config = PresetConfig(push_enabled=True, fixer_enabled=True)
+        self.config = PresetConfig(
+            push_enabled=True,
+            fixer_enabled=True,
+            sync_enabled=True,
+            sync_dump_regen=[
+                ("test-dumps/partner.sql", "./scripts/worktree-env.sh dump-regen partner"),
+                ("test-dumps/shop.sql", "./scripts/worktree-env.sh dump-regen shop"),
+                ("test-dumps/app.sql", "./scripts/worktree-env.sh dump-regen app"),
+                ("test-dumps/fleet.sql", "./scripts/worktree-env.sh dump-regen fleet"),
+            ],
+            local_ci_enabled=True,
+            local_ci_command="./scripts/worktree-env.sh ci auto",
+            local_ci_full_command="./scripts/worktree-env.sh ci auto",
+            local_review_enabled=True,
+            local_review_command="./scripts/local-review.sh",
+            local_review_full_command="./scripts/local-review.sh --full",
+        )
 
     def quality_gate(self, cwd: Path) -> GateResult:
         hook = cwd / ".claude/hooks/pre-commit-phpstan.sh"
@@ -90,6 +128,12 @@ class AcmePreset(BasePreset):
             return False
         return True
 
+    def build_prompt_extra(self, cwd: Path) -> str:
+        return (
+            f"- PARTNER PHPStan: {cwd}/scripts/worktree-env.sh phpstan partner\n"
+            f"- APP PHPStan: {cwd}/scripts/worktree-env.sh phpstan app\n"
+        )
+
     def stage_teardown(self, cwd: Path) -> None:
         try:
             subprocess.run(
@@ -103,7 +147,12 @@ class AcmePreset(BasePreset):
 
 class NodeappPreset(BasePreset):
     def __init__(self) -> None:
-        self.config = PresetConfig(push_enabled=True, fixer_enabled=True)
+        self.config = PresetConfig(
+            push_enabled=False,
+            fixer_enabled=False,
+            model="opus",
+            fix_model="opus",
+        )
 
     def quality_gate(self, cwd: Path) -> GateResult:
         packages = ["shared", "backend", "api", "frontend"]

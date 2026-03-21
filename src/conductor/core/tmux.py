@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 
@@ -10,39 +11,161 @@ class TmuxManager:
     def __init__(self, session_name: str = "conductor") -> None:
         self._session_name = session_name
 
-    async def ensure_session(self, name: str) -> None:
-        """Create tmux session if it doesn't exist."""
-        # Real implementation: tmux new-session -d -s name
-        pass
-
-    async def spawn_in_window(self, name: str, cmd: str) -> None:
-        """Spawn command in a tmux window (non-blocking)."""
-        # Real implementation: tmux new-window -t session:name -n name cmd
-        pass
-
-    async def spawn_in_window_and_wait(self, name: str, cmd: str) -> int:
-        """Spawn command in a tmux window and wait for exit, return exit code."""
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a tmux command synchronously."""
+        return subprocess.run(
+            ["tmux"] + list(args),
+            capture_output=True,
+            text=True,
+            check=check,
         )
-        _, _ = await proc.communicate()
-        return proc.returncode or 0
+
+    def session_exists(self) -> bool:
+        """Check if the tmux session exists."""
+        r = self._run_tmux("has-session", "-t", self._session_name, check=False)
+        return r.returncode == 0
+
+    async def ensure_session(self) -> None:
+        """Create tmux session if it doesn't exist."""
+        if not self.session_exists():
+            self._run_tmux(
+                "new-session", "-d", "-s", self._session_name,
+                "-x", "200", "-y", "50",
+            )
+
+    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None) -> None:
+        """Spawn command in a new tmux window (non-blocking, fire-and-forget)."""
+        # Kill stale window first
+        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
+
+        args = ["new-window", "-t", self._session_name, "-n", name]
+        if cwd:
+            args.extend(["-c", cwd])
+        args.append(cmd)
+        self._run_tmux(*args)
+
+    async def spawn_in_window_and_wait(
+        self,
+        name: str,
+        cmd: str,
+        *,
+        exit_file: Path | None = None,
+        cwd: str | None = None,
+    ) -> int:
+        """Spawn command in tmux window, wait for it to finish, return exit code.
+
+        Uses tmux wait-for to block until the command completes.
+        Writes exit code to exit_file if provided.
+        """
+        # Kill stale window
+        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
+
+        # Build the command that writes exit code and signals completion
+        wait_channel = f"conductor-{name}-done"
+        if exit_file:
+            wrapped = f'{cmd}; echo $? > {exit_file}; tmux wait-for -S {wait_channel}'
+        else:
+            wrapped = f'{cmd}; tmux wait-for -S {wait_channel}'
+
+        args = ["new-window", "-t", self._session_name, "-n", name]
+        if cwd:
+            args.extend(["-c", cwd])
+        args.append(wrapped)
+        self._run_tmux(*args)
+
+        # Block until signal
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._run_tmux("wait-for", wait_channel, check=False),
+        )
+
+        # Read exit code from file if available
+        if exit_file and exit_file.exists():
+            try:
+                return int(exit_file.read_text().strip())
+            except (ValueError, OSError):
+                return 1
+        return 0
+
+    async def spawn_runner_in_window(
+        self,
+        name: str,
+        cmd: str,
+        *,
+        exit_file: Path,
+        cwd: str | None = None,
+    ) -> None:
+        """Spawn runner command in tmux window (non-blocking). Writes exit code to file when done."""
+        # Kill stale window
+        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
+
+        # Wrap command to write exit code on completion
+        wrapped = f'{cmd}; echo $? > {exit_file}'
+
+        args = ["new-window", "-t", self._session_name, "-n", name]
+        if cwd:
+            args.extend(["-c", cwd])
+        args.append(wrapped)
+        self._run_tmux(*args)
 
     async def is_window_alive(self, name: str) -> bool:
-        """Check if a tmux window/pane is alive (process still running)."""
-        # Real implementation: check tmux has-session / list-panes
-        return False
+        """Check if a tmux window exists."""
+        r = self._run_tmux(
+            "list-windows", "-t", self._session_name,
+            "-F", "#{window_name}",
+            check=False,
+        )
+        if r.returncode != 0:
+            return False
+        return name in r.stdout.strip().splitlines()
+
+    async def is_runner_idle(self, name: str) -> bool:
+        """Check if the runner's pane is idle (command is bash/zsh = process finished)."""
+        r = self._run_tmux(
+            "list-panes", "-t", f"{self._session_name}:{name}",
+            "-F", "#{pane_current_command}",
+            check=False,
+        )
+        if r.returncode != 0:
+            return True  # Window doesn't exist = "idle"
+        cmd = r.stdout.strip()
+        return cmd in ("bash", "zsh", "sh", "fish", "")
 
     async def get_pane_pid(self, name: str) -> int | None:
         """Get PID of the process in the tmux pane."""
-        return None
+        r = self._run_tmux(
+            "list-panes", "-t", f"{self._session_name}:{name}",
+            "-F", "#{pane_pid}",
+            check=False,
+        )
+        if r.returncode != 0:
+            return None
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return None
+
+    async def send_keys(self, name: str, keys: str) -> None:
+        """Send keys to a tmux pane (e.g., Ctrl-C)."""
+        self._run_tmux(
+            "send-keys", "-t", f"{self._session_name}:{name}",
+            keys, check=False,
+        )
 
     async def kill_window(self, name: str) -> None:
         """Kill a tmux window."""
-        pass
+        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
 
-    async def kill_session(self, name: str) -> None:
-        """Kill a tmux session."""
-        pass
+    async def kill_session(self) -> None:
+        """Kill the tmux session."""
+        self._run_tmux("kill-session", "-t", self._session_name, check=False)
+
+    async def capture_pane(self, name: str, lines: int = 20) -> str:
+        """Capture the last N lines from a tmux pane."""
+        r = self._run_tmux(
+            "capture-pane", "-t", f"{self._session_name}:{name}",
+            "-p", "-S", f"-{lines}",
+            check=False,
+        )
+        return r.stdout if r.returncode == 0 else ""

@@ -49,6 +49,10 @@ class StageState(BaseModel):
     context_wiring: ContextWiring | None = None
     pid: int | None = None
     started_at: datetime | None = None
+    completed_at: datetime | None = None
+    feature_suffix: str = ""
+    feature_description_file: str | None = None
+    retries: int = 0
 
 
 class RunState(BaseModel):
@@ -65,6 +69,7 @@ class RunState(BaseModel):
     monitor: MonitorState = MonitorState()
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    pr_url: str | None = None
 
 
 class DomainState(BaseModel):
@@ -126,6 +131,8 @@ class ConductorState(BaseModel):
     integration: Optional[IntegrationState] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    preset: Optional[str] = None
+    overnight: bool = False
 
 
 # ---------------------------------------------------------------------------

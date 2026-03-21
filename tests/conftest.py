@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+import glob
 
 from conductor.core.models import (
     ConductorState,
@@ -67,3 +68,42 @@ def sample_conductor_state() -> ConductorState:
 @pytest.fixture
 def tmp_state_dir(tmp_path: Path) -> Path:
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def clean_tmp_files():
+    """Clean up conductor temp files before and after each test."""
+    # Remove old conductor exit and activity files to avoid test pollution
+    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+        for f in glob.glob(pattern):
+            try:
+                Path(f).unlink()
+            except (OSError, FileNotFoundError):
+                pass
+    yield
+    # Also clean up after test
+    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+        for f in glob.glob(pattern):
+            try:
+                Path(f).unlink()
+            except (OSError, FileNotFoundError):
+                pass
+
+
+@pytest.fixture(autouse=True)
+def patch_orchestrator_create_worktree(monkeypatch, tmp_path):
+    """Patch create_worktree to avoid real git ops in tests."""
+    import conductor.core.orchestrator as orch
+
+    _wt_counter = [0]
+
+    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+        run = state.runs[run_idx]
+        stage = run.stages[stage_idx]
+        _wt_counter[0] += 1
+        wt_dir = tmp_path / "worktrees" / f"wt-{_wt_counter[0]}"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        stage.branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
+        stage.worktree = str(wt_dir)
+
+    monkeypatch.setattr(orch, "create_worktree", mock_create_worktree)

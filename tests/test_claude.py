@@ -143,8 +143,10 @@ async def test_steerable_session_send():
     last_write = written[-1][0][0]
     data = json.loads(last_write.decode())
     assert data["type"] == "user"
-    assert data["role"] == "user"
-    assert data["content"] == "follow-up"
+    assert data["message"]["role"] == "user"
+    assert data["message"]["content"] == "follow-up"
+    assert data["session_id"] == "default"
+    assert data["parent_tool_use_id"] is None
 
 
 @pytest.mark.asyncio
@@ -261,7 +263,12 @@ async def test_ndjson_format():
     line = first_write.decode("utf-8")
     assert line.endswith("\n")
     data = json.loads(line.strip())
-    assert data == {"type": "user", "role": "user", "content": "hello world"}
+    assert data == {
+        "type": "user",
+        "message": {"role": "user", "content": "hello world"},
+        "session_id": "default",
+        "parent_tool_use_id": None,
+    }
 
 
 @pytest.mark.asyncio

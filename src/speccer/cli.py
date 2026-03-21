@@ -907,6 +907,59 @@ def cmd_status(spec_dir: Path) -> None:
         _log(hint)
 
 
+def cmd_stats(spec_dir: Path) -> None:
+    """Display stats from STATS.json for the spec and build phases."""
+    import json as _json
+
+    if not spec_dir.is_dir():
+        _die(f"Spec directory not found: {spec_dir}")
+
+    feature_name = spec_dir.parent.name
+    _header(f"Stats — {feature_name}")
+
+    # Spec stats
+    spec_stats = spec_dir / "STATS.json"
+    if spec_stats.exists():
+        try:
+            data = _json.loads(spec_stats.read_text(encoding="utf-8"))
+            entries = data if isinstance(data, list) else data.get("entries", [])
+            if entries:
+                total_cost = sum(e.get("cost_usd", 0) for e in entries)
+                total_input = sum(e.get("tokens", {}).get("input", 0) for e in entries)
+                total_output = sum(e.get("tokens", {}).get("output", 0) for e in entries)
+                total_duration = sum(e.get("duration_s", 0) for e in entries)
+                print(f"  {_BOLD}Spec Stats{_RESET} ({len(entries)} calls)")
+                print(f"    Input: {total_input:,}  Output: {total_output:,}")
+                print(f"    Duration: {total_duration:.0f}s")
+                print(f"    Cost: {_GREEN}${total_cost:.4f}{_RESET}")
+                print()
+        except (_json.JSONDecodeError, OSError):
+            pass
+    else:
+        _log(f"{_DIM}No spec stats found{_RESET}")
+
+    # Build stats
+    build_stats = spec_dir.parent / "STATS.json"
+    if build_stats.exists():
+        try:
+            data = _json.loads(build_stats.read_text(encoding="utf-8"))
+            entries = data if isinstance(data, list) else data.get("entries", [])
+            if entries:
+                total_cost = sum(e.get("cost_usd", 0) for e in entries)
+                total_input = sum(e.get("tokens", {}).get("input", 0) for e in entries)
+                total_output = sum(e.get("tokens", {}).get("output", 0) for e in entries)
+                total_duration = sum(e.get("duration_s", 0) for e in entries)
+                print(f"  {_BOLD}Build Stats{_RESET} ({len(entries)} iterations)")
+                print(f"    Input: {total_input:,}  Output: {total_output:,}")
+                print(f"    Duration: {total_duration:.0f}s")
+                print(f"    Cost: {_GREEN}${total_cost:.4f}{_RESET}")
+                print()
+        except (_json.JSONDecodeError, OSError):
+            pass
+    else:
+        _log(f"{_DIM}No build stats found{_RESET}")
+
+
 def cmd_tree(spec_dir: Path) -> None:
     if not spec_dir.is_dir():
         _die(f"Spec directory not found: {spec_dir}")
@@ -1005,6 +1058,16 @@ def _parse_args(argv: list[str] | None = None):
     p_status.add_argument("--feature", default=None)
     p_status.add_argument("--project-dir", dest="project_dir", default=None)
 
+    # ── stats ─────────────────────────────────────────────────────────────────
+    p_stats = subparsers.add_parser("stats", help="Show spec and build stats")
+    p_stats.add_argument(
+        "--spec-dir",
+        dest="spec_dir",
+        help="Explicit spec directory path",
+    )
+    p_stats.add_argument("--feature", default=None)
+    p_stats.add_argument("--project-dir", dest="project_dir", default=None)
+
     # ── tree ──────────────────────────────────────────────────────────────────
     p_tree = subparsers.add_parser("tree", help="Display feature decomposition tree")
     p_tree.add_argument(
@@ -1090,6 +1153,10 @@ def main() -> None:
     elif args.subcommand == "status":
         spec_dir = _resolve_spec_dir(args)
         cmd_status(spec_dir=spec_dir)
+
+    elif args.subcommand == "stats":
+        spec_dir = _resolve_spec_dir(args)
+        cmd_stats(spec_dir=spec_dir)
 
     elif args.subcommand == "tree":
         spec_dir = _resolve_spec_dir(args)

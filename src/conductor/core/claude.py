@@ -105,7 +105,12 @@ class SteerableSession:
         """Send a follow-up message to the running Claude process."""
         if self._closed or self._proc.stdin.is_closing():
             raise RuntimeError("Session closed")
-        formatted = json.dumps({"type": "user", "role": "user", "content": message}) + "\n"
+        formatted = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": message},
+            "session_id": "default",
+            "parent_tool_use_id": None,
+        }) + "\n"
         self._proc.stdin.write(formatted.encode("utf-8"))
         await self._proc.stdin.drain()
 
@@ -241,8 +246,36 @@ async def run_claude_steerable(
         close_fds=True,
     )
 
-    initial = json.dumps({"type": "user", "role": "user", "content": prompt}) + "\n"
+    initial = json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "session_id": "default",
+        "parent_tool_use_id": None,
+    }) + "\n"
     proc.stdin.write(initial.encode("utf-8"))
     await proc.stdin.drain()
 
     return SteerableSession(proc, start)
+
+
+def resolve_model(name: str) -> str:
+    """Resolve short model names to full Claude model IDs."""
+    _MODEL_MAP = {
+        "opus": "claude-opus-4-6[1m]",
+        "opus-200k": "claude-opus-4-6",
+        "sonnet": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-4-5",
+    }
+    return _MODEL_MAP.get(name, name)
+
+
+def calculate_cost(tokens: dict[str, int] | None) -> float | None:
+    """Calculate cost from token usage. Returns None if tokens is None."""
+    if not tokens:
+        return None
+    # Pricing per million tokens (as of 2025)
+    input_cost = tokens.get("input_tokens", 0) * 15.0 / 1_000_000
+    output_cost = tokens.get("output_tokens", 0) * 75.0 / 1_000_000
+    cache_read_cost = tokens.get("cache_read_input_tokens", 0) * 1.5 / 1_000_000
+    cache_write_cost = tokens.get("cache_creation_input_tokens", 0) * 18.75 / 1_000_000
+    return input_cost + output_cost + cache_read_cost + cache_write_cost

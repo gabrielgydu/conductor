@@ -53,14 +53,43 @@ def _patch_storage(tmp_path: Path):
     return patch.object(StorageResolver, "__init__", patched_init)
 
 
+def _patch_create_worktree(tmp_path: Path):
+    """Return a context manager patching create_worktree to avoid git ops."""
+    import conductor.core.orchestrator as orch
+
+    _wt_counter = [0]
+
+    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+        run = state.runs[run_idx]
+        stage = run.stages[stage_idx]
+        _wt_counter[0] += 1
+        wt_dir = tmp_path / "worktrees" / f"wt-{_wt_counter[0]}"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        stage.branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
+        stage.worktree = str(wt_dir)
+
+    return patch.object(orch, "create_worktree", mock_create_worktree)
+
+
 def _patch_tmux():
     """Return a context manager patching TmuxManager with a no-op mock."""
     tmux = MagicMock()
     tmux.ensure_session = AsyncMock()
     tmux.is_window_alive = AsyncMock(return_value=False)
+    tmux.is_runner_idle = AsyncMock(return_value=True)
     tmux.spawn_in_window = AsyncMock()
+    tmux.spawn_in_window_and_wait = AsyncMock(return_value=0)
+    tmux.spawn_runner_in_window = AsyncMock()
     return patch(
         "conductor.core.orchestrator._tmux_module.TmuxManager", return_value=tmux
+    )
+
+
+def _patch_post_run():
+    """Return a context manager that prevents conductor_post_run from calling Claude."""
+    return patch(
+        "conductor.core.orchestrator.conductor_post_run",
+        new_callable=AsyncMock,
     )
 
 
@@ -77,14 +106,13 @@ async def test_integration_triggered_when_all_terminal(tmp_path):
 
     fake_result = IntegrationState(status="done", branch="integration/test-proj")
 
-    with _patch_storage(tmp_path):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-                return_value=fake_result,
-            ) as mock_merge:
-                result = await conductor_run_loop(state, config)
+    with _patch_storage(tmp_path), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+            return_value=fake_result,
+        ) as mock_merge:
+            result = await conductor_run_loop(state, config)
 
     mock_merge.assert_called_once()
     assert result.integration is not None
@@ -97,13 +125,12 @@ async def test_integration_not_triggered_when_active_runs(tmp_path):
     state = _make_state(_done_run(0, "feat-a"), _active_run(1, "feat-b"))
     config = ConductorConfig(check_interval_s=0.0, max_iterations=2)
 
-    with _patch_storage(tmp_path):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-            ) as mock_merge:
-                await conductor_run_loop(state, config)
+    with _patch_storage(tmp_path), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+        ) as mock_merge:
+            await conductor_run_loop(state, config)
 
     mock_merge.assert_not_called()
 
@@ -114,13 +141,12 @@ async def test_integration_not_triggered_fewer_than_two_done(tmp_path):
     state = _make_state(_done_run(0, "feat-a"), _blocked_run(1, "feat-b"))
     config = ConductorConfig(check_interval_s=0.0, max_iterations=5)
 
-    with _patch_storage(tmp_path):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-            ) as mock_merge:
-                await conductor_run_loop(state, config)
+    with _patch_storage(tmp_path), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+        ) as mock_merge:
+            await conductor_run_loop(state, config)
 
     mock_merge.assert_not_called()
 
@@ -134,14 +160,13 @@ async def test_integration_runs_only_once(tmp_path):
 
     fake_result = IntegrationState(status="done", branch="integration/test-proj")
 
-    with _patch_storage(tmp_path):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-                return_value=fake_result,
-            ) as mock_merge:
-                result = await conductor_run_loop(state, config)
+    with _patch_storage(tmp_path), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+            return_value=fake_result,
+        ) as mock_merge:
+            result = await conductor_run_loop(state, config)
 
     # Should only be called once regardless of iteration count
     mock_merge.assert_called_once()
@@ -164,14 +189,13 @@ async def test_integration_state_persisted(tmp_path):
         self._project_key = "test-project"
         self.base_dir = storage_base
 
-    with patch.object(StorageResolver, "__init__", patched_init):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-                return_value=fake_result,
-            ):
-                result = await conductor_run_loop(state, config)
+    with patch.object(StorageResolver, "__init__", patched_init), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+            return_value=fake_result,
+        ):
+            result = await conductor_run_loop(state, config)
 
     # State file should exist and contain integration data
     state_file = storage_base / "conductor" / "test-proj" / "CONDUCTOR-STATE.json"
@@ -190,14 +214,13 @@ async def test_integration_failure_handled(tmp_path):
     state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
     config = ConductorConfig(check_interval_s=0.0, max_iterations=5)
 
-    with _patch_storage(tmp_path):
-        with _patch_tmux():
-            with patch(
-                "conductor.integration.merge.run_integration_merge",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("merge exploded"),
-            ):
-                result = await conductor_run_loop(state, config)
+    with _patch_storage(tmp_path), _patch_tmux(), _patch_post_run(), _patch_create_worktree(tmp_path):
+        with patch(
+            "conductor.integration.merge.run_integration_merge",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("merge exploded"),
+        ):
+            result = await conductor_run_loop(state, config)
 
     # Loop should complete without raising
     assert result.integration is not None

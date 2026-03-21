@@ -23,17 +23,30 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "WORKTREE_CREATE":   EventConfig("⚙",  False),
     "WORKTREE_REMOVE":   EventConfig("⚙",  False),
     "SPECCER_INIT":      EventConfig("⚙",  False),
+    "SPECCER_INVOKE":    EventConfig("⚙",  False),
     "SPECCER_RUN":       EventConfig("⚙",  False),
     "SPECCER_EXIT":      EventConfig("⚙",  False),
+    "SPECCER_STATUS_SYNC": EventConfig("⚙", False),
     "BRAIN_CALL":        EventConfig("🧠", True),
     "RUNNER_START":      EventConfig("▶",  False),
     "RUNNER_EXIT":       EventConfig("✓",  False),
+    "RUNNER_DEAD":       EventConfig("✗",  False),
     "RUNNER_STEER":      EventConfig("↪",  False),
     "STALL_CHECK":       EventConfig("○",  False),
+    "STALL_EXCEEDED":    EventConfig("✗",  True),
     "FAILURE":           EventConfig("✗",  True),
     "BLOCKED":           EventConfig("⊘",  True),
     "PLAN":              EventConfig("◆",  True),
     "RETRY":             EventConfig("↻",  False),
+    "GIT_PUSH":          EventConfig("⬆",  True),
+    "GIT_PUSH_FAILED":   EventConfig("⬆",  True),
+    "PR_CREATED":        EventConfig("🔗", True),
+    "PR_CREATE_FAILED":  EventConfig("🔗", True),
+    "POST_RUN":          EventConfig("📋", False),
+    "POST_RUN_START":    EventConfig("📋", True),
+    "POST_RUN_END":      EventConfig("📋", True),
+    "FILE_WRITE":        EventConfig("📝", False),
+    "RUNNER_BRAIN_DIAGNOS": EventConfig("🧠", False),
 }
 
 # ---------------------------------------------------------------------------
@@ -47,14 +60,25 @@ _YELLOW = "\033[33m"
 _DIM = "\033[2m"
 _RESET = "\033[0m"
 
+_GREEN = "\033[32m"
+
 _COLOR_MAP: dict[str, str] = {
     "FAILURE": _RED,
     "BLOCKED": _RED,
+    "RUNNER_DEAD": _RED,
+    "STALL_EXCEEDED": _RED,
+    "GIT_PUSH_FAILED": _RED,
+    "PR_CREATE_FAILED": _RED,
     "RUN_ACTIVATE": _CYAN,
     "RUNNER_START": _CYAN,
     "CONDUCTOR_START": _CYAN_BOLD,
+    "RUN_COMPLETE": _GREEN,
+    "GIT_PUSH": _GREEN,
+    "PR_CREATED": _GREEN,
     "PLAN": _YELLOW,
     "BRAIN_CALL": _YELLOW,
+    "RETRY": _YELLOW,
+    "STAGE_TRANSITION": _CYAN,
 }
 
 

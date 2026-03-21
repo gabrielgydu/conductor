@@ -48,8 +48,14 @@ _MOCK_CLAUDE_SCRIPT = textwrap.dedent("""\
             exit_code = config.get("exit_code", 0)
             break
 
-    # Write stream-json to stdout
-    print(json.dumps({"type": "assistant", "content": matched_response}), flush=True)
+    # Write stream-json to stdout in the format the orchestrator expects:
+    # {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
+    print(json.dumps({
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "text", "text": matched_response}]
+        }
+    }), flush=True)
     print(json.dumps({
         "type": "result",
         "result": {
@@ -170,10 +176,11 @@ class MockTmux:
     def set_spawn_callback(self, callback: Callable) -> None:
         self._spawn_callback = callback
 
-    async def ensure_session(self, name: str) -> None:
-        self._session_name = name
+    async def ensure_session(self, name: str | None = None) -> None:
+        if name is not None:
+            self._session_name = name
 
-    async def spawn_in_window(self, name: str, cmd: str) -> None:
+    async def spawn_in_window(self, name: str, cmd: str, *, cwd=None) -> None:
         self._spawned_commands.append({"window": name, "cmd": cmd})
         if name not in self._windows:
             self._windows[name] = {"alive": True}
@@ -184,7 +191,19 @@ class MockTmux:
             if asyncio.iscoroutine(result):
                 await result
 
-    async def spawn_in_window_and_wait(self, name: str, cmd: str) -> int:
+    async def spawn_runner_in_window(self, name: str, cmd: str, *, exit_file=None, cwd=None) -> None:
+        """Non-blocking spawn (runner). Optionally writes exit file."""
+        self._spawned_commands.append({"window": name, "cmd": cmd, "runner": True})
+        if name not in self._windows:
+            self._windows[name] = {"alive": True}
+        else:
+            self._windows[name]["alive"] = True
+        if self._spawn_callback is not None:
+            result = self._spawn_callback(name, cmd)
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def spawn_in_window_and_wait(self, name: str, cmd: str, *, exit_file=None, cwd=None) -> int:
         self._spawned_commands.append({"window": name, "cmd": cmd, "waited": True})
         if name not in self._windows:
             self._windows[name] = {"alive": False, "exit_code": 0}
@@ -204,7 +223,19 @@ class MockTmux:
         if name in self._windows:
             self._windows[name]["alive"] = False
 
-    async def kill_session(self, name: str) -> None:
+    async def send_keys(self, name: str, keys: str) -> None:
+        pass
+
+    async def capture_pane(self, name: str, lines: int = 20) -> str:
+        return ""
+
+    async def is_runner_idle(self, name: str) -> bool:
+        return not self._windows.get(name, {}).get("alive", False)
+
+    def session_exists(self) -> bool:
+        return self._session_name is not None
+
+    async def kill_session(self, name: str | None = None) -> None:
         self._session_name = None
         for key in self._windows:
             self._windows[key]["alive"] = False
@@ -219,6 +250,56 @@ def mock_tmux(monkeypatch) -> MockTmux:
     except (AttributeError, ModuleNotFoundError):
         pass
     return tmux
+
+
+@pytest.fixture(autouse=True)
+def mock_conductor_post_run(monkeypatch):
+    """Prevent conductor_post_run from hitting real Claude API in all integration tests."""
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(
+        "conductor.core.orchestrator.conductor_post_run",
+        AsyncMock(return_value=None),
+    )
+
+
+@pytest.fixture(autouse=True)
+def clean_tmp_files():
+    """Clean up conductor temp files before each test."""
+    import glob
+    # Remove old conductor exit and activity files to avoid test pollution
+    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+        for f in glob.glob(pattern):
+            try:
+                Path(f).unlink()
+            except (OSError, FileNotFoundError):
+                pass
+    yield
+    # Also clean up after test
+    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+        for f in glob.glob(pattern):
+            try:
+                Path(f).unlink()
+            except (OSError, FileNotFoundError):
+                pass
+
+
+@pytest.fixture(autouse=True)
+def patch_orchestrator_create_worktree(monkeypatch, tmp_path):
+    """Patch create_worktree to avoid real git ops in tests."""
+    import conductor.core.orchestrator as orch
+
+    _wt_counter = [0]
+
+    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+        run = state.runs[run_idx]
+        stage = run.stages[stage_idx]
+        _wt_counter[0] += 1
+        wt_dir = tmp_path / "worktrees" / f"wt-{_wt_counter[0]}"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        stage.branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
+        stage.worktree = str(wt_dir)
+
+    monkeypatch.setattr(orch, "create_worktree", mock_create_worktree)
 
 
 # ---------------------------------------------------------------------------
@@ -259,18 +340,27 @@ class MockSpeccer:
     def _handle_spawn(
         self, window_name: str, cmd: str, storage_path: Path | None = None
     ) -> None:
-        self._invoke_count += 1
+        # Detect if this is a speccer init call — init calls don't count toward
+        # fail_count since they just set up the spec, not drive the spec cycle.
+        is_init_call = " init " in cmd and "--feature" not in cmd
+
         self._invocations.append(
             {"window": window_name, "cmd": cmd, "count": self._invoke_count}
         )
 
+        if not is_init_call:
+            self._invoke_count += 1
+        invoke = self._invoke_count
+
         # Determine status to write:
-        # - First fail_count invocations: FAILED (explicit failure, triggers retry)
+        # - First fail_count RUN invocations: FAILED (explicit failure, triggers retry)
         # - Next invocation after fails: NEEDS_INPUT (if needs_input=True)
         # - All subsequent: final_status
-        if self._invoke_count <= self._fail_count:
+        if is_init_call:
+            status = "INIT"  # Init always writes INIT to signal successful setup
+        elif invoke <= self._fail_count:
             status = "FAILED"
-        elif self._needs_input and self._invoke_count == self._fail_count + 1:
+        elif self._needs_input and invoke == self._fail_count + 1:
             status = "NEEDS_INPUT"
         else:
             status = self._final_status
@@ -304,6 +394,25 @@ class MockSpeccer:
                 return Path(part)
             if "spec" in part and Path(part).is_dir():
                 return Path(part) / "PROGRESS.md"
+
+        # Try to extract --project-dir and feature name from speccer command
+        # Command patterns:
+        #   speccer init <feature> --project-dir <wt> ...
+        #   speccer run --feature <feature> --project-dir <wt> ...
+        project_dir = None
+        feature_name = None
+        for i, part in enumerate(parts):
+            if part == "--project-dir" and i + 1 < len(parts):
+                project_dir = Path(parts[i + 1])
+            elif part == "--feature" and i + 1 < len(parts):
+                feature_name = parts[i + 1]
+            elif part == "init" and i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                # speccer init <feature_name>
+                feature_name = parts[i + 1]
+
+        if project_dir is not None and feature_name is not None:
+            return project_dir / "docs" / feature_name / "spec" / "PROGRESS.md"
+
         return None
 
 

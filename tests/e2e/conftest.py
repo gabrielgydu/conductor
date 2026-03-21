@@ -25,6 +25,35 @@ from tests.integration.conftest import (  # noqa: F401
 )
 
 
+@pytest.fixture(autouse=True)
+def mock_conductor_post_run_e2e(monkeypatch):
+    """Prevent conductor_post_run from hitting real Claude API in all e2e tests."""
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(
+        "conductor.core.orchestrator.conductor_post_run",
+        AsyncMock(return_value=None),
+    )
+
+
+@pytest.fixture(autouse=True)
+def patch_orchestrator_create_worktree_e2e(monkeypatch, tmp_path):
+    """Patch create_worktree to avoid real git ops in e2e tests."""
+    import conductor.core.orchestrator as orch
+
+    _wt_counter = [0]
+
+    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+        run = state.runs[run_idx]
+        stage = run.stages[stage_idx]
+        _wt_counter[0] += 1
+        wt_dir = tmp_path / "worktrees" / f"wt-{_wt_counter[0]}"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        stage.branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
+        stage.worktree = str(wt_dir)
+
+    monkeypatch.setattr(orch, "create_worktree", mock_create_worktree)
+
+
 class E2EEnvironment:
     def __init__(
         self,
