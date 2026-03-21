@@ -13,6 +13,12 @@ from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState, atomic_save
 from conductor.core.storage import StorageResolver
 
+# Resolve paths to our own speccer/runner wrappers (sibling to the conductor package root)
+# so we never accidentally invoke the old bash versions via PATH.
+_PACKAGE_ROOT = Path(__file__).resolve().parents[3]  # src/conductor/core/orchestrator.py -> repo root
+_SPECCER_BIN = str(_PACKAGE_ROOT / "speccer")
+_RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
+
 
 @dataclass
 class ConductorConfig:
@@ -177,7 +183,7 @@ async def conductor_run_loop(
                     runner_window = f"runner-{run.index}-{stage_idx}"
                     window_names[window_key] = runner_window
                     stage.status = StageStatus.EXECUTING
-                    await tmux.spawn_in_window(runner_window, f"bash {run_sh}")
+                    await tmux.spawn_in_window(runner_window, f"{_RUNNER_BIN} run --feature {run.name} --storage-dir {feature_dir}")
                     _append_log(conductor_log, f"RUNNER_STARTED: {run.name} stage {stage_idx}")
                     has_active_work = True
                 else:
@@ -192,7 +198,7 @@ async def conductor_run_loop(
                 stage.status = StageStatus.SPEC_RUNNING
                 window_name = f"speccer-{run.index}-{stage_idx}"
                 window_names[window_key] = window_name
-                cmd = f"speccer init --feature {run.name} --spec-dir {spec_dir}"
+                cmd = f"{_SPECCER_BIN} init --feature {run.name} --spec-dir {spec_dir}"
                 await tmux.spawn_in_window(window_name, cmd)
                 _append_log(conductor_log, f"SPEC_INIT: {run.name} stage {stage_idx}")
 
@@ -206,7 +212,7 @@ async def conductor_run_loop(
                         stage.status = StageStatus.SPEC_NEEDS_INPUT
                         _append_log(conductor_log, f"SPEC_NEEDS_INPUT: {run.name} stage {stage_idx}")
                         await brain_answer_questions(state, run_idx, stage_idx, storage)
-                        cmd = f"speccer run --continue --spec-dir {spec_dir}"
+                        cmd = f"{_SPECCER_BIN} run --continue --spec-dir {spec_dir}"
                         await tmux.spawn_in_window(window_name, cmd)
                         stage.status = StageStatus.SPEC_RUNNING
                         _append_log(conductor_log, f"SPEC_RESTARTED: {run.name} stage {stage_idx}")
@@ -221,7 +227,7 @@ async def conductor_run_loop(
                         # Died after writing NEEDS_INPUT — call brain, restart
                         _append_log(conductor_log, f"SPEC_NEEDS_INPUT: {run.name} stage {stage_idx}")
                         await brain_answer_questions(state, run_idx, stage_idx, storage)
-                        cmd = f"speccer run --continue --spec-dir {spec_dir}"
+                        cmd = f"{_SPECCER_BIN} run --continue --spec-dir {spec_dir}"
                         await tmux.spawn_in_window(window_name, cmd)
                         stage.status = StageStatus.SPEC_RUNNING
                         _append_log(conductor_log, f"SPEC_RESTARTED: {run.name} stage {stage_idx}")
@@ -233,7 +239,7 @@ async def conductor_run_loop(
                                 conductor_log,
                                 f"SPEC_RETRY {run.monitor.retry_count}: {run.name} stage {stage_idx}",
                             )
-                            cmd = f"speccer run --spec-dir {spec_dir}"
+                            cmd = f"{_SPECCER_BIN} run --spec-dir {spec_dir}"
                             await tmux.spawn_in_window(window_name, cmd)
                             stage.status = StageStatus.SPEC_RUNNING
                         else:

@@ -65,8 +65,8 @@ async def test_conductor_starts_runner_after_generate(
 
     # Runner window spawned with run.sh command
     spawned = mock_tmux.get_spawned_commands()
-    assert any("run.sh" in entry["cmd"] for entry in spawned), (
-        f"Expected runner spawn with run.sh, got: {[e['cmd'] for e in spawned]}"
+    assert any("runner" in entry["cmd"] for entry in spawned), (
+        f"Expected runner spawn, got: {[e['cmd'] for e in spawned]}"
     )
 
     # CONDUCTOR-LOG.md contains runner start event
