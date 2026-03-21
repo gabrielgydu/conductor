@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -21,10 +22,13 @@ from conductor.core.enums import (
 class MonitorState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
+    stall_count: int = 0
+    last_progress_hash: str | None = None
+    last_check_ts: datetime | None = None
+    retry_count: int = 0
     ci_pass_count: int = 0
     ci_fail_count: int = 0
-    last_checked_at: Optional[datetime] = None
-    last_ci_url: Optional[str] = None
+    last_ci_url: str | None = None
 
 
 class ContextWiring(BaseModel):
@@ -37,26 +41,30 @@ class ContextWiring(BaseModel):
 class StageState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
-    id: str
     name: str
+    spec_mode: str
     status: StageStatus = StageStatus.PENDING
-    wiring: Optional[ContextWiring] = None
-    attempt: int = 0
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    error: Optional[str] = None
+    worktree: str | None = None
+    branch: str | None = None
+    context_wiring: ContextWiring | None = None
+    pid: int | None = None
+    started_at: datetime | None = None
 
 
 class RunState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
-    id: str
-    feature: str
-    status: RunStatus = RunStatus.PENDING
+    index: int
+    name: str
+    description: str
+    depends_on: list[int] = []
+    constitution: list[str] = []
     stages: list[StageState] = []
-    monitor: Optional[MonitorState] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    current_stage: int = 0
+    status: RunStatus = RunStatus.PENDING
+    monitor: MonitorState = MonitorState()
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class DomainState(BaseModel):
@@ -71,11 +79,11 @@ class DomainState(BaseModel):
 class SpeccerState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
-    feature: str
-    status: SpeccerStatus = SpeccerStatus.PENDING
-    mode: Optional[str] = None
-    preset: Optional[str] = None
+    feature_name: str
+    status: SpeccerStatus = SpeccerStatus.INIT
     iteration: int = 0
+    mode: str
+    preset: str
     domains: list[DomainState] = []
 
 
@@ -101,19 +109,72 @@ class IntegrationState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
     status: IntegrationStatus = IntegrationStatus.PENDING
-    conflicts: list[ConflictRecord] = []
+    branch: str
+    merged_runs: list[int] = []
+    conflicts_resolved: list[ConflictRecord] = []
+    conflicts_unresolved: list[ConflictRecord] = []
     e2e: Optional[E2ETestState] = None
-    branch: Optional[str] = None
 
 
 class ConductorState(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
+    project_name: str
+    base_branch: str = "main"
     check_interval_s: int = 900
     runs: list[RunState] = []
     integration: Optional[IntegrationState] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# DAG validation
+# ---------------------------------------------------------------------------
+
+
+def validate_dag(runs: list[RunState]) -> None:
+    if not runs:
+        return
+
+    index_set = {run.index for run in runs}
+
+    if len(index_set) != len(runs):
+        seen: set[int] = set()
+        for run in runs:
+            if run.index in seen:
+                raise ValueError(f"Duplicate run index: {run.index}")
+            seen.add(run.index)
+
+    for run in runs:
+        if run.index in run.depends_on:
+            raise ValueError(f"Run {run.index} depends on itself")
+        for dep in run.depends_on:
+            if dep not in index_set:
+                raise ValueError(f"Run {run.index} depends on non-existent run {dep}")
+
+    graph: dict[int, list[int]] = {run.index: [] for run in runs}
+    in_degree: dict[int, int] = {run.index: 0 for run in runs}
+
+    for run in runs:
+        for dep in run.depends_on:
+            graph[dep].append(run.index)
+            in_degree[run.index] += 1
+
+    queue: deque[int] = deque(idx for idx in index_set if in_degree[idx] == 0)
+    processed = 0
+
+    while queue:
+        node = queue.popleft()
+        processed += 1
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if processed != len(runs):
+        unprocessed = sorted(idx for idx in index_set if in_degree[idx] > 0)
+        raise ValueError(f"Dependency cycle detected among runs: {unprocessed}")
 
 
 # ---------------------------------------------------------------------------

@@ -10,50 +10,50 @@ class RunStatus(str, Enum):
 
 class StageStatus(str, Enum):
     PENDING = "pending"
-    ACTIVE = "active"
+    SPEC_INIT = "spec_init"
+    SPEC_RUNNING = "spec_running"
+    SPEC_NEEDS_INPUT = "spec_needs_input"
+    SPEC_COMPLETE = "spec_complete"
+    GENERATED = "generated"
+    EXECUTING = "executing"
     DONE = "done"
-    BLOCKED = "blocked"
-    SKIPPED = "skipped"
     FAILED = "failed"
-    RETRYING = "retrying"
-    WAITING = "waiting"
-    CANCELLED = "cancelled"
-    PARTIAL = "partial"
-    REVIEWING = "reviewing"
+    STALLED = "stalled"
+    BLOCKED = "blocked"
 
 
 class SpeccerStatus(str, Enum):
-    PENDING = "pending"
-    ACTIVE = "active"
-    DONE = "done"
-    FAILED = "failed"
-    BLOCKED = "blocked"
-    REVIEWING = "reviewing"
+    INIT = "init"
+    EXPLORING = "exploring"
+    NEEDS_INPUT = "needs_input"
+    SPECCING = "speccing"
+    COMPLETE = "complete"
+    GENERATED = "generated"
 
 
 class IntegrationStatus(str, Enum):
     PENDING = "pending"
-    ACTIVE = "active"
+    MERGING = "merging"
+    CONFLICT_RESOLVING = "conflict_resolving"
     DONE = "done"
+    PARTIAL = "partial"
     FAILED = "failed"
-    BLOCKED = "blocked"
-    CONFLICT = "conflict"
 
 
 class BrainAction(str, Enum):
-    PROCEED = "proceed"
-    WAIT = "wait"
-    BLOCK = "block"
     RETRY = "retry"
-    ESCALATE = "escalate"
+    BLOCK = "block"
+    STEER = "steer"
+    RESET = "reset"
+    IGNORE = "ignore"
 
 
 class FixerStatus(str, Enum):
-    PENDING = "pending"
-    ACTIVE = "active"
+    WAITING_CI = "waiting_ci"
+    FIXING_CONFLICT = "fixing_conflict"
+    FIXING = "fixing"
+    CLEAN = "clean"
+    NO_CHANGES = "no_changes"
     DONE = "done"
-    FAILED = "failed"
-    BLOCKED = "blocked"
-    SKIPPED = "skipped"
-    RETRYING = "retrying"
-    CANCELLED = "cancelled"
+    CONFLICT_UNRESOLVABLE = "conflict_unresolvable"
+    PUSH_FAILED = "push_failed"
