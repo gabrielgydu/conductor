@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import conductor.core.tmux as _tmux_module
-from conductor.core.brain import brain_answer_questions
+from conductor.core.brain import brain_answer_questions, brain_diagnose_runner
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState
 from conductor.core.storage import StorageResolver
@@ -160,14 +161,27 @@ async def conductor_run_loop(
                 _append_log(conductor_log, f"RUN_BLOCKED: {run.name} stage {stage_idx}")
                 continue
 
-            if stage.status in (StageStatus.GENERATED, StageStatus.DONE):
+            if stage.status == StageStatus.DONE:
                 run.status = RunStatus.DONE
                 continue
 
             if stage.status == StageStatus.SPEC_COMPLETE:
                 stage.status = StageStatus.GENERATED
-                run.status = RunStatus.DONE
                 _append_log(conductor_log, f"GENERATED: {run.name} stage {stage_idx}")
+                # Fall through to GENERATED handler below
+
+            if stage.status == StageStatus.GENERATED:
+                feature_dir = storage.feature_dir(run.name)
+                run_sh = feature_dir / "run.sh"
+                if run_sh.exists():
+                    runner_window = f"runner-{run.index}-{stage_idx}"
+                    window_names[window_key] = runner_window
+                    stage.status = StageStatus.EXECUTING
+                    await tmux.spawn_in_window(runner_window, f"bash {run_sh}")
+                    _append_log(conductor_log, f"RUNNER_STARTED: {run.name} stage {stage_idx}")
+                    has_active_work = True
+                else:
+                    run.status = RunStatus.DONE
                 continue
 
             # Active stages need processing
@@ -239,6 +253,69 @@ async def conductor_run_loop(
                             f"SPEC_FAILED died unexpectedly: {run.name} stage {stage_idx}",
                         )
                         has_active_work = False
+
+            elif stage.status == StageStatus.EXECUTING:
+                runner_window = window_names.get(window_key, f"runner-{run.index}-{stage_idx}")
+                alive = await tmux.is_window_alive(runner_window)
+                feature_dir = storage.feature_dir(run.name)
+
+                if not alive:
+                    exit_code_file = feature_dir / "exit_code"
+                    if exit_code_file.exists():
+                        try:
+                            exit_code = int(exit_code_file.read_text(encoding="utf-8").strip())
+                        except ValueError:
+                            exit_code = 1
+                        if exit_code == 0:
+                            stage.status = StageStatus.DONE
+                            run.status = RunStatus.DONE
+                            _append_log(conductor_log, f"RUNNER_DONE: {run.name} stage {stage_idx}")
+                        else:
+                            stage.status = StageStatus.FAILED
+                            run.status = RunStatus.BLOCKED
+                            _append_log(
+                                conductor_log,
+                                f"RUNNER_FAILED exit_code={exit_code}: {run.name} stage {stage_idx}",
+                            )
+                    else:
+                        stage.status = StageStatus.FAILED
+                        run.status = RunStatus.BLOCKED
+                        _append_log(
+                            conductor_log,
+                            f"RUNNER_DIED unexpectedly: {run.name} stage {stage_idx}",
+                        )
+                else:
+                    activity_log = feature_dir / "activity.log"
+                    current_hash: str | None = None
+                    if activity_log.exists():
+                        content = activity_log.read_text(encoding="utf-8")
+                        current_hash = hashlib.md5(content.encode()).hexdigest()
+
+                    if current_hash is not None and current_hash == run.monitor.last_progress_hash:
+                        run.monitor.stall_count += 1
+                        if run.monitor.stall_count >= 5:
+                            stage.status = StageStatus.FAILED
+                            run.status = RunStatus.BLOCKED
+                            _append_log(
+                                conductor_log,
+                                f"RUNNER_STALL_FAILED stall_count={run.monitor.stall_count}: {run.name} stage {stage_idx}",
+                            )
+                        elif run.monitor.stall_count == 3:
+                            action = await brain_diagnose_runner(state, run_idx, stage_idx, storage)
+                            action_name = action.get("action", "retry")
+                            message = action.get("message", "")
+                            _append_log(
+                                conductor_log,
+                                f"RUNNER_BRAIN_DIAGNOS action={action_name}: {run.name} stage {stage_idx}",
+                            )
+                            if action_name == "steer":
+                                _append_log(
+                                    conductor_log,
+                                    f"RUNNER_STEER: {run.name} stage {stage_idx} - {message}",
+                                )
+                    else:
+                        run.monitor.stall_count = 0
+                        run.monitor.last_progress_hash = current_hash
 
         if not has_active_work:
             break

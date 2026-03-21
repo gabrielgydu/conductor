@@ -28,7 +28,6 @@ from helpers import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="BUG: orchestrator does not handle GENERATED->EXECUTING transition; GENERATED stages are immediately marked DONE with no runner spawned (src/conductor/core/orchestrator.py:81-88)")
 @pytest.mark.asyncio
 async def test_conductor_starts_runner_after_generate(
     mock_tmux,
@@ -51,6 +50,8 @@ async def test_conductor_starts_runner_after_generate(
         if "run.sh" in cmd or "runner" in name:
             mock_tmux.set_window_alive(name, False)
             mock_tmux.set_window_exit_code(name, 0)
+            # Write exit_code file so orchestrator can read it
+            (feature_dir / "exit_code").write_text("0")
 
     mock_tmux.set_spawn_callback(spawn_callback)
 
@@ -83,7 +84,6 @@ async def test_conductor_starts_runner_after_generate(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="BUG: orchestrator has no EXECUTING stage handler; stages stuck at EXECUTING are never monitored, completed, or failed")
 @pytest.mark.asyncio
 async def test_conductor_detects_runner_completion(
     mock_tmux,
@@ -136,7 +136,6 @@ async def test_conductor_detects_runner_completion(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="BUG: orchestrator has no stall detection logic; stall_count never increments, brain is never called, and stalled stages are never failed")
 @pytest.mark.asyncio
 async def test_conductor_detects_runner_stall(
     mock_tmux,
@@ -194,7 +193,6 @@ async def test_conductor_detects_runner_stall(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="BUG: orchestrator has no steering mechanism; brain is never called for stalled runners and steer messages are never sent to runner stdin")
 @pytest.mark.asyncio
 async def test_conductor_steers_stalled_runner(
     mock_tmux,
@@ -248,7 +246,6 @@ async def test_conductor_steers_stalled_runner(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="BUG: orchestrator has no dead runner detection; EXECUTING stages with dead tmux windows are never transitioned to FAILED")
 @pytest.mark.asyncio
 async def test_conductor_detects_dead_runner(
     mock_tmux,
