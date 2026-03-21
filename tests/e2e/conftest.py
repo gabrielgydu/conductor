@@ -1,0 +1,93 @@
+"""E2E test fixtures: E2EEnvironment wrapping all mock infrastructure."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from conductor.core.models import ConductorState, atomic_save
+from conductor.core.storage import StorageResolver
+
+# Import integration fixtures so pytest discovers them
+from tests.integration.conftest import (  # noqa: F401
+    mock_claude_cli,
+    mock_tmux,
+    mock_speccer,
+    mock_runner,
+    tmp_git_repo,
+    tmp_storage_dir,
+    MockClaudeCLI,
+    MockTmux,
+    MockSpeccer,
+    MockRunner,
+)
+
+
+class E2EEnvironment:
+    def __init__(
+        self,
+        repo_path: Path,
+        storage_dir: Path,
+        claude: MockClaudeCLI,
+        tmux: MockTmux,
+        speccer: MockSpeccer,
+        runner: MockRunner,
+    ) -> None:
+        self.repo_path = repo_path
+        self.storage_dir = storage_dir
+        self.claude = claude
+        self.tmux = tmux
+        self.speccer = speccer
+        self.runner = runner
+
+    def init_project(self, name: str, brief: str) -> ConductorState:
+        """Create a ConductorState for the project and write brief to storage."""
+        storage = StorageResolver(self.repo_path)
+        state = ConductorState(
+            project_name=name,
+            base_branch="main",
+            check_interval_s=0,
+            runs=[],
+        )
+        state_path = storage.conductor_state(name)
+        atomic_save(state, state_path)
+
+        brief_path = storage.conductor_brief(name)
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(brief)
+
+        return state
+
+    def get_state(self, project_name: str) -> ConductorState:
+        """Load state from storage."""
+        from conductor.core.models import load_state
+        storage = StorageResolver(self.repo_path)
+        state_path = storage.conductor_state(project_name)
+        return load_state(state_path, ConductorState)
+
+    def make_config(self, check_interval_s: float = 0.1, max_iterations: int = 50) -> dict[str, Any]:
+        """Return a config dict with test-appropriate defaults."""
+        return {
+            "check_interval_s": check_interval_s,
+            "max_iterations": max_iterations,
+        }
+
+
+@pytest.fixture
+def e2e_env(
+    tmp_git_repo,
+    tmp_storage_dir,
+    mock_claude_cli,
+    mock_tmux,
+    mock_speccer,
+    mock_runner,
+) -> E2EEnvironment:
+    return E2EEnvironment(
+        repo_path=tmp_git_repo,
+        storage_dir=tmp_storage_dir,
+        claude=mock_claude_cli,
+        tmux=mock_tmux,
+        speccer=mock_speccer,
+        runner=mock_runner,
+    )
