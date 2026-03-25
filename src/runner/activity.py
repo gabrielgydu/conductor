@@ -89,6 +89,8 @@ def parse_stream_json_text(stream_output: str) -> str:
             event = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") == "assistant":
             msg = event.get("message", {})
             for block in msg.get("content", []):

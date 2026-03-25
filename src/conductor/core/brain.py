@@ -48,6 +48,8 @@ async def brain_diagnose_runner(
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") == "assistant":
             content = event.get("content", "")
             if isinstance(content, str):
@@ -121,6 +123,8 @@ async def brain_answer_questions(
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
             continue
         if event.get("type") == "assistant":
             content = event.get("content", "")

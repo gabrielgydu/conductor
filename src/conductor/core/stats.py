@@ -74,7 +74,10 @@ def extract_stats(stream_json_output: str) -> TokenStats:
         except (json.JSONDecodeError, ValueError):
             continue
         if event.get("type") == "result":
-            usage = event.get("result", {}).get("usage", {})
+            result = event.get("result", {})
+            if not isinstance(result, dict):
+                continue
+            usage = result.get("usage", {})
             return TokenStats(
                 input=usage.get("input_tokens", 0),
                 output=usage.get("output_tokens", 0),
