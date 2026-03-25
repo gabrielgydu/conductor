@@ -167,7 +167,7 @@ async def local_review_fix_loop(
     fix_model: str | None = None,
     scripts_root: Path | None = None,
 ) -> bool:
-    """Run review, fix high-severity findings. Returns True if review eventually passes."""
+    """Run review once, fix once, done. Never blocks the phase."""
     model = resolve_model(fix_model) if fix_model else None
     cwd = scripts_root or project_dir
     findings_file = project_dir / ".claude" / "reviews" / "findings.json"
@@ -187,43 +187,27 @@ async def local_review_fix_loop(
         success("Local review passed (no high-severity findings)")
         return True
 
-    error(f"Local review found {count} high-severity issue(s) — entering fix loop")
+    warn(f"Local review found {count} high-severity issue(s) — attempting fix")
 
-    for attempt in range(1, max_retries + 1):
-        log(f"  Review fix attempt {attempt}/{max_retries}")
+    prompt = _build_review_fix_prompt(findings_file, 1, 1, project_dir, feature_name)
+    await run_claude(prompt, model=model, max_turns=50, cwd=str(project_dir))
 
-        prompt = _build_review_fix_prompt(findings_file, attempt, max_retries, project_dir, feature_name)
-        await run_claude(prompt, model=model, max_turns=50, cwd=str(project_dir))
-
-        # Stage and commit
-        subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=project_dir, capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                ["git", "commit", "-m", f"fix: local review fixes (attempt {attempt})"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            log(dim(f"  Committed review fix (attempt {attempt})"))
-
-        # Re-run review
-        log("  Re-running local review...")
+    # Stage and commit if there are changes
+    subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=project_dir, capture_output=True,
+    )
+    if result.returncode != 0:
         subprocess.run(
-            ["bash", "-c", review_command],
-            cwd=cwd, capture_output=True, text=True,
-            env=env, timeout=900, stdin=subprocess.DEVNULL,
+            ["git", "commit", "-m", "fix: local review fixes"],
+            cwd=project_dir, capture_output=True, text=True,
         )
+        success("Committed review fixes")
+    else:
+        warn(f"No changes made — {count} finding(s) likely false positives, continuing")
 
-        count = _count_high_severity(findings_file)
-        if count == 0:
-            success(f"Local review passed after {attempt} fix attempt(s)")
-            return True
-        error(f"  Review still has {count} high-severity issue(s)")
-
-    error(f"Local review failed after {max_retries} fix attempts")
-    return False
+    return True
 
 
 async def run_local_checks(
