@@ -317,7 +317,7 @@ def build_generate_prompt(
     docs_dir = spec_dir.parent
     project_dir = str(docs_dir.parent.parent)
 
-    model_default = "opus" if mode == "testing" else "sonnet"
+    model_default = "opus"
 
     injections: dict[str, str] = {
         "FEATURE_DESCRIPTION": _read_file(spec_dir / "FEATURE-DESCRIPTION.md"),
@@ -357,6 +357,8 @@ def _extract_text_from_output(output: str) -> str:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
             continue
         if event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
@@ -647,7 +649,7 @@ async def _cmd_run_async(
 
     result = await run_claude(
         prompt,
-        model="claude-sonnet-4-6",
+        model="claude-opus-4-6",
         max_turns=200,
         cwd=str(spec_dir),
     )
@@ -769,7 +771,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
 
     result = await run_claude(
         prompt,
-        model="claude-sonnet-4-6",
+        model="claude-opus-4-6",
         max_turns=200,
         cwd=str(docs_dir),
     )
