@@ -25,6 +25,7 @@ class MonitorState(BaseModel):
     stall_count: int = 0
     last_progress_hash: str | None = None
     last_check_ts: datetime | None = None
+    last_heartbeat_ts: datetime | None = None
     retry_count: int = 0
     ci_pass_count: int = 0
     ci_fail_count: int = 0
@@ -53,6 +54,8 @@ class StageState(BaseModel):
     feature_suffix: str = ""
     feature_description_file: str | None = None
     retries: int = 0
+    infra_retries: int = 0
+    last_exit_code: int | None = None
 
 
 class RunState(BaseModel):
@@ -126,7 +129,7 @@ class ConductorState(BaseModel):
 
     project_name: str
     base_branch: str = "main"
-    check_interval_s: int = 900
+    check_interval_s: int = 120
     runs: list[RunState] = []
     integration: Optional[IntegrationState] = None
     created_at: Optional[datetime] = None

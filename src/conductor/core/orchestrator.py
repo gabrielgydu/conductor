@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +36,7 @@ _RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
 
 @dataclass
 class ConductorConfig:
-    check_interval_s: float = 900.0
+    check_interval_s: float = 120.0
     max_iterations: int = 1000
     max_retries: int = 2
     project_root: Path | None = None
@@ -1016,6 +1018,12 @@ async def check_stall(
     else:
         stall_count = 0
 
+    # Heartbeat: if Claude process is alive, cap stall_count at 1 (don't escalate)
+    window_name = f"run{run_idx}:{stage.name}-exec"
+    if stall_count > 1 and await tmux.has_active_children(window_name):
+        run.monitor.last_heartbeat_ts = datetime.now(timezone.utc)
+        stall_count = 1
+
     run.monitor.last_progress_hash = current_hash
     run.monitor.stall_count = stall_count
     run.monitor.last_check_ts = datetime.now(timezone.utc)
@@ -1173,6 +1181,21 @@ def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None 
                 # Window is gone — write synthetic exit file
                 Path(f"/tmp/conductor-exit-{fname}").write_text("1")
                 return True
+            # Check for zombie runner (window alive but Claude process dead)
+            if r.returncode == 0 and window_name in r.stdout.strip().splitlines():
+                pid_r = subprocess.run(
+                    ["tmux", "list-panes", "-t", f"{session_name}:{window_name}",
+                     "-F", "#{pane_pid}"],
+                    capture_output=True, text=True,
+                )
+                if pid_r.returncode == 0 and pid_r.stdout.strip():
+                    try:
+                        pane_pid = int(pid_r.stdout.strip())
+                        if not _tmux_module.check_pstree_depth(pane_pid):
+                            Path(f"/tmp/conductor-exit-{fname}").write_text("143")
+                            return True
+                    except (ValueError, OSError):
+                        pass
     return False
 
 
@@ -1242,6 +1265,7 @@ async def monitor_runner(
                     pane_output = fail_log.read_text(errors="replace").strip()
                 except OSError:
                     pass
+            stage.last_exit_code = exit_code
             stage.status = StageStatus.FAILED
             _log(
                 "RUNNER_EXIT",
@@ -1274,15 +1298,54 @@ async def monitor_runner(
                     stage=stage_idx,
                     window=window_name,
                 )
-        else:
-            await check_stall(
-                state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
-            )
+            elif elapsed > 60 and not await tmux.has_active_children(window_name):
+                stage.last_exit_code = 143
+                stage.status = StageStatus.FAILED
+                _log(
+                    "RUNNER_ZOMBIE",
+                    f"Runner {fname} alive but Claude process dead (no children)",
+                    log_path,
+                    audit_path,
+                    run=run_idx,
+                    stage=stage_idx,
+                    window=window_name,
+                )
+            else:
+                await check_stall(
+                    state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
+                )
 
 
 # ---------------------------------------------------------------------------
 # Failure handling
 # ---------------------------------------------------------------------------
+
+
+def classify_failure(fname: str, exit_code: int | None, stage: StageState) -> str:
+    """Classify failure as 'infra' or 'logic'.
+
+    - Exit 137/143 (signal kills) → infra
+    - Exit 1 + activity log modified within 60s → infra (mid-work crash)
+    - Everything else → logic
+    """
+    if exit_code in (137, 143):
+        return "infra"
+    if exit_code == 1:
+        pattern = f"/tmp/ralph-activity-{fname}*"
+        matches = glob.glob(pattern)
+        # Sort by mtime, tolerating files deleted between glob and stat
+        timed: list[tuple[float, str]] = []
+        for p in matches:
+            try:
+                timed.append((Path(p).stat().st_mtime, p))
+            except OSError:
+                continue
+        timed.sort(reverse=True)
+        if timed:
+            mtime = timed[0][0]
+            if time.time() - mtime < 60:
+                return "infra"
+    return "logic"
 
 
 async def handle_failure(
@@ -1294,12 +1357,47 @@ async def handle_failure(
     log_path: Path | None = None,
     audit_path: Path | None = None,
 ) -> None:
-    """retries >= 2 -> blocked, else brain diagnose-failure call -> RETRY/BLOCK."""
+    """Classify failure, auto-retry infra failures, brain call for logic failures."""
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    retries = stage.retries
 
+    failure_type = classify_failure(fname, stage.last_exit_code, stage)
+
+    # Infra failures: auto-retry without brain call, separate budget (cap 5)
+    if failure_type == "infra":
+        if stage.infra_retries >= 5:
+            stage.status = StageStatus.BLOCKED
+            _log(
+                "BLOCKED",
+                f"Run {run.name} stage {stage.name}: max infra retries ({stage.infra_retries})",
+                log_path,
+                audit_path,
+                run=run_idx,
+                stage=stage_idx,
+                reason="max_infra_retries",
+                exit_code=stage.last_exit_code,
+            )
+            return
+        stage.infra_retries += 1
+        _log(
+            "INFRA_RETRY",
+            f"Run {run.name} stage {stage.name}: infra failure (exit {stage.last_exit_code}), "
+            f"auto-retry {stage.infra_retries}/5",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+            infra_retries=stage.infra_retries,
+            exit_code=stage.last_exit_code,
+        )
+        await restart_stage(
+            state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+        )
+        return
+
+    # Logic failures: existing brain call flow, cap at 2
+    retries = stage.retries
     if retries >= 2:
         stage.status = StageStatus.BLOCKED
         _log(
@@ -1313,7 +1411,7 @@ async def handle_failure(
         )
         return
 
-    # Build failure context
+    # Build failure context for brain call
     context_parts: list[str] = []
 
     import glob as _glob
@@ -1410,6 +1508,7 @@ async def restart_stage(
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
     current_status = stage.status
+    stage.last_exit_code = None
 
     if current_status == StageStatus.FAILED:
         # Determine where to restart based on how far the stage got.

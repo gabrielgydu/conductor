@@ -3,8 +3,28 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 from pathlib import Path
+
+# Minimum number of PIDs expected in a healthy runner process tree
+# (shell → python → claude = 3 processes)
+MIN_HEALTHY_TREE_DEPTH = 3
+
+
+def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
+    """Check if a process tree has at least `depth` PIDs (sync).
+
+    Returns True if pstree is not available (safe fallback).
+    """
+    r = subprocess.run(
+        ["pstree", "-p", str(pid)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return True
+    pids = re.findall(r"\((\d+)\)", r.stdout)
+    return len(pids) >= depth
 
 
 class TmuxManager:
@@ -171,6 +191,17 @@ class TmuxManager:
     async def kill_session(self) -> None:
         """Kill the tmux session."""
         self._run_tmux("kill-session", "-t", self._session_name, check=False)
+
+    async def has_active_children(self, name: str, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
+        """Check if the pane has a healthy process tree.
+
+        Returns False if fewer than `depth` PIDs in the tree (zombie runner).
+        Falls back to True if pstree is not available.
+        """
+        pid = await self.get_pane_pid(name)
+        if pid is None:
+            return False
+        return check_pstree_depth(pid, depth)
 
     async def capture_pane(self, name: str, lines: int = 20) -> str:
         """Capture the last N lines from a tmux pane."""
