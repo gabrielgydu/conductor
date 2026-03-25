@@ -47,6 +47,19 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "POST_RUN_END":      EventConfig("📋", True),
     "FILE_WRITE":        EventConfig("📝", False),
     "RUNNER_BRAIN_DIAGNOS": EventConfig("🧠", False),
+    # Loop events
+    "LOOP_START":        EventConfig("●",  True),
+    "LOOP_DONE":         EventConfig("■",  True),
+    "SESSION_START":     EventConfig("▶",  True),
+    "SESSION_END":       EventConfig("◼",  False),
+    "CLAUDE_RUNNING":    EventConfig("⚙",  False),
+    "TASK_SIGNAL":       EventConfig("◆",  False),
+    "TASK_COMPLETED":    EventConfig("✓",  True),
+    "TASK_FAILED":       EventConfig("✗",  True),
+    "GATE_FAILED":       EventConfig("✗",  True),
+    "NO_SIGNAL":         EventConfig("↻",  False),
+    "PARTIAL_COMMIT":    EventConfig("⚙",  False),
+    "PUSH":              EventConfig("⬆",  True),
 }
 
 # ---------------------------------------------------------------------------
@@ -79,6 +92,15 @@ _COLOR_MAP: dict[str, str] = {
     "BRAIN_CALL": _YELLOW,
     "RETRY": _YELLOW,
     "STAGE_TRANSITION": _CYAN,
+    # Loop colors
+    "LOOP_START": _CYAN_BOLD,
+    "LOOP_DONE": _GREEN,
+    "SESSION_START": _CYAN,
+    "TASK_COMPLETED": _GREEN,
+    "TASK_FAILED": _RED,
+    "GATE_FAILED": _RED,
+    "PUSH": _GREEN,
+    "NO_SIGNAL": _YELLOW,
 }
 
 
