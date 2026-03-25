@@ -132,7 +132,8 @@ class ConductorState(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     preset: Optional[str] = None
-    overnight: bool = False
+    overnight: bool = True
+    quick: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ def test_speccer_status_values():
 
 def test_integration_status_values():
     values = [e.value for e in IntegrationStatus]
-    assert len(values) == 6
+    assert len(values) == 7
 
 
 def test_brain_action_values():

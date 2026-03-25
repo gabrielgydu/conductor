@@ -12,7 +12,7 @@ def _resolve_repo_root(repo_path: Path) -> Path:
             text=True,
             check=True,
         )
-        git_dir = Path(result.stdout.strip()).resolve()
+        git_dir = (repo_path / result.stdout.strip()).resolve()
         if git_dir.name == ".git" or str(git_dir).endswith(".git"):
             return git_dir.parent
         return git_dir

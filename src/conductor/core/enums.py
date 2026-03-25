@@ -38,6 +38,7 @@ class IntegrationStatus(str, Enum):
     DONE = "done"
     PARTIAL = "partial"
     FAILED = "failed"
+    NEEDS_FIX = "needs_fix"
 
 
 class BrainAction(str, Enum):
