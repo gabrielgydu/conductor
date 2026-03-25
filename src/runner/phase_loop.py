@@ -145,7 +145,8 @@ async def _run_plain_iteration(
             continue
         try:
             event = json.loads(line)
-            append_event_to_activity_log(activity_log, event)
+            if isinstance(event, dict):
+                append_event_to_activity_log(activity_log, event)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -163,8 +164,8 @@ async def _run_steerable_iteration(
     cwd: str,
     activity_log: Path,
     idle_timeout: float = 600.0,
-) -> tuple[str, str]:
-    """Run one steerable Claude invocation. Returns (raw_output, assistant_text)."""
+) -> tuple[str, str, dict | None]:
+    """Run one steerable Claude invocation. Returns (raw_output, assistant_text, result_event)."""
     session = await SteerableSession.launch(
         prompt,
         model=model,
@@ -173,15 +174,13 @@ async def _run_steerable_iteration(
         activity_log=activity_log,
     )
     try:
-        assistant_text, _result_event = await session.stream_events(
+        assistant_text, result_event = await session.stream_events(
             idle_timeout=idle_timeout,
         )
     finally:
         await session.close()
 
-    # For steerable, we don't have a raw stream-json buffer; return text directly.
-    # We still return a consistent tuple — raw_output is the same as assistant_text here.
-    return assistant_text, assistant_text
+    return assistant_text, assistant_text, result_event
 
 
 # ─── Single phase execution ──────────────────────────────────────────────────
@@ -252,9 +251,10 @@ async def _run_phase(
         )
 
         # ── Invoke Claude ──────────────────────────────────────────────────
+        result_event = None
         try:
             if cfg.steerable:
-                raw_output, assistant_text = await _run_steerable_iteration(
+                raw_output, assistant_text, result_event = await _run_steerable_iteration(
                     prompt, model, max_turns, cwd_str, activity_log
                 )
             else:
@@ -270,9 +270,19 @@ async def _run_phase(
         iter_duration = time.monotonic() - iter_start
 
         # ── Record stats ───────────────────────────────────────────────────
-        tokens = extract_stats(raw_output) if not cfg.steerable else TokenStats()
-        pricing = get_pricing(model or "")
-        cost = calculate_cost(tokens, pricing)
+        if cfg.steerable and result_event:
+            usage = result_event.get("usage", {})
+            tokens = TokenStats(
+                input=usage.get("input_tokens", 0),
+                output=usage.get("output_tokens", 0),
+                cache_read=usage.get("cache_read_input_tokens", 0),
+                cache_write=usage.get("cache_creation_input_tokens", 0),
+            )
+            cost = result_event.get("total_cost_usd", 0.0)
+        else:
+            tokens = extract_stats(raw_output) if not cfg.steerable else TokenStats()
+            pricing = get_pricing(model or "")
+            cost = calculate_cost(tokens, pricing)
 
         entry = StatsEntry(
             type="phase",
@@ -338,6 +348,24 @@ async def _run_phase(
             # ── Push ───────────────────────────────────────────────────────
             if cfg.push_enabled:
                 git_push(project_dir, cfg.push_remote)
+
+            # ── Local checks (skip in quick mode) ─────────────────────────
+            if not cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
+                from runner.local_checks import run_local_checks  # noqa: PLC0415
+
+                await run_local_checks(
+                    project_dir,
+                    cfg.feature_name,
+                    ci_enabled=cfg.local_ci_enabled,
+                    ci_command=cfg.local_ci_command,
+                    ci_full_command=cfg.local_ci_full_command,
+                    ci_max_retries=cfg.local_ci_max_retries,
+                    review_enabled=cfg.local_review_enabled,
+                    review_command=cfg.local_review_command,
+                    review_full_command=cfg.local_review_full_command,
+                    review_max_retries=cfg.local_review_max_retries,
+                    fix_model=cfg.fix_model,
+                )
 
             phase_complete = True
             break
@@ -444,6 +472,28 @@ async def run_phase_loop(
         # Brief pause between phases
         if phase.number < len(cfg.phases):
             await asyncio.sleep(3)
+
+    # ── End-of-run local checks (quick mode: deferred to here) ──────────
+    if exit_code == 0 and cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
+        from runner.local_checks import run_local_checks  # noqa: PLC0415
+
+        header("END-OF-RUN LOCAL CHECKS (full)")
+        checks_ok = await run_local_checks(
+            project_dir,
+            cfg.feature_name,
+            ci_enabled=cfg.local_ci_enabled,
+            ci_command=cfg.local_ci_command,
+            ci_full_command=cfg.local_ci_full_command,
+            ci_max_retries=cfg.local_ci_max_retries,
+            review_enabled=cfg.local_review_enabled,
+            review_command=cfg.local_review_command,
+            review_full_command=cfg.local_review_full_command,
+            review_max_retries=cfg.local_review_max_retries,
+            fix_model=cfg.fix_model,
+            full_mode=True,
+        )
+        if not checks_ok:
+            exit_code = 1
 
     # ── Teardown ───────────────────────────────────────────────────────────
     try:

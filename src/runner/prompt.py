@@ -72,6 +72,14 @@ AUTONOMOUS EXECUTION RULES:
 - DO NOT run git add or git commit — the runner handles commits automatically after the quality gate passes
 - LEARNINGS: When you encounter a non-obvious problem and find the solution, append it to docs/{feature_name}/LEARNINGS.md so future iterations don't repeat the same mistake. Format: ## Problem title, what went wrong, what fixed it. Keep entries concise. Also write learnings when you discover environment quirks, selector gotchas, timing issues, or anything that cost you significant effort to figure out.
 
+TESTING RULES:
+- Tests must validate INTENDED behavior (from the spec/plan), not CURRENT behavior
+- If you write a test and it fails, the DEFAULT assumption is the CODE is wrong, not the test
+- Only change a test assertion if you can justify that the spec/plan was wrong
+- Never weaken a test to make it pass — fix the code instead
+- If a test expects behavior X (per the spec) but the code does Y, that is a BUG in the code — fix the code
+- Do not shape tests around buggy reality. Tests are the spec's enforcement mechanism.
+
 PROJECT CONTEXT:
 - Working directory: {project_dir}
 - Feature: {feature_name}

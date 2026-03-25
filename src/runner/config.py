@@ -63,6 +63,24 @@ class RunConfig:
     # git remote name to push to
     push_remote: str = "origin"
 
+    # Quick mode: quality gate only between phases, full CI+review at end
+    quick: bool = False
+
+    # Local CI config
+    local_ci_enabled: bool = False
+    local_ci_command: str = ""
+    local_ci_full_command: str = ""
+    local_ci_max_retries: int = 3
+
+    # Local review config
+    local_review_enabled: bool = False
+    local_review_command: str = ""
+    local_review_full_command: str = ""
+    local_review_max_retries: int = 2
+
+    # Model for fix loops
+    fix_model: Optional[str] = None
+
     @classmethod
     def load(cls, path: Path) -> "RunConfig":
         data = json.loads(path.read_text("utf-8"))
@@ -88,6 +106,16 @@ class RunConfig:
             max_gate_retries=data.get("max_gate_retries", 3),
             steerable=data.get("steerable", False),
             push_remote=data.get("push_remote", "origin"),
+            quick=data.get("quick", False),
+            local_ci_enabled=data.get("local_ci_enabled", False),
+            local_ci_command=data.get("local_ci_command", ""),
+            local_ci_full_command=data.get("local_ci_full_command", ""),
+            local_ci_max_retries=data.get("local_ci_max_retries", 3),
+            local_review_enabled=data.get("local_review_enabled", False),
+            local_review_command=data.get("local_review_command", ""),
+            local_review_full_command=data.get("local_review_full_command", ""),
+            local_review_max_retries=data.get("local_review_max_retries", 2),
+            fix_model=data.get("fix_model"),
         )
 
     def save(self, path: Path) -> None:
@@ -102,6 +130,16 @@ class RunConfig:
             "max_gate_retries": self.max_gate_retries,
             "steerable": self.steerable,
             "push_remote": self.push_remote,
+            "quick": self.quick,
+            "local_ci_enabled": self.local_ci_enabled,
+            "local_ci_command": self.local_ci_command,
+            "local_ci_full_command": self.local_ci_full_command,
+            "local_ci_max_retries": self.local_ci_max_retries,
+            "local_review_enabled": self.local_review_enabled,
+            "local_review_command": self.local_review_command,
+            "local_review_full_command": self.local_review_full_command,
+            "local_review_max_retries": self.local_review_max_retries,
+            "fix_model": self.fix_model,
             "phases": [
                 {
                     "number": p.number,

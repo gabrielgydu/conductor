@@ -66,6 +66,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.push_enabled = False
     if args.no_fixer:
         cfg.fixer_enabled = False
+    if args.quick:
+        cfg.quick = True
     if args.max_iterations:
         cfg.max_iterations = args.max_iterations
 
@@ -172,6 +174,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--start-phase", type=int, default=None, help="Start from this phase number (1-based)")
     p_run.add_argument("--no-push", action="store_true", help="Disable push even if enabled in config")
     p_run.add_argument("--no-fixer", action="store_true", help="Disable fixer even if enabled in config")
+    p_run.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end")
     p_run.add_argument("--max-iterations", type=int, default=None, help="Override max iterations per phase")
 
     # --- fixer ---
