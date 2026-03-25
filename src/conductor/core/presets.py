@@ -102,8 +102,7 @@ class AcmePreset(BasePreset):
             local_review_enabled=True,
             local_review_command="./scripts/local-review.sh",
             local_review_full_command="./scripts/local-review.sh --full",
-            model="opus",
-            fix_model="opus",
+            fix_model="sonnet",
         )
 
     def quality_gate(self, cwd: Path) -> GateResult:
@@ -168,8 +167,7 @@ class NodeappPreset(BasePreset):
         self.config = PresetConfig(
             push_enabled=False,
             fixer_enabled=False,
-            model="opus",
-            fix_model="opus",
+            fix_model="sonnet",
         )
 
     def quality_gate(self, cwd: Path) -> GateResult:

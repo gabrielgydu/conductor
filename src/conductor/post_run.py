@@ -105,7 +105,7 @@ async def review_learnings(
     template = _load_prompt_template("review-learnings")
     prompt = template.replace("{CONTEXT}", context)
 
-    result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=1)
+    result = await run_claude(prompt, model="claude-sonnet-4-6", max_turns=1)
     response_text = _extract_text_from_stream_json(result.output)
 
     if "<<<NO_CHANGES>>>" in response_text:
@@ -325,7 +325,7 @@ async def generate_audit_report(
     template = _load_prompt_template("overnight-audit")
     prompt = template.replace("{CONTEXT}", context)
 
-    result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=1)
+    result = await run_claude(prompt, model="claude-sonnet-4-6", max_turns=1)
     report_text = _extract_text_from_stream_json(result.output)
 
     if not report_text.strip():

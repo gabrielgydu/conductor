@@ -1302,7 +1302,7 @@ async def handle_failure(
         stage=stage_idx,
     )
 
-    result = await run_claude(context, model=resolve_model("opus"), max_turns=1)
+    result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
 
     response_text = ""
     for line in result.output.splitlines():
@@ -1960,7 +1960,7 @@ async def _review_learnings(
         + claudemd_section
     )
 
-    result = await run_claude(prompt, model=resolve_model("opus"), max_turns=1)
+    result = await run_claude(prompt, model=resolve_model("sonnet"), max_turns=1)
 
     import json as _json
 
@@ -2085,7 +2085,7 @@ async def _generate_audit_report(
         )
 
     context = "\n\n".join(context_parts)
-    result = await run_claude(context, model=resolve_model("opus"), max_turns=1)
+    result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
 
     response_text = ""
     for line in result.output.splitlines():

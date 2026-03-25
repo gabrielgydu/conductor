@@ -167,7 +167,7 @@ async def resolve_conflicts_with_claude(
 
         result = await run_claude(
             prompt,
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-6",
             max_turns=50,
             cwd=str(cwd),
         )

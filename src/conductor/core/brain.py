@@ -37,7 +37,7 @@ async def brain_diagnose_runner(
         f"Please diagnos the issue and suggest an action (retry, steer, or block)."
     )
 
-    result = await run_claude(prompt, model="claude-opus-4-6[1m]")
+    result = await run_claude(prompt, model="claude-sonnet-4-6")
 
     answer_text = ""
     for line in result.output.splitlines():

@@ -348,7 +348,7 @@ def _run_completeness_review(
     result = asyncio.run(
         run_claude(
             review_prompt,
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-6",
             max_turns=1,
             cwd=str(repo_path),
         )
