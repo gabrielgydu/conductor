@@ -67,6 +67,8 @@ def _extract_text_from_stream_json(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -93,9 +95,7 @@ async def review_learnings(
 
     claudemd_files = _collect_claudemd_files(project_dir)
     if not claudemd_files.strip():
-        live_log("PLAN", "No CLAUDE.md files found — skipping review",
-                 log_path=log_path, audit_path=audit_path)
-        return 0
+        claudemd_files = "(No CLAUDE.md files exist yet — create .claude/CLAUDE.md if learnings warrant it)"
 
     context = (
         f"## Learnings from Completed Run(s)\n\n{learnings}\n"
@@ -124,17 +124,20 @@ async def review_learnings(
     for file_path_str, content in file_blocks:
         file_path_str = file_path_str.strip()
         full_path = project_dir / file_path_str
-        if not full_path.exists():
-            live_log("PLAN", f"Skipping non-existent file: {file_path_str}",
-                     log_path=log_path, audit_path=audit_path)
-            continue
         content = content.strip()
-        if content:
+        if not content:
+            continue
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        if full_path.exists():
             with open(full_path, "a", encoding="utf-8") as f:
                 f.write(f"\n## Conductor Learnings\n\n{content}\n")
-            updates_applied += 1
             live_log("PLAN", f"Updated {file_path_str} with learnings",
                      log_path=log_path, audit_path=audit_path)
+        else:
+            full_path.write_text(f"## Conductor Learnings\n\n{content}\n", encoding="utf-8")
+            live_log("PLAN", f"Created {file_path_str} with learnings",
+                     log_path=log_path, audit_path=audit_path)
+        updates_applied += 1
 
     if updates_applied > 0:
         subprocess.run(
