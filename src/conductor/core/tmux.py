@@ -33,12 +33,14 @@ class TmuxManager:
                 "-x", "200", "-y", "50",
             )
 
-    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None) -> None:
+    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None, detached: bool = False) -> None:
         """Spawn command in a new tmux window (non-blocking, fire-and-forget)."""
         # Kill stale window first
         self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
 
         args = ["new-window", "-t", self._session_name, "-n", name]
+        if detached:
+            args.insert(1, "-d")
         if cwd:
             args.extend(["-c", cwd])
         args.append(cmd)
@@ -100,8 +102,15 @@ class TmuxManager:
         # Kill stale window
         self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
 
-        # Wrap command to write exit code on completion
-        wrapped = f'{cmd}; echo $? > {exit_file}'
+        # Wrap command to capture pane output on failure and write exit code
+        fail_log = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
+        wrapped = (
+            f'{cmd}; _rc=$?; '
+            f'if [ "$_rc" -ne 0 ]; then '
+            f'tmux capture-pane -t "$TMUX_PANE" -p -S -50 > {fail_log} 2>/dev/null; '
+            f'fi; '
+            f'echo $_rc > {exit_file}'
+        )
 
         args = ["new-window", "-t", self._session_name, "-n", name]
         if cwd:
@@ -121,16 +130,18 @@ class TmuxManager:
         return name in r.stdout.strip().splitlines()
 
     async def is_runner_idle(self, name: str) -> bool:
-        """Check if the runner's pane is idle (command is bash/zsh = process finished)."""
-        r = self._run_tmux(
-            "list-panes", "-t", f"{self._session_name}:{name}",
-            "-F", "#{pane_current_command}",
-            check=False,
-        )
-        if r.returncode != 0:
+        """Check if the runner's pane is idle (no child processes under the pane shell)."""
+        pid = await self.get_pane_pid(name)
+        if pid is None:
             return True  # Window doesn't exist = "idle"
-        cmd = r.stdout.strip()
-        return cmd in ("bash", "zsh", "sh", "fish", "")
+        # Check if the pane's shell has any child processes
+        import subprocess as _sp
+        r = _sp.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True, text=True,
+        )
+        # pgrep exits 0 if children found, 1 if none
+        return r.returncode != 0
 
     async def get_pane_pid(self, name: str) -> int | None:
         """Get PID of the process in the tmux pane."""
