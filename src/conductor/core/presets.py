@@ -60,6 +60,9 @@ class Preset(ABC):
     @abstractmethod
     def stage_teardown(self, cwd: Path) -> None: ...
 
+    @abstractmethod
+    def run_teardown(self, cwd: Path) -> None: ...
+
 
 class BasePreset(Preset):
     def __init__(self) -> None:
@@ -75,6 +78,9 @@ class BasePreset(Preset):
         return ""
 
     def stage_teardown(self, cwd: Path) -> None:
+        pass
+
+    def run_teardown(self, cwd: Path) -> None:
         pass
 
 
@@ -96,6 +102,8 @@ class AcmePreset(BasePreset):
             local_review_enabled=True,
             local_review_command="./scripts/local-review.sh",
             local_review_full_command="./scripts/local-review.sh --full",
+            model="opus",
+            fix_model="opus",
         )
 
     def quality_gate(self, cwd: Path) -> GateResult:
@@ -135,6 +143,16 @@ class AcmePreset(BasePreset):
         )
 
     def stage_teardown(self, cwd: Path) -> None:
+        try:
+            subprocess.run(
+                ["./scripts/worktree-env.sh", "down"],
+                cwd=cwd,
+                timeout=60,
+            )
+        except Exception:
+            pass
+
+    def run_teardown(self, cwd: Path) -> None:
         try:
             subprocess.run(
                 ["./scripts/worktree-env.sh", "down"],
@@ -216,6 +234,17 @@ class NodeappPreset(BasePreset):
                     failures.append(f"{pkg}/test: error reading package.json or timed out")
 
         return GateResult(passed=len(failures) == 0, failures=failures)
+
+
+def detect_preset(project_dir: Path) -> str:
+    """Auto-detect preset from project directory markers."""
+    # Acme: has app/ and partner/ directories
+    if (project_dir / "app").is_dir() and (project_dir / "partner").is_dir():
+        return "acme"
+    # Nodeapp: has packages/ with shared/backend/frontend
+    if (project_dir / "packages" / "shared").is_dir():
+        return "nodeapp"
+    return "base"
 
 
 def load_preset(name: Optional[str]) -> Preset:
