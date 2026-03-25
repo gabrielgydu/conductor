@@ -19,6 +19,7 @@ from asyncio.subprocess import PIPE
 from pathlib import Path
 from typing import AsyncIterator, Callable, Awaitable
 
+from conductor.core.claude import progress_on_event
 from runner.activity import append_event_to_activity_log
 
 
@@ -46,6 +47,7 @@ class SteerableSession:
         self._start_time = start_time
         self._last_event_time = time.monotonic()
         self._closed = False
+        self._stderr_task: asyncio.Task | None = None
 
     @classmethod
     async def launch(
@@ -83,20 +85,46 @@ class SteerableSession:
             close_fds=True,
         )
 
-        # Write the initial prompt as NDJSON
-        initial = json.dumps({"type": "user", "role": "user", "content": prompt}) + "\n"
+        # Write the initial prompt as NDJSON — CLI expects message.role, not top-level role
+        initial = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+            "session_id": "",
+            "parent_tool_use_id": None,
+        }) + "\n"
         proc.stdin.write(initial.encode("utf-8"))
         await proc.stdin.drain()
 
-        return cls(proc, activity_log, start)
+        # Drain stderr in background to prevent buffer deadlock and log errors
+        session = cls(proc, activity_log, start)
+        session._stderr_task = asyncio.ensure_future(session._drain_stderr())
+        return session
 
     async def send(self, message: str) -> None:
         """Send a follow-up message to the running Claude process."""
         if self._closed or self._proc.stdin is None or self._proc.stdin.is_closing():
             raise RuntimeError("SteerableSession: cannot send to closed session")
-        formatted = json.dumps({"type": "user", "role": "user", "content": message}) + "\n"
+        formatted = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": message},
+            "session_id": "",
+            "parent_tool_use_id": None,
+        }) + "\n"
         self._proc.stdin.write(formatted.encode("utf-8"))
         await self._proc.stdin.drain()
+
+    async def _drain_stderr(self) -> None:
+        """Read stderr in background to prevent buffer deadlock."""
+        assert self._proc.stderr is not None
+        import logging
+        logger = logging.getLogger("runner.steerable")
+        while True:
+            line = await self._proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                logger.warning("Claude stderr: %s", text)
 
     async def stream_events(
         self,
@@ -137,9 +165,12 @@ class SteerableSession:
                     event = json.loads(raw)
                 except (json.JSONDecodeError, ValueError):
                     continue
+                if not isinstance(event, dict):
+                    continue
 
-                # Write to activity log
+                # Write to activity log + live progress display
                 append_event_to_activity_log(self._activity_log, event)
+                progress_on_event(event)
 
                 # Collect assistant text
                 if event.get("type") == "assistant":
@@ -156,14 +187,8 @@ class SteerableSession:
                     done.set()
                     return
 
-                # end_turn stop reason is a reliable completion signal
-                if event.get("type") == "assistant":
-                    msg = event.get("message", {})
-                    if msg.get("stop_reason") == "end_turn":
-                        # Give Claude a moment to emit result before we stop
-                        await asyncio.sleep(0.5)
-                        done.set()
-                        return
+                # end_turn stop reason means Claude is done — but keep reading
+                # to capture the result event with cost/token stats
 
                 if on_event is not None:
                     await on_event(event)
@@ -215,6 +240,13 @@ class SteerableSession:
             except asyncio.TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
+
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         return self._proc.returncode or 0
 
