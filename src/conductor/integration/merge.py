@@ -209,6 +209,7 @@ async def _run_post_merge_validation(wt: Path) -> tuple[bool, str]:
         proc_up = await asyncio.create_subprocess_exec(
             str(worktree_env),
             "up",
+            "--all",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(wt),

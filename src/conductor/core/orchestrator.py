@@ -277,13 +277,23 @@ async def run_speccer_init(
                     args += ["--spec-context", full_ctx]
 
     cmd = f"cd {wt} && {' '.join(args)}"
+    _log(
+        "SPECCER_INVOKE",
+        f"speccer init {fname} (mode={mode}) [window: {window_name}]",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+        command="speccer init",
+        mode=mode,
+    )
     exit_code = await tmux.spawn_in_window_and_wait(
         window_name, cmd, exit_file=exit_file, cwd=wt
     )
 
     _log(
         "SPECCER_INVOKE",
-        f"speccer init {fname} (mode={mode})",
+        f"speccer init {fname} (mode={mode}) done",
         log_path,
         audit_path,
         run=run_idx,
@@ -325,11 +335,19 @@ async def run_speccer_run(
     exit_file.unlink(missing_ok=True)
 
     cmd = f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt}"
+    _log(
+        "SPECCER_INVOKE",
+        f"speccer run {fname} [window: {window_name}]",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+    )
     await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
 
     _log(
         "SPECCER_INVOKE",
-        f"speccer run {fname}",
+        f"speccer run {fname} done",
         log_path,
         audit_path,
         run=run_idx,
@@ -360,11 +378,19 @@ async def run_speccer_continue(
     cmd = (
         f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue"
     )
+    _log(
+        "SPECCER_INVOKE",
+        f"speccer run --continue {fname} [window: {window_name}]",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+    )
     await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
 
     _log(
         "SPECCER_INVOKE",
-        f"speccer run --continue {fname}",
+        f"speccer run --continue {fname} done",
         log_path,
         audit_path,
         run=run_idx,
@@ -393,11 +419,19 @@ async def run_speccer_generate(
     exit_file.unlink(missing_ok=True)
 
     cmd = f"cd {wt} && {_SPECCER_BIN} generate --feature {fname} --project-dir {wt}"
+    _log(
+        "SPECCER_INVOKE",
+        f"speccer generate {fname} [window: {window_name}]",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+    )
     rc = await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
 
     _log(
         "SPECCER_INVOKE",
-        f"speccer generate {fname}",
+        f"speccer generate {fname} done",
         log_path,
         audit_path,
         run=run_idx,
@@ -1114,9 +1148,9 @@ async def check_stall(
             stage.status = StageStatus.FAILED
 
 
-def _any_runner_exit_file_ready(state: ConductorState) -> bool:
-    """Check if any executing stage has a runner exit file, meaning it finished."""
-    for run in state.runs:
+def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None = None) -> bool:
+    """Check if any executing stage has a runner exit file or dead window."""
+    for ri, run in enumerate(state.runs):
         if run.status != RunStatus.ACTIVE:
             continue
         si = run.current_stage
@@ -1128,6 +1162,17 @@ def _any_runner_exit_file_ready(state: ConductorState) -> bool:
         fname = run.name + stage.feature_suffix
         if Path(f"/tmp/conductor-exit-{fname}").exists():
             return True
+        # Also detect dead windows (runner crashed without writing exit file)
+        if session_name:
+            window_name = f"run{ri}:{stage.name}-exec"
+            r = subprocess.run(
+                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and window_name not in r.stdout.strip().splitlines():
+                # Window is gone — write synthetic exit file
+                Path(f"/tmp/conductor-exit-{fname}").write_text("1")
+                return True
     return False
 
 
@@ -1366,11 +1411,26 @@ async def restart_stage(
     fname = run.name + stage.feature_suffix
     current_status = stage.status
 
-    if current_status in (
+    if current_status == StageStatus.FAILED:
+        # Determine where to restart based on how far the stage got.
+        # If run.sh exists, the spec phase completed — restart from runner.
+        wt = stage.worktree
+        run_sh = Path(wt) / "docs" / fname / "run.sh" if wt else None
+        if run_sh and run_sh.exists():
+            exit_file = Path(f"/tmp/conductor-exit-{fname}")
+            exit_file.unlink(missing_ok=True)
+            Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
+            stage.status = StageStatus.GENERATED
+        else:
+            pre_reset_speccer_status(state, run_idx, stage_idx, storage)
+            exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+            exit_file.unlink(missing_ok=True)
+            stage.status = StageStatus.SPEC_INIT
+
+    elif current_status in (
         StageStatus.SPEC_INIT,
         StageStatus.SPEC_RUNNING,
         StageStatus.SPEC_NEEDS_INPUT,
-        StageStatus.FAILED,
     ):
         pre_reset_speccer_status(state, run_idx, stage_idx, storage)
         exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
@@ -2257,7 +2317,7 @@ async def conductor_run_loop(
             while elapsed < config.check_interval_s:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
-                if _any_runner_exit_file_ready(state):
+                if _any_runner_exit_file_ready(state, session_name=f"conductor-{state.project_name}"):
                     break
 
     else:
