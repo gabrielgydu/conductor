@@ -3,10 +3,157 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from asyncio.subprocess import PIPE
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from datetime import datetime, timezone
+from typing import AsyncIterator, Callable
+
+# Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
+_USE_DEFAULT = object()
+
+# ANSI codes for progress output
+_DIM = "\033[2m"
+_CYAN = "\033[36m"
+_YELLOW = "\033[33m"
+_MAGENTA = "\033[35m"
+_GRAY = "\033[90m"
+_GREEN_BOLD = "\033[1;32m"
+_RESET = "\033[0m"
+
+
+def _isatty() -> bool:
+    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+
+
+def _ts() -> str:
+    """Return a dim HH:MM:SS timestamp prefix."""
+    t = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    if _isatty():
+        return f"{_DIM}{t}{_RESET} "
+    return f"{t} "
+
+# Track context window size (updated from init events)
+_ctx_max = 200_000
+
+
+def progress_on_event(event: dict) -> None:
+    """Default on_event callback — prints live progress to stderr, matching ralph style."""
+    global _ctx_max
+    t = event.get("type")
+    color = _isatty()
+
+    # System init — detect context window size
+    if t == "system" and event.get("subtype") == "init":
+        model = event.get("model", "")
+        if "[1m]" in model:
+            _ctx_max = 1_000_000
+        else:
+            _ctx_max = 200_000
+        return
+
+    # Assistant turn — show context stats + content
+    if t == "assistant":
+        ts = _ts()
+        msg = event.get("message", {})
+        usage = msg.get("usage", {})
+
+        # Context usage line (like ralph)
+        inp = usage.get("input_tokens", 0)
+        cc = usage.get("cache_creation_input_tokens", 0)
+        cr = usage.get("cache_read_input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        if inp or cc or cr or out:
+            ctx_k = (inp + cc + cr) // 1000
+            ctx_max_k = _ctx_max // 1000
+            pct = (inp + cc + cr) * 100 // _ctx_max if _ctx_max else 0
+            stats = f"[{ctx_k}k/{ctx_max_k}k {pct}% | in:{inp} cache_r:{cr} cache_w:{cc} out:{out}]"
+            if color:
+                sys.stderr.write(f"{ts}{_DIM}{stats}{_RESET}\n")
+            else:
+                sys.stderr.write(f"{ts}{stats}\n")
+
+        content = msg.get("content", [])
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+
+            if bt == "tool_use":
+                name = block.get("name", "")
+                inp_data = block.get("input", {})
+                if name in ("Edit", "Write", "Read"):
+                    detail = inp_data.get("file_path", "")
+                    c = _DIM + _CYAN if color else ""
+                elif name == "Bash":
+                    detail = inp_data.get("command", "")[:150]
+                    c = _DIM + _YELLOW if color else ""
+                elif name == "Grep":
+                    pat = inp_data.get("pattern", "")
+                    path = inp_data.get("path", "")
+                    glb = inp_data.get("glob", "")
+                    detail = pat + (f" in {path}" if path else "") + (f" ({glb})" if glb else "")
+                    c = _DIM + _MAGENTA if color else ""
+                elif name == "Glob":
+                    pat = inp_data.get("pattern", "")
+                    path = inp_data.get("path", "")
+                    detail = pat + (f" in {path}" if path else "")
+                    c = _DIM + _MAGENTA if color else ""
+                elif name in ("TaskRead", "TaskWrite", "TodoRead", "TodoWrite"):
+                    detail = ""
+                    c = _DIM if color else ""
+                else:
+                    detail = str(inp_data)[:120]
+                    c = _DIM if color else ""
+                r = _RESET if color else ""
+                sys.stderr.write(f"{ts}{c}{name}: {detail}{r}\n")
+
+            elif bt == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    sys.stderr.write(f"{ts}{text}\n")
+
+            elif bt == "thinking":
+                thinking = block.get("thinking", "").strip()
+                if thinking:
+                    if color:
+                        sys.stderr.write(f"{ts}{_DIM}{_CYAN}{thinking}{_RESET}\n")
+                    else:
+                        sys.stderr.write(f"{ts}{thinking}\n")
+
+        sys.stderr.flush()
+        return
+
+    # Tool results (user events containing tool_result)
+    if t == "user":
+        ts = _ts()
+        msg = event.get("message", {})
+        content = msg.get("content", [])
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                c = str(block.get("content", ""))
+                if len(c) > 200:
+                    c = c[:200] + "…"
+                if c:
+                    if color:
+                        sys.stderr.write(f"{ts}{_DIM}  {_GRAY}→ {c}{_RESET}\n")
+                    else:
+                        sys.stderr.write(f"{ts}  → {c}\n")
+        sys.stderr.flush()
+        return
+
+    # Result event — show bold green subtype
+    if t == "result":
+        ts = _ts()
+        subtype = event.get("subtype", "")
+        if color:
+            sys.stderr.write(f"{ts}{_GREEN_BOLD}{subtype}{_RESET}\n")
+        else:
+            sys.stderr.write(f"{ts}{subtype}\n")
+        sys.stderr.flush()
 
 
 @dataclass
@@ -28,20 +175,22 @@ def _extract_tokens_from_stdout(stdout_text: str) -> dict[str, int] | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
         if event.get("type") == "result":
-            result_val = event.get("result", {})
-            if isinstance(result_val, str):
-                # result can be a string in some stream-json formats
-                continue
-            usage = result_val.get("usage", {})
-            if isinstance(usage, str):
-                continue
-            return {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-            }
+            # usage may be top-level on the result event or nested under result
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                result_val = event.get("result", {})
+                if isinstance(result_val, dict):
+                    usage = result_val.get("usage")
+            if isinstance(usage, dict):
+                return {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+                }
     return None
 
 
@@ -53,8 +202,16 @@ async def run_claude(
     output_format: str = "stream-json",
     append_args: list[str] | None = None,
     cwd: str | None = None,
+    on_event: Callable[[dict], None] | object = _USE_DEFAULT,
 ) -> ClaudeResult:
-    """Run claude CLI non-interactively, passing prompt via stdin."""
+    """Run claude CLI non-interactively, passing prompt via stdin.
+
+    By default, streams live progress to stderr (tool calls, text, context usage).
+    Pass on_event=None to suppress output, or a custom callback.
+    """
+    # Resolve sentinel to default progress printer
+    if on_event is _USE_DEFAULT:
+        on_event = progress_on_event
     cmd = [
         "claude",
         "-p", "-",
@@ -76,11 +233,51 @@ async def run_claude(
         stderr=PIPE,
         cwd=cwd,
         close_fds=True,
+        limit=10 * 1024 * 1024,  # 10MB line buffer (Claude JSON lines can be large)
     )
-    stdout_bytes, _stderr_bytes = await proc.communicate(prompt.encode("utf-8"))
-    duration = time.monotonic() - start
 
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    if on_event is None:
+        # Original non-streaming path
+        stdout_bytes, _stderr_bytes = await proc.communicate(prompt.encode("utf-8"))
+        duration = time.monotonic() - start
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    else:
+        # Streaming path: write prompt, close stdin, then read stdout line by line
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+        await proc.stdin.wait_closed()
+
+        # Drain stderr in background to avoid pipe deadlock
+        async def _drain_stderr():
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    break
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+
+        lines: list[str] = []
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace")
+            lines.append(line)
+            stripped = line.strip()
+            if stripped:
+                try:
+                    event = json.loads(stripped)
+                    if isinstance(event, dict):
+                        on_event(event)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        await stderr_task
+        await proc.wait()
+        duration = time.monotonic() - start
+        stdout_text = "".join(lines)
+
     tokens = _extract_tokens_from_stdout(stdout_text)
 
     return ClaudeResult(
@@ -125,6 +322,8 @@ class SteerableSession:
                 event = json.loads(line.decode("utf-8", errors="replace").strip())
             except (json.JSONDecodeError, ValueError):
                 continue
+            if not isinstance(event, dict):
+                continue
             yield event
 
     async def wait(self, timeout: float = 300) -> ClaudeResult:
@@ -143,13 +342,18 @@ class SteerableSession:
                     if isinstance(content, str):
                         output_parts.append(content)
                 if event.get("type") == "result":
-                    usage = event.get("result", {}).get("usage", {})
-                    tokens = {
-                        "input_tokens": usage.get("input_tokens", 0),
-                        "output_tokens": usage.get("output_tokens", 0),
-                        "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-                    }
+                    usage = event.get("usage")
+                    if not isinstance(usage, dict):
+                        result_val = event.get("result", {})
+                        if isinstance(result_val, dict):
+                            usage = result_val.get("usage")
+                    if isinstance(usage, dict):
+                        tokens = {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+                            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+                        }
                     break
 
         async def _idle_watchdog():
@@ -244,6 +448,7 @@ async def run_claude_steerable(
         stderr=PIPE,
         cwd=cwd,
         close_fds=True,
+        limit=10 * 1024 * 1024,  # 10MB line buffer (Claude JSON lines can be large)
     )
 
     initial = json.dumps({
@@ -261,7 +466,7 @@ async def run_claude_steerable(
 def resolve_model(name: str) -> str:
     """Resolve short model names to full Claude model IDs."""
     _MODEL_MAP = {
-        "opus": "claude-opus-4-6[1m]",
+        "opus": "claude-opus-4-6",
         "opus-200k": "claude-opus-4-6",
         "sonnet": "claude-sonnet-4-6",
         "haiku": "claude-haiku-4-5",
