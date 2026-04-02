@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import glob
 import hashlib
 import os
 import re
@@ -13,7 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import conductor.core.tmux as _tmux_module
@@ -33,12 +32,20 @@ _PACKAGE_ROOT = (
 _SPECCER_BIN = str(_PACKAGE_ROOT / "speccer")
 _RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
 
+# Tracks consecutive shallow-pstree observations per tmux window name.
+# Only declare zombie after ZOMBIE_SHALLOW_THRESHOLD consecutive shallow checks,
+# to avoid false positives during the brief gap when the runner restarts Claude
+# between phase iterations.
+_shallow_tree_counts: dict[str, int] = {}
+ZOMBIE_SHALLOW_THRESHOLD = 3
+
 
 @dataclass
 class ConductorConfig:
     check_interval_s: float = 120.0
     max_iterations: int = 1000
     max_retries: int = 2
+    max_parallel: int = 1
     project_root: Path | None = None
     overnight: bool = True
 
@@ -85,9 +92,21 @@ def _progress_file_path(
     return Path(wt) / "docs" / fname / "spec" / "PROGRESS.md"
 
 
+def _activity_log_path(state: ConductorState, run_idx: int, stage_idx: int) -> Path | None:
+    """Return path to activity.log for a given run/stage, or None if worktree is not set."""
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    wt = stage.worktree
+    if not wt:
+        return None
+    fname = run.name + stage.feature_suffix
+    return Path(wt) / "docs" / fname / "activity.log"
+
+
 # ---------------------------------------------------------------------------
 # Worktree management
 # ---------------------------------------------------------------------------
+
 
 
 def create_worktree(
@@ -115,14 +134,19 @@ def create_worktree(
     if isinstance(storage_or_project_dir, Path):
         # Direct path convention: (state, run_idx, stage_idx, project_dir, worktrees_base)
         project_dir = storage_or_project_dir
-        wt_base = worktrees_base or (project_dir.parent / "worktrees")
+        wt_base = worktrees_base or (
+            Path(state.worktrees_base) if state.worktrees_base else project_dir.parent / "worktrees"
+        )
     else:
         # StorageResolver convention: (state, run_idx, stage_idx, storage)
         storage = storage_or_project_dir
         project_dir = storage.repo_root
-        wt_base = project_dir.parent / "worktrees"
+        wt_base = (
+            Path(state.worktrees_base) if state.worktrees_base else project_dir.parent / "worktrees"
+        )
 
-    # Branch naming: conductor/{project}/{run}/{stage}
+    # Branch naming: conductor/{project}/{run}/{stage} to avoid ref collisions
+    # with the base branch (which may share the project_name prefix)
     branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
 
     # Worktree path: worktrees_base / {run}-{stage}
@@ -289,8 +313,9 @@ async def run_speccer_init(
         command="speccer init",
         mode=mode,
     )
+    log_file = storage.tmux_log(state.project_name, f"speccer-init_{fname}")
     exit_code = await tmux.spawn_in_window_and_wait(
-        window_name, cmd, exit_file=exit_file, cwd=wt
+        window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
     )
 
     _log(
@@ -345,7 +370,8 @@ async def run_speccer_run(
         run=run_idx,
         stage=stage_idx,
     )
-    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
+    log_file = storage.tmux_log(state.project_name, f"speccer-run_{fname}")
+    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
 
     _log(
         "SPECCER_INVOKE",
@@ -388,7 +414,8 @@ async def run_speccer_continue(
         run=run_idx,
         stage=stage_idx,
     )
-    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
+    log_file = storage.tmux_log(state.project_name, f"speccer-continue_{fname}")
+    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
 
     _log(
         "SPECCER_INVOKE",
@@ -429,7 +456,8 @@ async def run_speccer_generate(
         run=run_idx,
         stage=stage_idx,
     )
-    rc = await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt)
+    log_file = storage.tmux_log(state.project_name, f"speccer-generate_{fname}")
+    rc = await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
 
     _log(
         "SPECCER_INVOKE",
@@ -853,9 +881,9 @@ def generate_run_config(
         ))
 
     # Extract model if present
-    model_match = re.search(r'RALPH_MODEL\s*=\s*"([^"]+)"', text)
+    model_match = re.search(r'CONDUCTOR_MODEL\s*=\s*"([^"]+)"', text)
     model = model_match.group(1) if model_match else ""
-    fix_model_match = re.search(r'RALPH_FIX_MODEL\s*=\s*"([^"]+)"', text)
+    fix_model_match = re.search(r'CONDUCTOR_FIX_MODEL\s*=\s*"([^"]+)"', text)
     fix_model = fix_model_match.group(1) if fix_model_match else model
 
     cfg = RunConfig(
@@ -933,7 +961,8 @@ async def start_runner(
 
     storage_dir = str(docs_dir)
     cmd = f"cd {wt} && {_RUNNER_BIN} run --feature {fname} --storage-dir {storage_dir}"
-    await tmux.spawn_runner_in_window(window_name, cmd, exit_file=exit_file, cwd=wt)
+    log_file = storage.tmux_log(state.project_name, f"runner_{fname}")
+    await tmux.spawn_runner_in_window(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
 
     stage.started_at = datetime.now(timezone.utc)
 
@@ -967,16 +996,9 @@ def compute_progress_hash(
         return hashlib.md5(progress_file.read_bytes()).hexdigest()
 
     if stage.status == StageStatus.EXECUTING:
-        # Find activity log by glob
-        import glob as _glob
-
-        pattern = f"/tmp/ralph-activity-{fname}*"
-        matches = sorted(
-            _glob.glob(pattern), key=lambda p: Path(p).stat().st_mtime, reverse=True
-        )
-        if not matches:
+        activity_log = _activity_log_path(state, run_idx, stage_idx)
+        if activity_log is None or not activity_log.exists():
             return None
-        activity_log = Path(matches[0])
         lines = activity_log.read_text(encoding="utf-8", errors="replace").splitlines()
         last20 = "\n".join(lines[-20:])
         return hashlib.md5(last20.encode()).hexdigest()
@@ -1057,19 +1079,10 @@ async def check_stall(
         # Build context for brain call
         context_parts: list[str] = []
 
-        import glob as _glob
-
         if stage.status == StageStatus.EXECUTING:
-            pattern = f"/tmp/ralph-activity-{fname}*"
-            matches = sorted(
-                _glob.glob(pattern), key=lambda p: Path(p).stat().st_mtime, reverse=True
-            )
-            if matches:
-                lines = (
-                    Path(matches[0])
-                    .read_text(encoding="utf-8", errors="replace")
-                    .splitlines()
-                )
+            activity_log = _activity_log_path(state, run_idx, stage_idx)
+            if activity_log is not None and activity_log.exists():
+                lines = activity_log.read_text(encoding="utf-8", errors="replace").splitlines()
                 context_parts.append(
                     "## Activity Log (last 100 lines)\n" + "\n".join(lines[-100:])
                 )
@@ -1089,7 +1102,11 @@ async def check_stall(
         context_parts.append(
             f"## Stall Duration\nStalled for {stall_seconds}s ({stall_count} consecutive checks)"
         )
-        context = "\n\n".join(context_parts)
+        no_tools = (
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+            "Tool calls will be REJECTED and will waste your only turn.\n\n"
+        )
+        context = no_tools + "\n\n".join(context_parts)
 
         _log(
             "BRAIN_CALL",
@@ -1135,13 +1152,16 @@ async def check_stall(
             )
             message = "\n".join(lines_after)
             if message and stage.status == StageStatus.EXECUTING:
-                # Attempt to steer via ralph_steer — best-effort
+                # Write steering message to runner's steer_inbox (file-based IPC)
                 try:
-                    subprocess.run(
-                        ["ralph", "steer", fname, message],
-                        capture_output=True,
-                        timeout=10,
-                    )
+                    worktree = stage.worktree
+                    if worktree:
+                        inbox = Path(worktree) / "docs" / fname / "steer_inbox"
+                        inbox.mkdir(parents=True, exist_ok=True)
+                        msg_file = inbox / f"{time.time():.6f}.msg"
+                        tmp_file = msg_file.with_suffix(".msg.tmp")
+                        tmp_file.write_text(message, encoding="utf-8")
+                        tmp_file.rename(msg_file)  # atomic on same filesystem
                     _log(
                         "RUNNER_STEER",
                         f"Steered {fname}",
@@ -1191,9 +1211,17 @@ def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None 
                 if pid_r.returncode == 0 and pid_r.stdout.strip():
                     try:
                         pane_pid = int(pid_r.stdout.strip())
+                        window_key = f"{session_name}:{window_name}"
                         if not _tmux_module.check_pstree_depth(pane_pid):
-                            Path(f"/tmp/conductor-exit-{fname}").write_text("143")
-                            return True
+                            _shallow_tree_counts[window_key] = (
+                                _shallow_tree_counts.get(window_key, 0) + 1
+                            )
+                            if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
+                                _shallow_tree_counts.pop(window_key, None)
+                                Path(f"/tmp/conductor-exit-{fname}").write_text("143")
+                                return True
+                        else:
+                            _shallow_tree_counts.pop(window_key, None)
                     except (ValueError, OSError):
                         pass
     return False
@@ -1232,30 +1260,9 @@ async def monitor_runner(
                 stage=stage_idx,
                 exit_code=0,
             )
-            # Post-runner validation
-            from conductor.core.validation import ValidationContext, validate_and_fix  # noqa: PLC0415
-
-            vctx = ValidationContext(
-                project_dir=Path(stage.worktree)
-                if stage.worktree
-                else config.project_root or Path.cwd(),
-                stage="post-runner",
-                feature_name=fname,
-            )
-            vresult = await validate_and_fix(vctx, max_attempts=2)
-            if vresult.passed:
-                stage.status = StageStatus.DONE
-                stage.completed_at = datetime.now(timezone.utc)
-            else:
-                stage.status = StageStatus.FAILED
-                _log(
-                    "VALIDATION_FAILED",
-                    f"Post-runner validation failed for {fname}: {vresult.summary}",
-                    log_path,
-                    audit_path,
-                    run=run_idx,
-                    stage=stage_idx,
-                )
+            # Runner already ran local CI before exiting 0 — skip redundant validation
+            stage.status = StageStatus.DONE
+            stage.completed_at = datetime.now(timezone.utc)
         else:
             # Read captured pane output if available
             fail_log = Path(f"/tmp/conductor-fail-{fname}.log")
@@ -1299,18 +1306,44 @@ async def monitor_runner(
                     window=window_name,
                 )
             elif elapsed > 60 and not await tmux.has_active_children(window_name):
-                stage.last_exit_code = 143
-                stage.status = StageStatus.FAILED
-                _log(
-                    "RUNNER_ZOMBIE",
-                    f"Runner {fname} alive but Claude process dead (no children)",
-                    log_path,
-                    audit_path,
-                    run=run_idx,
-                    stage=stage_idx,
-                    window=window_name,
+                session_name = tmux._session_name
+                window_key = f"{session_name}:{window_name}"
+                _shallow_tree_counts[window_key] = (
+                    _shallow_tree_counts.get(window_key, 0) + 1
                 )
+                if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
+                    _shallow_tree_counts.pop(window_key, None)
+                    stage.last_exit_code = 143
+                    stage.status = StageStatus.FAILED
+                    _log(
+                        "RUNNER_ZOMBIE",
+                        f"Runner {fname} alive but Claude process dead (no children, "
+                        f"{ZOMBIE_SHALLOW_THRESHOLD} consecutive checks)",
+                        log_path,
+                        audit_path,
+                        run=run_idx,
+                        stage=stage_idx,
+                        window=window_name,
+                    )
+                else:
+                    _log(
+                        "RUNNER_SHALLOW_TREE",
+                        f"Runner {fname} shallow pstree (check "
+                        f"{_shallow_tree_counts[window_key]}/{ZOMBIE_SHALLOW_THRESHOLD}), "
+                        "waiting before declaring zombie",
+                        log_path,
+                        audit_path,
+                        run=run_idx,
+                        stage=stage_idx,
+                        window=window_name,
+                    )
+                    await check_stall(
+                        state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
+                    )
             else:
+                # Tree is healthy — reset any accumulated shallow count
+                window_key = f"{tmux._session_name}:{window_name}"
+                _shallow_tree_counts.pop(window_key, None)
                 await check_stall(
                     state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
                 )
@@ -1321,30 +1354,50 @@ async def monitor_runner(
 # ---------------------------------------------------------------------------
 
 
+_TRANSIENT_PATTERNS = re.compile(
+    r"api_error|overloaded_error|internal server error|server_error|rate_limit"
+    r"|529|500\s*error|capacity|connection error|timeout|econnreset"
+    r"|APIStatusError|APIConnectionError|APITimeoutError",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_api_error(fname: str) -> bool:
+    """Check fail logs for transient API error patterns."""
+    paths_to_check = [
+        Path(f"/tmp/conductor-fail-{fname}.log"),
+    ]
+    for p in paths_to_check:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _TRANSIENT_PATTERNS.search(text):
+            return True
+    return False
+
+
 def classify_failure(fname: str, exit_code: int | None, stage: StageState) -> str:
-    """Classify failure as 'infra' or 'logic'.
+    """Classify failure as 'infra', 'transient', or 'logic'.
 
     - Exit 137/143 (signal kills) → infra
+    - Exit 1 + transient API error patterns in fail log → transient
     - Exit 1 + activity log modified within 60s → infra (mid-work crash)
     - Everything else → logic
     """
     if exit_code in (137, 143):
         return "infra"
     if exit_code == 1:
-        pattern = f"/tmp/ralph-activity-{fname}*"
-        matches = glob.glob(pattern)
-        # Sort by mtime, tolerating files deleted between glob and stat
-        timed: list[tuple[float, str]] = []
-        for p in matches:
+        if _is_transient_api_error(fname):
+            return "transient"
+        if stage.worktree:
+            activity_log = Path(stage.worktree) / "docs" / fname / "activity.log"
             try:
-                timed.append((Path(p).stat().st_mtime, p))
+                mtime = activity_log.stat().st_mtime
+                if time.time() - mtime < 60:
+                    return "infra"
             except OSError:
-                continue
-        timed.sort(reverse=True)
-        if timed:
-            mtime = timed[0][0]
-            if time.time() - mtime < 60:
-                return "infra"
+                pass
     return "logic"
 
 
@@ -1396,6 +1449,46 @@ async def handle_failure(
         )
         return
 
+    # Transient API failures: exponential backoff with 8-hour window
+    if failure_type == "transient":
+        now = datetime.now(timezone.utc)
+        if stage.first_transient_failure_ts is None:
+            stage.first_transient_failure_ts = now
+        elapsed_hours = (now - stage.first_transient_failure_ts).total_seconds() / 3600
+        if elapsed_hours > 8:
+            stage.status = StageStatus.BLOCKED
+            _log(
+                "BLOCKED",
+                f"Run {run.name} stage {stage.name}: API unavailable for 8+ hours",
+                log_path,
+                audit_path,
+                run=run_idx,
+                stage=stage_idx,
+                reason="transient_timeout",
+                exit_code=stage.last_exit_code,
+            )
+            return
+        # Exponential backoff: 30s, 60s, 2m, 4m, 8m, 16m, 32m, 60m cap
+        backoff_s = min(3600, 30 * (2 ** stage.transient_retries))
+        stage.transient_retries += 1
+        stage.backoff_until = now + timedelta(seconds=backoff_s)
+        _log(
+            "TRANSIENT_FAILURE",
+            f"Run {run.name} stage {stage.name}: API error, backing off {backoff_s}s "
+            f"(attempt {stage.transient_retries})",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+            backoff_s=backoff_s,
+            transient_retries=stage.transient_retries,
+            exit_code=stage.last_exit_code,
+        )
+        await restart_stage(
+            state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+        )
+        return
+
     # Logic failures: existing brain call flow, cap at 2
     retries = stage.retries
     if retries >= 2:
@@ -1414,17 +1507,11 @@ async def handle_failure(
     # Build failure context for brain call
     context_parts: list[str] = []
 
-    import glob as _glob
     import json as _json
 
-    pattern = f"/tmp/ralph-activity-{fname}*"
-    matches = sorted(
-        _glob.glob(pattern), key=lambda p: Path(p).stat().st_mtime, reverse=True
-    )
-    if matches:
-        lines = (
-            Path(matches[0]).read_text(encoding="utf-8", errors="replace").splitlines()
-        )
+    activity_log = _activity_log_path(state, run_idx, stage_idx)
+    if activity_log is not None and activity_log.exists():
+        lines = activity_log.read_text(encoding="utf-8", errors="replace").splitlines()
         context_parts.append(
             "## Activity Log (last 100 lines)\n" + "\n".join(lines[-100:])
         )
@@ -1433,7 +1520,11 @@ async def handle_failure(
         "## Stage Config\n" + _json.dumps(stage.model_dump(), indent=2, default=str)
     )
     context_parts.append(f"## Retries\n{retries} of 2")
-    context = "\n\n".join(context_parts)
+    no_tools = (
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+        "Tool calls will be REJECTED and will waste your only turn.\n\n"
+    )
+    context = no_tools + "\n\n".join(context_parts)
 
     _log(
         "BRAIN_CALL",
@@ -1510,7 +1601,7 @@ async def restart_stage(
     current_status = stage.status
     stage.last_exit_code = None
 
-    if current_status == StageStatus.FAILED:
+    if current_status in (StageStatus.FAILED, StageStatus.BLOCKED):
         # Determine where to restart based on how far the stage got.
         # If run.sh exists, the spec phase completed — restart from runner.
         wt = stage.worktree
@@ -1714,6 +1805,7 @@ def push_and_create_pr(
         ],
         capture_output=True,
         text=True,
+        cwd=str(project_dir),
     )
 
     if pr_result.returncode == 0:
@@ -1746,8 +1838,11 @@ def push_and_create_pr(
 # ---------------------------------------------------------------------------
 
 
-def activate_ready_runs(state: ConductorState) -> list[int]:
+def activate_ready_runs(state: ConductorState, max_parallel: int = 1) -> list[int]:
     """Activate runs whose dependencies are satisfied; block runs whose deps are blocked.
+
+    Respects max_parallel: won't activate more than max_parallel runs concurrently.
+    A max_parallel of 0 means unlimited.
 
     Returns list of run indices that are now active (or were already active).
     """
@@ -1778,6 +1873,9 @@ def activate_ready_runs(state: ConductorState) -> list[int]:
             if dep in run_by_index
         )
         if all_done:
+            # Respect concurrency cap before activating
+            if max_parallel > 0 and len(activated) >= max_parallel:
+                continue
             run.status = RunStatus.ACTIVE
             activated.append(run.index)
 
@@ -1890,6 +1988,23 @@ async def advance_run(
         return
 
     stage = run.stages[stage_idx]
+
+    # ----- backoff gate (transient API failures) -----
+    if stage.backoff_until:
+        now = datetime.now(timezone.utc)
+        if now < stage.backoff_until:
+            return  # still in backoff, skip this run
+        # Backoff expired, clear and retry
+        stage.backoff_until = None
+        _log(
+            "TRANSIENT_RETRY",
+            f"Run {run.name} stage {stage.name}: backoff complete, retrying",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+        )
+
     status = stage.status
 
     # ----- pending -----
@@ -2104,6 +2219,8 @@ async def _review_learnings(
         claudemd_section = "(No CLAUDE.md files exist yet — create .claude/CLAUDE.md if learnings warrant it)"
 
     prompt = (
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+        "Tool calls will be REJECTED and will waste your only turn.\n\n"
         "Review the learnings below from completed conductor runs. "
         "Extract project-specific conventions, patterns, and gotchas that would help "
         "future Claude sessions working on this codebase. "
@@ -2243,7 +2360,11 @@ async def _generate_audit_report(
             "## Conductor Log (last 100 lines)\n" + "\n".join(lines[-100:])
         )
 
-    context = "\n\n".join(context_parts)
+    no_tools = (
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+        "Tool calls will be REJECTED and will waste your only turn.\n\n"
+    )
+    context = no_tools + "\n\n".join(context_parts)
     result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
 
     response_text = ""
@@ -2286,6 +2407,59 @@ async def _generate_audit_report(
 
 
 # ---------------------------------------------------------------------------
+# Auto-resume blocked runs on startup
+# ---------------------------------------------------------------------------
+
+
+async def _auto_resume_blocked_runs(
+    state: ConductorState,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    """Un-block any BLOCKED runs so they resume automatically on restart."""
+    any_resumed = False
+    for run_idx, run in enumerate(state.runs):
+        if run.status != RunStatus.BLOCKED:
+            continue
+        stage = run.stages[run.current_stage]
+        if stage.status != StageStatus.BLOCKED:
+            # Cascaded dependency block — just reset run to PENDING
+            run.status = RunStatus.PENDING
+            _log(
+                "AUTO_RESUME",
+                f"Run {run.name}: un-blocked (dependency cascade), reset to PENDING",
+                log_path,
+                audit_path,
+                run=run_idx,
+            )
+            any_resumed = True
+            continue
+        # Stage was the actual blocker — restart it
+        stage.status = StageStatus.FAILED  # so restart_stage() dispatches correctly
+        await restart_stage(state, run_idx, run.current_stage, storage, log_path, audit_path)
+        # Reset all retry counters
+        stage.retries = 0
+        stage.infra_retries = 0
+        stage.transient_retries = 0
+        stage.first_transient_failure_ts = None
+        stage.backoff_until = None
+        run.monitor.stall_count = 0
+        run.status = RunStatus.ACTIVE
+        _log(
+            "AUTO_RESUME",
+            f"Run {run.name} stage {stage.name}: resumed, retries reset",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=run.current_stage,
+        )
+        any_resumed = True
+    if any_resumed:
+        atomic_save(state, storage.conductor_state(state.project_name))
+
+
+# ---------------------------------------------------------------------------
 # Main run loop
 # ---------------------------------------------------------------------------
 
@@ -2307,6 +2481,10 @@ async def conductor_run_loop(
     log_path = storage.conductor_log(state.project_name)
     audit_path = storage.conductor_audit(state.project_name)
     preset = load_preset(state.preset)
+
+    # Apply worktrees_base from preset if not set from CLI
+    if not state.worktrees_base and preset and preset.config.worktrees_base:
+        state.worktrees_base = preset.config.worktrees_base
 
     tmux = _tmux_module.TmuxManager(session_name=f"conductor-{state.project_name}")
     await tmux.ensure_session()
@@ -2334,10 +2512,13 @@ async def conductor_run_loop(
         audit_path,
     )
 
+    # Auto-resume any BLOCKED runs from a previous session
+    await _auto_resume_blocked_runs(state, storage, log_path, audit_path)
+
     exit_reason = "unknown"
 
     for _iteration in range(config.max_iterations):
-        active_run_indices = activate_ready_runs(state)
+        active_run_indices = activate_ready_runs(state, max_parallel=config.max_parallel)
 
         all_terminal = all(
             r.status in (RunStatus.DONE, RunStatus.BLOCKED) for r in state.runs

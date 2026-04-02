@@ -181,12 +181,15 @@ def _run_dump_regen(
     log("  Running dump-regen commands...")
     for cmd in regen_commands:
         log(dim(f"    {cmd}"))
-        result = subprocess.run(
-            ["bash", "-c", cmd],
-            cwd=project_dir, capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            warn(f"    dump-regen failed (exit {result.returncode}) — continuing")
+        try:
+            result = subprocess.run(
+                ["bash", "-c", cmd],
+                cwd=project_dir, capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                warn(f"    dump-regen failed (exit {result.returncode}) — continuing")
+        except subprocess.TimeoutExpired:
+            warn(f"    dump-regen timed out after 300s — continuing")
 
     # Commit regen changes if any
     subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)

@@ -45,6 +45,7 @@ class PresetConfig:
     fixer_skip_patterns: str = "coverage|Coverage|codecov|Codecov"
     overnight_cap_hours: int = 8
     max_retries: int = 3
+    worktrees_base: str = ""
 
 
 class Preset(ABC):
@@ -103,6 +104,7 @@ class AcmePreset(BasePreset):
             local_review_command="./scripts/local-review.sh",
             local_review_full_command="./scripts/local-review.sh --full",
             fix_model="sonnet",
+            worktrees_base=str(Path.home() / "acme" / "acme-bare"),
         )
 
     def quality_gate(self, cwd: Path) -> GateResult:
@@ -139,6 +141,11 @@ class AcmePreset(BasePreset):
         return (
             f"- PARTNER PHPStan: {cwd}/scripts/worktree-env.sh phpstan partner\n"
             f"- APP PHPStan: {cwd}/scripts/worktree-env.sh phpstan app\n"
+            f"- Playwright tests: {cwd}/scripts/worktree-env.sh playwright [args]\n"
+            f"  NEVER run npx playwright or cd into app/tests/Playwright to run tests directly.\n"
+            f"  ALL Playwright tests MUST run via ./scripts/worktree-env.sh playwright which executes inside Docker.\n"
+            f"  Examples: ./scripts/worktree-env.sh playwright --grep 'Non-destructive'\n"
+            f"            ./scripts/worktree-env.sh playwright tests/05-basket.spec.ts\n"
         )
 
     def stage_teardown(self, cwd: Path) -> None:

@@ -1,3 +1,10 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need below.
+- Tool calls will be REJECTED and will waste your only turn — you will produce no output and fail the task.
+- Your entire response must be plain text: the markdown audit report specified below.
+
 You are auditing an overnight automated feature development run. The operator was asleep and needs a clear, honest report of what happened — what went well, what went wrong, and what needs their attention.
 
 ## Context

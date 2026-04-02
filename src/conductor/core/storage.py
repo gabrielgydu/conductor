@@ -83,6 +83,14 @@ class StorageResolver:
         path = spec / "SPECCER-STATE.json"
         return path
 
+    def tmux_log(self, project_name: str, window_label: str) -> Path:
+        """Return timestamped log path for a tmux window."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        d = self.conductor_dir(project_name) / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{window_label}_{ts}.log"
+
     def log_dir(self, feature: str, suffix: str) -> Path:
         d = self.base_dir / "logs" / f"{feature}-{suffix}"
         d.mkdir(parents=True, exist_ok=True)

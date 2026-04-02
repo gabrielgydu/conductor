@@ -23,6 +23,13 @@ from conductor.core.smoke_test import generate_smoke_test
 logger = logging.getLogger(__name__)
 
 
+def _print(msg: str) -> None:
+    """Print to stdout so it shows in tmux."""
+    from conductor.core.logging import live_log  # noqa: PLC0415
+
+    live_log("INTEGRATION", msg)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -287,6 +294,7 @@ async def run_integration_merge(
     branch_name = f"integration/{state.project_name}"
     worktree_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
     repo_root = Path(storage.repo_root)
+    _print(f"Starting integration merge: {len(eligible_runs)} runs → {branch_name}")
 
     if len(eligible_runs) < 2:
         return IntegrationState(
@@ -340,6 +348,7 @@ async def run_integration_merge(
     has_partial = False
 
     # --- Merge loop ---
+    _print(f"Worktree created at {wt}")
     for run in eligible_runs:
         if not run.stages:
             logger.warning("Run %s has no stages, skipping", run.index)
@@ -351,8 +360,10 @@ async def run_integration_merge(
             continue
 
         # Try clean merge
+        _print(f"Merging run {run.index}: {run.name} ({branch})")
         rc, _, _ = await _run_git(["merge", branch, "--no-edit"], wt)
         if rc == 0:
+            _print(f"  ✓ Clean merge")
             merged_runs.append(run)
             continue
 
@@ -423,6 +434,7 @@ async def run_integration_merge(
             merged_runs.append(run)
 
     # --- Push ---
+    _print(f"Merged {len(merged_runs)} runs, pushing {branch_name}")
     await _run_git(["push", "origin", branch_name], wt)
 
     # --- Generate smoke test ---
@@ -432,6 +444,7 @@ async def run_integration_merge(
     smoke_path.write_text(smoke_src, encoding="utf-8")
 
     # --- Post-merge validation with self-healing ---
+    _print("Running post-merge validation (smoke + integration-tests)")
     vctx = ValidationContext(
         project_dir=wt,
         stage="integration",

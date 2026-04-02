@@ -53,7 +53,24 @@ class TmuxManager:
                 "-x", "200", "-y", "50",
             )
 
-    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None, detached: bool = False) -> None:
+    def _enable_logging(self, window_name: str, log_file: Path) -> None:
+        """Tee all pane output to a log file via tmux pipe-pane."""
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        self._run_tmux(
+            "pipe-pane", "-t", f"{self._session_name}:{window_name}",
+            f"cat >> {log_file}",
+            check=False,
+        )
+
+    def _set_remain_on_exit(self, window_name: str) -> None:
+        """Keep window open after command exits."""
+        self._run_tmux(
+            "set-option", "-t", f"{self._session_name}:{window_name}",
+            "remain-on-exit", "on",
+            check=False,
+        )
+
+    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None, detached: bool = False, log_file: Path | None = None) -> None:
         """Spawn command in a new tmux window (non-blocking, fire-and-forget)."""
         # Kill stale window first
         self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
@@ -65,6 +82,9 @@ class TmuxManager:
             args.extend(["-c", cwd])
         args.append(cmd)
         self._run_tmux(*args)
+        self._set_remain_on_exit(name)
+        if log_file:
+            self._enable_logging(name, log_file)
 
     async def spawn_in_window_and_wait(
         self,
@@ -73,6 +93,7 @@ class TmuxManager:
         *,
         exit_file: Path | None = None,
         cwd: str | None = None,
+        log_file: Path | None = None,
     ) -> int:
         """Spawn command in tmux window, wait for it to finish, return exit code.
 
@@ -94,6 +115,9 @@ class TmuxManager:
             args.extend(["-c", cwd])
         args.append(wrapped)
         self._run_tmux(*args)
+        self._set_remain_on_exit(name)
+        if log_file:
+            self._enable_logging(name, log_file)
 
         # Block until signal
         loop = asyncio.get_event_loop()
@@ -117,6 +141,7 @@ class TmuxManager:
         *,
         exit_file: Path,
         cwd: str | None = None,
+        log_file: Path | None = None,
     ) -> None:
         """Spawn runner command in tmux window (non-blocking). Writes exit code to file when done."""
         # Kill stale window
@@ -137,6 +162,9 @@ class TmuxManager:
             args.extend(["-c", cwd])
         args.append(wrapped)
         self._run_tmux(*args)
+        self._set_remain_on_exit(name)
+        if log_file:
+            self._enable_logging(name, log_file)
 
     async def is_window_alive(self, name: str) -> bool:
         """Check if a tmux window exists."""

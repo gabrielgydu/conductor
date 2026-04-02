@@ -3,7 +3,7 @@
 Uses subprocess.PIPE (NOT FIFOs) to communicate with Claude in
 --input-format stream-json mode.
 
-Key design (from bug report ralph-bugs-report.md):
+Key design:
 - NO named FIFOs — use asyncio subprocess pipes directly
 - NO fd inheritance tricks — close_fds=True everywhere
 - Idle timeout for completion detection (not polling for "result" which

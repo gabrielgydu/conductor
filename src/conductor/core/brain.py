@@ -30,14 +30,16 @@ async def brain_diagnose_runner(
         activity_content = activity_log.read_text(encoding="utf-8")
 
     prompt = (
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+        "Tool calls will be REJECTED and will waste your only turn.\n\n"
         f"diagnose-runner\n\n"
         f"Feature: {run.name}\n"
         f"Description: {run.description}\n\n"
         f"The runner appears stalled. Last activity:\n{activity_content}\n\n"
-        f"Please diagnos the issue and suggest an action (retry, steer, or block)."
+        f"Please diagnose the issue and suggest an action (retry, steer, or block)."
     )
 
-    result = await run_claude(prompt, model="claude-sonnet-4-6")
+    result = await run_claude(prompt, model="claude-sonnet-4-6", max_turns=1)
 
     answer_text = ""
     for line in result.output.splitlines():
@@ -109,10 +111,20 @@ async def brain_answer_questions(
         f"Feature: {run.name}\n"
         f"Description: {run.description}\n\n"
         f"Please answer the following questions for spec generation:\n\n"
-        f"{questions_content}"
+        f"{questions_content}\n\n"
+        f"## Second Opinion — Codex (non-blocking)\n\n"
+        f"Before finalizing your answers, get a second opinion from Codex (OpenAI o3).\n"
+        f"Use the Agent tool with `subagent_type=\"codex:codex-rescue\"` and ask it to review\n"
+        f"your draft answers. Incorporate its feedback where it makes good points, then finalize.\n\n"
+        f"This is non-blocking: if the agent call fails, errors, or times out, proceed with your\n"
+        f"own judgment. Do not let Codex failures delay or block your output.\n\n"
+        f"**Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.\n"
+        f"If Codex responded, summarize what it said and what you incorporated or disagreed with.\n"
+        f"If the call failed or timed out, note that explicitly (e.g. \"Codex was unavailable: <error>\").\n"
+        f"This section is important for auditability — always include it.\n"
     )
 
-    result = await run_claude(prompt, model="claude-opus-4-6[1m]")
+    result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=20)
 
     # Extract assistant content from stream-json output
     answer_text = ""

@@ -1,3 +1,10 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need below.
+- Tool calls will be REJECTED and will waste your only turn — you will produce no output and fail the task.
+- Your entire response must be plain text using the output format specified below.
+
 You are a senior engineer reviewing lessons learned from an automated feature development run. Your job is to identify which learnings should be persisted into CLAUDE.md files so they prevent future mistakes.
 
 ## Context

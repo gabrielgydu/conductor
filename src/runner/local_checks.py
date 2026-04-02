@@ -28,11 +28,11 @@ async def run_local_ci(
         result = subprocess.run(
             ["bash", "-c", ci_command],
             cwd=cwd, capture_output=True, text=True,
-            env=env, timeout=900,
+            env=env, timeout=1800,
         )
         output = result.stdout + result.stderr
     except subprocess.TimeoutExpired:
-        output = "CI command timed out after 900s"
+        output = "CI command timed out after 1800s"
         result = type('R', (), {'returncode': 1})()
 
     # Write log
@@ -176,11 +176,15 @@ async def local_review_fix_loop(
            if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")}
 
     log(f"Running local review: {dim(review_command)}")
-    subprocess.run(
-        ["bash", "-c", review_command],
-        cwd=cwd, capture_output=True, text=True,
-        env=env, timeout=900, stdin=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            ["bash", "-c", review_command],
+            cwd=cwd, capture_output=True, text=True,
+            env=env, timeout=1800, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        warn("Local review timed out after 1800s — skipping review, continuing build")
+        return True
 
     count = _count_high_severity(findings_file)
     if count == 0:

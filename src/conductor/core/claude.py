@@ -39,7 +39,7 @@ _ctx_max = 200_000
 
 
 def progress_on_event(event: dict) -> None:
-    """Default on_event callback — prints live progress to stderr, matching ralph style."""
+    """Default on_event callback — prints live progress to stderr."""
     global _ctx_max
     t = event.get("type")
     color = _isatty()
@@ -59,7 +59,7 @@ def progress_on_event(event: dict) -> None:
         msg = event.get("message", {})
         usage = msg.get("usage", {})
 
-        # Context usage line (like ralph)
+        # Context usage line
         inp = usage.get("input_tokens", 0)
         cc = usage.get("cache_creation_input_tokens", 0)
         cr = usage.get("cache_read_input_tokens", 0)

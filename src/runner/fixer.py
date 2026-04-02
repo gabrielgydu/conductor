@@ -1,9 +1,9 @@
-"""PR review fixer — port of ralph/lib/fixer.sh.
+"""PR review fixer — fixes issues from GitHub PR review comments.
 
 Reads PR review comments via `gh api` GraphQL, builds a fix prompt,
 invokes Claude to fix the issues, commits and pushes.
 
-Key differences from the bash version:
+Implementation details:
 - Uses subprocess.PIPE for Claude invocation (no FIFOs)
 - Uses json.dumps() for all JSON construction (no shell escaping bugs)
 - Caps prompt input at 100k chars
@@ -571,14 +571,18 @@ async def _resolve_conflict(
         log("  Running dump-regen commands...")
         for cmd in regen_commands:
             log(f"    {cmd}")
-            subprocess.run(
-                cmd,
-                shell=True,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                close_fds=True,
-                check=False,
-            )
+            try:
+                subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                    check=False,
+                    timeout=300,
+                )
+            except subprocess.TimeoutExpired:
+                log(f"    dump-regen timed out after 300s — continuing")
         # Commit regen changes if any
         _git_run(["add", "-A"], cwd, check=False)
         staged_result = _git_run(["diff", "--cached", "--quiet"], cwd, check=False)

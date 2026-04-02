@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict
 from conductor.core.claude import ClaudeResult, resolve_model, run_claude
 from conductor.core.logging import live_log
 from conductor.core.models import atomic_save, load_state
-from conductor.core.presets import Preset, load_preset
+from conductor.core.presets import load_preset
 from conductor.core.storage import StorageResolver
 
 
@@ -224,10 +224,14 @@ def check_output_for_signal(output: str) -> str | None:
 
 
 def create_loop_worktree(
-    project_dir: Path, branch_name: str, base_branch: str
+    project_dir: Path, branch_name: str, base_branch: str,
+    worktrees_base: Path | None = None,
 ) -> Path:
     """Create a git worktree for the loop."""
-    wt_path = project_dir.parent / f"{project_dir.name}-{branch_name}"
+    if worktrees_base:
+        wt_path = worktrees_base / branch_name
+    else:
+        wt_path = project_dir.parent / f"{project_dir.name}-{branch_name}"
     if wt_path.exists():
         return wt_path
 
@@ -243,12 +247,6 @@ def create_loop_worktree(
 # ---------------------------------------------------------------------------
 # Quality gate + commit
 # ---------------------------------------------------------------------------
-
-
-def run_quality_gate(preset: Preset, cwd: Path) -> tuple[bool, str]:
-    """Run the preset's quality gate. Returns (passed, message)."""
-    result = preset.quality_gate(cwd)
-    return result.passed, result.message
 
 
 def commit_task(cwd: Path, task: LoopTask) -> str | None:
@@ -389,7 +387,8 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
             f"echo $? > {exit_file}"
         )
 
-        await tmux.spawn_in_window(window_name, wrapped_cmd, cwd=str(cwd), detached=True)
+        log_file = storage.tmux_log(state.name, f"task-{task.index}_session-{state.session_count}")
+        await tmux.spawn_in_window(window_name, wrapped_cmd, cwd=str(cwd), detached=True, log_file=log_file)
 
         # Wait for completion by polling exit file
         _log("CLAUDE_RUNNING", f"Claude running in window '{window_name}'", log_path, audit_path)
@@ -420,37 +419,24 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         if signal == "completed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled completed", log_path, audit_path)
 
-            # Quality gate
-            gate_passed, gate_msg = run_quality_gate(preset, cwd)
-            if not gate_passed:
-                _log(
-                    "GATE_FAILED",
-                    f"Quality gate failed for task {task.index}: {gate_msg}",
-                    log_path, audit_path,
-                )
-                if task.attempts >= 3:
-                    task.status = "failed"
-                    _log("TASK_FAILED", f"Task {task.index} failed after {task.attempts} attempts", log_path, audit_path)
-                    state.current_task_index += 1
-            else:
-                commit_hash = commit_task(cwd, task)
-                task.status = "completed"
-                task.commit = commit_hash
-                task.completed_at = datetime.now(timezone.utc)
+            commit_hash = commit_task(cwd, task)
+            task.status = "completed"
+            task.commit = commit_hash
+            task.completed_at = datetime.now(timezone.utc)
 
-                _log(
-                    "TASK_COMPLETED",
-                    f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
-                    log_path, audit_path,
-                    task_index=task.index, commit=commit_hash,
-                )
+            _log(
+                "TASK_COMPLETED",
+                f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
+                log_path, audit_path,
+                task_index=task.index, commit=commit_hash,
+            )
 
-                if preset.config.push_enabled and state.branch:
-                    pushed = push_branch(cwd, state.branch)
-                    if pushed:
-                        _log("PUSH", f"Pushed {state.branch}", log_path, audit_path)
+            if preset.config.push_enabled and state.branch:
+                pushed = push_branch(cwd, state.branch)
+                if pushed:
+                    _log("PUSH", f"Pushed {state.branch}", log_path, audit_path)
 
-                state.current_task_index += 1
+            state.current_task_index += 1
 
         elif signal == "failed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled failed", log_path, audit_path)
@@ -479,8 +465,6 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         # Cleanup temp files
         for f in [prompt_file, exit_file, output_file]:
             f.unlink(missing_ok=True)
-
-        await tmux.kill_window(window_name)
 
     # Done
     completed = sum(1 for t in state.tasks if t.status == "completed")

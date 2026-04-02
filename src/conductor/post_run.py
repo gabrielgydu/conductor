@@ -1,10 +1,12 @@
 """Post-run processing: learnings review and audit report generation."""
 from __future__ import annotations
 
-import glob
+import asyncio
 import json
 import re
+import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +16,24 @@ from conductor.core.logging import live_log
 from conductor.core.models import ConductorState
 from conductor.integration.e2e import run_integration_testing
 from conductor.integration.merge import run_integration_merge
+
+def _find_codex_companion() -> Path | None:
+    """Discover codex-companion.mjs from installed_plugins.json."""
+    plugins_file = Path.home() / ".claude/plugins/installed_plugins.json"
+    if not plugins_file.exists():
+        return None
+    try:
+        data = json.loads(plugins_file.read_text(encoding="utf-8"))
+        for key, entries in data.get("plugins", {}).items():
+            if not key.startswith("codex@"):
+                continue
+            for entry in entries:
+                candidate = Path(entry["installPath"]) / "scripts" / "codex-companion.mjs"
+                if candidate.exists():
+                    return candidate
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return None
 
 
 def _load_prompt_template(name: str) -> str:
@@ -233,22 +253,15 @@ def _collect_audit_context(
                 continue
             suffix = stage.feature_suffix or ""
             fname = f"{run.name}{suffix}"
-            # Try both conductor and ralph naming conventions
-            for pattern in (
-                f"/tmp/conductor-activity-{fname}*",
-                f"/tmp/ralph-activity-{fname}*",
-            ):
-                activity_logs = sorted(glob.glob(pattern), reverse=True)
-                if activity_logs:
-                    try:
-                        lines = Path(activity_logs[0]).read_text(encoding="utf-8").splitlines()
-                        parts.append(
-                            f"## Activity Log: {fname} (last 30 lines)\n"
-                            + "\n".join(lines[-30:]) + "\n"
-                        )
-                    except OSError:
-                        pass
-                    break
+            activity_log = Path(wt) / "docs" / fname / "activity.log"
+            try:
+                lines = activity_log.read_text(encoding="utf-8").splitlines()
+                parts.append(
+                    f"## Activity Log: {fname} (last 30 lines)\n"
+                    + "\n".join(lines[-30:]) + "\n"
+                )
+            except OSError:
+                pass
 
     # FIXME/skip markers
     fixme_parts = []
@@ -349,6 +362,94 @@ async def generate_audit_report(
     return report_file
 
 
+async def codex_final_review(
+    state: ConductorState,
+    project_dir: Path,
+    storage=None,
+) -> None:
+    """Run Codex review on each worktree's changes. Non-blocking — any failure is swallowed."""
+    codex_companion = _find_codex_companion()
+    if not codex_companion or not shutil.which("node"):
+        live_log("PLAN", "Codex companion not available — skipping final review")
+        return
+
+    # Resolve log directory for codex review artifacts
+    codex_log_dir: Path | None = None
+    if storage is not None and hasattr(storage, "brain_calls_dir"):
+        codex_log_dir = storage.brain_calls_dir(state.project_name)
+        codex_log_dir.mkdir(parents=True, exist_ok=True)
+
+    worktrees: list[tuple[str, str]] = []  # (name, path)
+    for run in state.runs:
+        for stage in run.stages:
+            wt = stage.worktree
+            if wt and Path(wt).is_dir():
+                worktrees.append((run.name, wt))
+
+    if not worktrees:
+        live_log("PLAN", "No worktrees to review — skipping Codex final review")
+        return
+
+    for name, wt_path in worktrees:
+        live_log("PLAN", f"Codex reviewing {name} ({wt_path})")
+        ts = int(time.time() * 1000)
+        status = "unknown"
+        review_text = ""
+        error_detail = ""
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "node", str(codex_companion), "review", "--wait", "--scope", "branch",
+                cwd=wt_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            review_text = stdout.decode("utf-8", errors="replace")
+            error_detail = stderr.decode("utf-8", errors="replace")
+
+            if proc.returncode != 0:
+                status = "error"
+                live_log("PLAN", f"Codex review for {name} exited {proc.returncode}: {error_detail[:200]}")
+            elif review_text.strip():
+                status = "ok"
+                # Save review alongside the worktree's conductor artifacts
+                conductor_dir = Path(wt_path) / ".conductor"
+                conductor_dir.mkdir(parents=True, exist_ok=True)
+                review_file = conductor_dir / f"CODEX-REVIEW-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.md"
+                review_file.write_text(review_text, encoding="utf-8")
+                live_log("PLAN", f"Codex review saved: {review_file}")
+            else:
+                status = "empty"
+                live_log("PLAN", f"Codex review for {name} returned empty")
+        except asyncio.TimeoutError:
+            status = "timeout"
+            error_detail = "Timed out after 300s"
+            live_log("PLAN", f"Codex review for {name} timed out (300s)")
+        except Exception as exc:
+            status = "error"
+            error_detail = str(exc)
+            live_log("PLAN", f"Codex review for {name} failed: {exc}")
+
+        # Always log the result to brain_calls_dir for auditability
+        if codex_log_dir:
+            log_file = codex_log_dir / f"codex-review-{name}-{ts}.json"
+            log_file.write_text(
+                json.dumps(
+                    {
+                        "action": "codex-final-review",
+                        "feature": name,
+                        "worktree": wt_path,
+                        "status": status,
+                        "review": review_text[:5000] if review_text else "",
+                        "error": error_detail[:2000] if error_detail else "",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+
 async def conductor_post_run(
     state: ConductorState,
     project_dir: Path,
@@ -403,7 +504,13 @@ async def post_run_processing(
         except Exception:
             pass
 
-    # 4. Audit report (always runs)
+    # 4. Codex final review (non-blocking)
+    try:
+        await codex_final_review(state, project_dir, storage)
+    except Exception as exc:
+        live_log("PLAN", f"Codex final review failed (non-blocking): {exc}")
+
+    # 5. Audit report (always runs)
     await generate_audit_report(state, project_dir, storage)
 
     return state

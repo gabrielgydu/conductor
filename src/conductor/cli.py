@@ -63,6 +63,13 @@ def _plan_progress_callback(event: dict) -> None:
     etype = event.get("type", "")
     ts = _ts()
 
+    if etype == "system":
+        if not getattr(_plan_progress_callback, "_session_logged", False):
+            _plan_progress_callback._session_logged = True
+            sys.stderr.write(f"{ts} ● Claude session started\n")
+            sys.stderr.flush()
+        return
+
     if etype == "assistant":
         for block in event.get("message", {}).get("content", []):
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -89,9 +96,6 @@ def _plan_progress_callback(event: dict) -> None:
                     else:
                         sys.stderr.write(f"{ts} ▸ {first_line}\n")
                     sys.stderr.flush()
-    elif etype == "system":
-        sys.stderr.write(f"{ts} ● Claude session started\n")
-        sys.stderr.flush()
     elif etype == "result":
         cost = event.get("total_cost_usd")
         duration_ms = event.get("duration_ms")
@@ -259,6 +263,7 @@ def _generate_and_review_plan(
     """Generate plan, review for completeness, re-generate if needed (max 1 retry)."""
     # Step 1: Generate plan
     print("Invoking Claude to generate plan...", file=sys.stderr)
+    _plan_progress_callback._session_logged = False
     result = asyncio.run(
         run_claude(
             prompt,
@@ -293,6 +298,7 @@ def _generate_and_review_plan(
     print("Review found gaps — re-generating plan...", file=sys.stderr)
     prompt = prompt + "\n\n" + review_feedback
 
+    _plan_progress_callback._session_logged = False
     result = asyncio.run(
         run_claude(
             prompt,
@@ -592,6 +598,16 @@ def _cmd_run(args):
     if getattr(args, "quick", False):
         state.quick = True
 
+    # Set max_parallel from CLI
+    cli_max_parallel = getattr(args, "max_parallel", None)
+    if cli_max_parallel is not None:
+        state.max_parallel = cli_max_parallel
+
+    # Set worktrees_base from CLI (overrides preset default)
+    cli_wt_base = getattr(args, "worktrees_base", None)
+    if cli_wt_base:
+        state.worktrees_base = str(Path(cli_wt_base).resolve())
+
     inside_tmux = getattr(args, "inside_tmux", False)
 
     if not inside_tmux:
@@ -613,16 +629,31 @@ def _cmd_run(args):
             reexec_args += " --no-overnight"
         if getattr(args, "quick", False):
             reexec_args += " --quick"
+        if cli_max_parallel is not None:
+            reexec_args += f" --max-parallel {state.max_parallel}"
+        if cli_wt_base:
+            reexec_args += f" --worktrees-base {state.worktrees_base}"
 
         # Create detached session
+        session_name = f"conductor-{state.project_name}"
         tmux._run_tmux(
             "new-session",
             "-d",
             "-s",
-            f"conductor-{state.project_name}",
+            session_name,
             "-n",
             "conductor",
             f"bash -c '{conductor_bin} {reexec_args}'",
+        )
+        # Keep window open after exit + log all output
+        tmux._run_tmux(
+            "set-option", "-t", f"{session_name}:conductor",
+            "remain-on-exit", "on", check=False,
+        )
+        log_file = storage.tmux_log(state.project_name, "conductor-main")
+        tmux._run_tmux(
+            "pipe-pane", "-t", f"{session_name}:conductor",
+            f"cat >> {log_file}", check=False,
         )
 
         tmux_env = os.environ.get("TMUX", "")
@@ -630,12 +661,12 @@ def _cmd_run(args):
             # Not in tmux — attach
             os.execvp(
                 "tmux",
-                ["tmux", "attach-session", "-t", f"conductor-{state.project_name}"],
+                ["tmux", "attach-session", "-t", session_name],
             )
         else:
             # Already in tmux — switch client
             subprocess.run(
-                ["tmux", "switch-client", "-t", f"conductor-{state.project_name}"],
+                ["tmux", "switch-client", "-t", session_name],
                 check=False,
             )
             sys.exit(0)
@@ -645,6 +676,7 @@ def _cmd_run(args):
 
         config = ConductorConfig(
             check_interval_s=state.check_interval_s,
+            max_parallel=state.max_parallel,
             project_root=repo_path,
         )
 
@@ -898,8 +930,17 @@ def _cmd_loop(args):
         # Create worktree if requested
         if not getattr(args, "no_worktree", False):
             from conductor.core.loop import create_loop_worktree
+            from conductor.core.presets import load_preset as _load_preset
+            cli_wt_base = getattr(args, "worktrees_base", None)
+            wt_base = None
+            if cli_wt_base:
+                wt_base = Path(cli_wt_base).resolve()
+            elif preset_name:
+                _preset = _load_preset(preset_name)
+                if _preset and _preset.config.worktrees_base:
+                    wt_base = Path(_preset.config.worktrees_base)
             branch_name = f"loop-{args.name}"
-            wt = create_loop_worktree(repo_path, branch_name, base_branch)
+            wt = create_loop_worktree(repo_path, branch_name, base_branch, worktrees_base=wt_base)
             state.worktree = str(wt)
             state.branch = branch_name
             print(f"Created worktree: {wt}")
@@ -944,6 +985,16 @@ def _cmd_loop(args):
         tmux._run_tmux(
             "new-session", "-d", "-s", session_name, "-n", "loop",
             f"bash -c '{conductor_bin} {reexec_args}'",
+        )
+        # Keep window open after exit + log all output
+        tmux._run_tmux(
+            "set-option", "-t", f"{session_name}:loop",
+            "remain-on-exit", "on", check=False,
+        )
+        log_file = storage.tmux_log(state.name, "loop-main")
+        tmux._run_tmux(
+            "pipe-pane", "-t", f"{session_name}:loop",
+            f"cat >> {log_file}", check=False,
         )
 
         tmux_env = os.environ.get("TMUX", "")
@@ -1096,6 +1147,8 @@ def main():
     _add_common(p_run)
     p_run.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
     p_run.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end of run")
+    p_run.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: 1, 0=unlimited)")
+    p_run.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../worktrees)")
     p_run.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
     p_status = subparsers.add_parser("status", help="Show run status")
@@ -1121,6 +1174,7 @@ def main():
     p_loop.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_loop.add_argument("--model", default=None, help="Claude model to use")
     p_loop.add_argument("--no-worktree", action="store_true", help="Work in project dir instead of creating a worktree")
+    p_loop.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../<name>-<branch>)")
     p_loop.add_argument("--reset", action="store_true", help="Reset and re-initialize the loop")
     p_loop.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 

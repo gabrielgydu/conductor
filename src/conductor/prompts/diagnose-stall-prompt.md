@@ -1,3 +1,9 @@
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need below.
+- Tool calls will be REJECTED and will waste your only turn — you will produce no output and fail the task.
+
 You are a process supervisor diagnosing a stalled automation pipeline stage. Analyze the provided context and recommend one concrete action.
 
 ## Context

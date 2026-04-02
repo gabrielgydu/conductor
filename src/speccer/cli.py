@@ -1,6 +1,4 @@
-"""Speccer CLI — Python port of ~/development/ralph/speccer.
-
-State machine: INIT -> EXPLORING -> NEEDS_INPUT <-> SPECCING -> COMPLETE -> GENERATED
+"""Speccer CLI — spec generation loop (INIT -> EXPLORING -> NEEDS_INPUT <-> SPECCING -> COMPLETE -> GENERATED).
 
 The orchestrator calls speccer as:
   speccer init --feature <name> --spec-dir <path>
@@ -14,6 +12,29 @@ import re
 import sys
 from pathlib import Path
 
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "conductor" / "prompts" / "speccer"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Codex second-opinion snippet (appended to planning prompts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CODEX_SECOND_OPINION = """
+
+## Second Opinion — Codex (non-blocking)
+
+Before finalizing your plans or answers, get a second opinion from Codex (OpenAI o3).
+Use the Agent tool with `subagent_type="codex:codex-rescue"` and ask it to review your
+draft output. Incorporate its feedback where it makes good points, then finalize.
+
+This is non-blocking: if the agent call fails, errors, or times out, proceed with your
+own judgment. Do not let Codex failures delay or block your output.
+
+**Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.
+If Codex responded, summarize what it said and what you incorporated or disagreed with.
+If the call failed or timed out, note that explicitly (e.g. "Codex was unavailable: <error>").
+This section is important for auditability — always include it.
+"""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANSI helpers
@@ -142,7 +163,7 @@ def _process_template(
     conditions: dict[str, bool],
     injections: dict[str, str],
 ) -> str:
-    """Process a Ralph template file.
+    """Process a template file.
 
     Supports:
       {VARIABLE}          — scalar substitution
@@ -199,18 +220,6 @@ def _process_template(
     return "\n".join(output)
 
 
-def _find_ralph_dir() -> Path | None:
-    """Locate the ralph directory with spec prompts."""
-    candidates = [
-        Path.home() / "development" / "ralph",
-        Path("/home/user/development/ralph"),
-    ]
-    for c in candidates:
-        if (c / "backend-spec-prompt.md").exists():
-            return c
-    return None
-
-
 def build_spec_prompt(
     spec_dir: Path,
     feature_name: str,
@@ -219,16 +228,12 @@ def build_spec_prompt(
     iteration: int,
 ) -> str:
     """Build the spec iteration prompt by processing the appropriate template."""
-    ralph_dir = _find_ralph_dir()
-    if ralph_dir is None:
-        _die("Cannot find ralph directory with prompt templates")
-
     template_map = {
-        "frontend": ralph_dir / "frontend-spec-prompt.md",
-        "backend":  ralph_dir / "backend-spec-prompt.md",
-        "testing":  ralph_dir / "testing-spec-prompt.md",
+        "frontend": _PROMPTS_DIR / "frontend-spec-prompt.md",
+        "backend":  _PROMPTS_DIR / "backend-spec-prompt.md",
+        "testing":  _PROMPTS_DIR / "testing-spec-prompt.md",
     }
-    template_file = template_map.get(mode, ralph_dir / "spec-prompt.md")
+    template_file = template_map.get(mode, _PROMPTS_DIR / "spec-prompt.md")
 
     if not template_file.exists():
         _die(f"Prompt template not found: {template_file}")
@@ -276,7 +281,8 @@ def build_spec_prompt(
         "STATUS":       status,
     }
 
-    return _process_template(template_file, variables, conditions, injections)
+    prompt = _process_template(template_file, variables, conditions, injections)
+    return prompt + _CODEX_SECOND_OPINION
 
 
 def build_generate_prompt(
@@ -287,16 +293,12 @@ def build_generate_prompt(
     preset_name: str,
 ) -> str:
     """Build the generate prompt."""
-    ralph_dir = _find_ralph_dir()
-    if ralph_dir is None:
-        _die("Cannot find ralph directory with prompt templates")
-
     template_map = {
-        "frontend": ralph_dir / "frontend-generate-prompt.md",
-        "backend":  ralph_dir / "backend-generate-prompt.md",
-        "testing":  ralph_dir / "testing-generate-prompt.md",
+        "frontend": _PROMPTS_DIR / "frontend-generate-prompt.md",
+        "backend":  _PROMPTS_DIR / "backend-generate-prompt.md",
+        "testing":  _PROMPTS_DIR / "testing-generate-prompt.md",
     }
-    template_file = template_map.get(mode, ralph_dir / "generate-prompt.md")
+    template_file = template_map.get(mode, _PROMPTS_DIR / "generate-prompt.md")
 
     if not template_file.exists():
         _die(f"Generate prompt template not found: {template_file}")
@@ -334,12 +336,13 @@ def build_generate_prompt(
         "PROJECT_DIR":  project_dir,
         "DOCS_DIR":     str(docs_dir),
         "SPEC_DIR":     str(spec_dir),
-        "RALPH_DIR":    str(ralph_dir),
+        "CONDUCTOR_DIR": str(_PROMPTS_DIR),
         "PRESET":       preset_name,
         "MODEL":        model_default,
     }
 
-    return _process_template(template_file, variables, conditions, injections)
+    prompt = _process_template(template_file, variables, conditions, injections)
+    return prompt + _CODEX_SECOND_OPINION
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

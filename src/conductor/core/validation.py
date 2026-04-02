@@ -138,7 +138,37 @@ async def _check_phpunit(ctx: ValidationContext) -> CheckResult:
 async def _check_smoke(ctx: ValidationContext) -> CheckResult:
     start = time.monotonic()
 
-    # Lazy import to avoid circular imports
+    # Acme preset: use worktree-env.sh to start containers and run CI
+    env = _worktree_env(ctx)
+    preset = ctx.state.preset if ctx.state else None
+    if preset == "acme" and env:
+        logger.warning("Smoke check: worktree-env.sh up --all (%s)", ctx.project_dir)
+        print(f"  smoke: worktree-env.sh up --all ...", flush=True)
+        exit_code, output = await _run_cmd(
+            [str(env), "up", "--all"], cwd=ctx.project_dir, timeout=600,
+        )
+        if exit_code != 0:
+            print(f"  smoke: up --all FAILED (exit {exit_code})", flush=True)
+            return CheckResult(
+                name="smoke",
+                passed=False,
+                output=f"worktree-env.sh up --all failed:\n{output}",
+                duration_s=time.monotonic() - start,
+            )
+        print(f"  smoke: containers up, running CI ...", flush=True)
+        logger.warning("Smoke check: worktree-env.sh ci")
+        exit_code, output = await _run_cmd(
+            [str(env), "ci", "auto"], cwd=ctx.project_dir, timeout=1800,
+        )
+        print(f"  smoke: CI {'PASSED' if exit_code == 0 else 'FAILED'} (exit {exit_code})", flush=True)
+        return CheckResult(
+            name="smoke",
+            passed=exit_code == 0,
+            output=output,
+            duration_s=time.monotonic() - start,
+        )
+
+    # Generic fallback: generate and run Playwright smoke test
     from conductor.core.smoke_test import generate_smoke_test  # noqa: PLC0415
 
     smoke_src = generate_smoke_test(ctx.project_dir)

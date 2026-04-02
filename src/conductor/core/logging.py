@@ -47,6 +47,9 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "POST_RUN_END":      EventConfig("📋", True),
     "FILE_WRITE":        EventConfig("📝", False),
     "RUNNER_BRAIN_DIAGNOS": EventConfig("🧠", False),
+    "AUTO_RESUME":       EventConfig("↻",  True),
+    "TRANSIENT_FAILURE": EventConfig("⏳", True),
+    "TRANSIENT_RETRY":   EventConfig("↻",  True),
     # Loop events
     "LOOP_START":        EventConfig("●",  True),
     "LOOP_DONE":         EventConfig("■",  True),
@@ -91,6 +94,9 @@ _COLOR_MAP: dict[str, str] = {
     "PLAN": _YELLOW,
     "BRAIN_CALL": _YELLOW,
     "RETRY": _YELLOW,
+    "AUTO_RESUME": _CYAN,
+    "TRANSIENT_FAILURE": _YELLOW,
+    "TRANSIENT_RETRY": _YELLOW,
     "STAGE_TRANSITION": _CYAN,
     # Loop colors
     "LOOP_START": _CYAN_BOLD,

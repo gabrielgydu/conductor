@@ -93,9 +93,25 @@ Each loop session receives **both** the original plan (full context) and the tas
 ## Project Structure
 
 - `src/conductor/` — main conductor package (CLI, orchestrator, models)
+  - `src/conductor/prompts/speccer/` — speccer prompt templates (spec + generate, per mode)
+  - `src/conductor/prompts/` — brain/diagnosis prompt templates
 - `src/speccer/` — spec generation loop
 - `src/runner/` — code execution runner
+  - `src/runner/steer_inbox.py` — file-based steering IPC (polls `.msg` files from orchestrator)
 - `conductor`, `speccer`, `runner` — bash wrapper scripts (auto-bootstrap venv)
+
+## Steering
+
+The orchestrator steers running Claude sessions via file-based IPC:
+- Orchestrator writes `.msg` files to `{feature_dir}/steer_inbox/` (atomic write via `.tmp` + rename)
+- Runner polls the inbox every 2s and forwards messages to the steerable session
+- No external CLI dependencies — fully self-contained
+
+## Environment Variables
+
+Templates generate `run.sh` files that reference:
+- `CONDUCTOR_MODEL` — primary Claude model for phases
+- `CONDUCTOR_FIX_MODEL` — model used for fix/retry phases
 
 ## Symlinks
 

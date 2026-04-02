@@ -1,15 +1,11 @@
 """Core phase loop — drives Claude through implementation phases.
 
-Port of the main phase loop in ralph/lib/runner.sh:ralph_main().
-
 For each phase:
   1. Build prompt from phase's plan file
   2. Run Claude (steerable or plain)
   3. Monitor output for promise token
-  4. On token: run quality_gate from preset
-  5. Gate fails: feed errors back, retry (capped at max_gate_retries)
-  6. Gate passes: commit, optionally push
-  7. After all phases: write LEARNINGS.md summary, STATS.json, exit_code
+  4. On token: stage, commit, optionally push
+  5. After all phases: write LEARNINGS.md summary, STATS.json, exit_code
 """
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from conductor.core.claude import run_claude, run_claude_steerable
-from conductor.core.presets import load_preset, GateResult
+from conductor.core.presets import load_preset
 from conductor.core.stats import (
     StatsEntry,
     TokenStats,
@@ -38,7 +34,6 @@ from runner.activity import parse_stream_json_text, append_event_to_activity_log
 from runner.config import RunConfig, PhaseConfig
 from runner.git_ops import (
     git_stage_all,
-    git_unstage_all,
     git_has_staged_changes,
     git_commit,
     git_push,
@@ -49,6 +44,7 @@ from runner.git_ops import (
 from runner.logging import log, info, success, warn, error, header, dim, bold
 from runner.prompt import build_prompt
 from runner.steerable import SteerableSession
+from runner.steer_inbox import poll_steer_inbox
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -99,25 +95,6 @@ def _write_learnings_summary(
         f.write("\n".join(lines))
 
 
-# ─── Gate evaluation ────────────────────────────────────────────────────────
-
-
-def _run_quality_gate(
-    cfg: RunConfig,
-    cwd: Path,
-) -> tuple[bool, str]:
-    """Run the preset quality gate. Returns (passed, failure_context)."""
-    preset = load_preset(cfg.preset)
-    result: GateResult = preset.quality_gate(cwd)
-    if result.passed:
-        return True, ""
-
-    parts = [result.message] if result.message else []
-    parts.extend(result.failures)
-    context = "\n".join(parts)
-    return False, context
-
-
 # ─── Plain (non-steerable) phase iteration ──────────────────────────────────
 
 
@@ -164,8 +141,13 @@ async def _run_steerable_iteration(
     cwd: str,
     activity_log: Path,
     idle_timeout: float = 600.0,
+    feature_dir: Path | None = None,
 ) -> tuple[str, str, dict | None]:
-    """Run one steerable Claude invocation. Returns (raw_output, assistant_text, result_event)."""
+    """Run one steerable Claude invocation. Returns (raw_output, assistant_text, result_event).
+
+    If feature_dir is provided, a steer_inbox directory is created inside it and polled
+    for incoming .msg files that are forwarded to the session as steering messages.
+    """
     session = await SteerableSession.launch(
         prompt,
         model=model,
@@ -173,11 +155,24 @@ async def _run_steerable_iteration(
         cwd=cwd,
         activity_log=activity_log,
     )
+
+    inbox_task: asyncio.Task | None = None
+    if feature_dir is not None:
+        inbox = feature_dir / "steer_inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        inbox_task = asyncio.ensure_future(poll_steer_inbox(inbox, session))
+
     try:
         assistant_text, result_event = await session.stream_events(
             idle_timeout=idle_timeout,
         )
     finally:
+        if inbox_task is not None and not inbox_task.done():
+            inbox_task.cancel()
+            try:
+                await inbox_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await session.close()
 
     return assistant_text, assistant_text, result_event
@@ -193,8 +188,8 @@ async def _run_phase(
     feature_dir: Path,
     log_dir: Path,
     stats_path: Path,
-) -> bool:
-    """Execute one phase. Returns True on success."""
+) -> tuple[bool, bool]:
+    """Execute one phase. Returns (success, committed)."""
 
     phase_num = phase.number
     phase_count = len(cfg.phases)
@@ -219,8 +214,9 @@ async def _run_phase(
 
     phase_start = time.monotonic()
     phase_complete = False
+    phase_committed = False
     iteration = 0
-    gate_retries = 0
+    commit_retries = 0
     fix_context = ""
 
     # Snapshot pre-existing untracked files so we don't commit them
@@ -234,7 +230,7 @@ async def _run_phase(
         iter_start = time.monotonic()
 
         if fix_context:
-            log(f"--- Phase {phase_num}, iteration {iteration} (GATE FIX retry {gate_retries}/{cfg.max_gate_retries}) ---")
+            log(f"--- Phase {phase_num}, iteration {iteration} (FIX retry {commit_retries}/{cfg.max_gate_retries}) ---")
         else:
             log(f"--- Phase {phase_num}, iteration {iteration} / {cfg.max_iterations} ---")
 
@@ -255,7 +251,8 @@ async def _run_phase(
         try:
             if cfg.steerable:
                 raw_output, assistant_text, result_event = await _run_steerable_iteration(
-                    prompt, model, max_turns, cwd_str, activity_log
+                    prompt, model, max_turns, cwd_str, activity_log,
+                    feature_dir=feature_dir,
                 )
             else:
                 raw_output, assistant_text = await _run_plain_iteration(
@@ -308,7 +305,8 @@ async def _run_phase(
             continue
 
         # ── Promise token detected ─────────────────────────────────────────
-        log(bold("Promise token detected — staging & running quality gate..."))
+        header(f"PROMISE TOKEN DETECTED — {phase.token}")
+        log("Staging changes...")
 
         git_stage_all(project_dir)
         git_unstage_pre_existing(project_dir, pre_untracked)
@@ -320,80 +318,61 @@ async def _run_phase(
             phase_complete = True
             break
 
-        gate_passed, gate_failures = _run_quality_gate(cfg, project_dir)
+        # ── Commit ─────────────────────────────────────────────────────
+        commit_msg = f"Phase {phase_num}: {phase_name}"
+        commit_ok, commit_output = git_commit(project_dir, commit_msg)
 
-        if gate_passed:
-            # ── Commit ─────────────────────────────────────────────────────
-            commit_msg = f"Phase {phase_num}: {phase_name}"
-            commit_ok, commit_output = git_commit(project_dir, commit_msg)
-
-            if not commit_ok:
-                # Pre-commit hook or other commit failure
-                gate_retries += 1
-                error(f"Commit rejected (pre-commit hook): {commit_output.strip()}")
-                if gate_retries >= cfg.max_gate_retries:
-                    error(f"PHASE {phase_num} — commit failed {cfg.max_gate_retries} times, giving up")
-                    return False
-                fix_context = (
-                    f"=== COMMIT REJECTED ===\n{commit_output}\n\n"
-                    "Fix the issues above. The commit was rejected by a pre-commit hook.\n"
-                    "Do NOT simply bypass the hook — fix the root cause.\n"
-                )
-                await asyncio.sleep(2)
-                continue
-
-            success(f"Committed: {commit_msg}")
-            untracked_snapshot.unlink(missing_ok=True)
-
-            # ── Push ───────────────────────────────────────────────────────
-            if cfg.push_enabled:
-                git_push(project_dir, cfg.push_remote)
-
-            # ── Local checks (skip in quick mode) ─────────────────────────
-            if not cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
-                from runner.local_checks import run_local_checks  # noqa: PLC0415
-
-                await run_local_checks(
-                    project_dir,
-                    cfg.feature_name,
-                    ci_enabled=cfg.local_ci_enabled,
-                    ci_command=cfg.local_ci_command,
-                    ci_full_command=cfg.local_ci_full_command,
-                    ci_max_retries=cfg.local_ci_max_retries,
-                    review_enabled=cfg.local_review_enabled,
-                    review_command=cfg.local_review_command,
-                    review_full_command=cfg.local_review_full_command,
-                    review_max_retries=cfg.local_review_max_retries,
-                    fix_model=cfg.fix_model,
-                )
-
-            phase_complete = True
-            break
-
-        else:
-            # Gate failed — unstage and retry
-            git_unstage_all(project_dir)
-            gate_retries += 1
-            error(f"Quality gate failed (retry {gate_retries}/{cfg.max_gate_retries})")
-
-            if gate_retries >= cfg.max_gate_retries:
-                error(f"PHASE {phase_num} — quality gate failed {cfg.max_gate_retries} times, giving up")
-                error("Last failures:")
-                error(gate_failures[:2000])
-                return False
-
-            fix_context = gate_failures
-            log("Restarting iteration with failure context...")
+        if not commit_ok:
+            # Pre-commit hook or other commit failure
+            commit_retries += 1
+            error(f"Commit rejected (pre-commit hook): {commit_output.strip()}")
+            if commit_retries >= cfg.max_gate_retries:
+                error(f"PHASE {phase_num} — commit failed {cfg.max_gate_retries} times, giving up")
+                return False, False
+            fix_context = (
+                f"=== COMMIT REJECTED ===\n{commit_output}\n\n"
+                "Fix the issues above. The commit was rejected by a pre-commit hook.\n"
+                "Do NOT simply bypass the hook — fix the root cause.\n"
+            )
             await asyncio.sleep(2)
             continue
 
+        success(f"Committed: {commit_msg}")
+        untracked_snapshot.unlink(missing_ok=True)
+        phase_committed = True
+
+        # ── Push ───────────────────────────────────────────────────────
+        if cfg.push_enabled:
+            git_push(project_dir, cfg.push_remote)
+
+        # ── Local checks (skip in quick mode) ─────────────────────────
+        if not cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
+            from runner.local_checks import run_local_checks  # noqa: PLC0415
+
+            await run_local_checks(
+                project_dir,
+                cfg.feature_name,
+                ci_enabled=cfg.local_ci_enabled,
+                ci_command=cfg.local_ci_command,
+                ci_full_command=cfg.local_ci_full_command,
+                ci_max_retries=cfg.local_ci_max_retries,
+                review_enabled=cfg.local_review_enabled,
+                review_command=cfg.local_review_command,
+                review_full_command=cfg.local_review_full_command,
+                review_max_retries=cfg.local_review_max_retries,
+                fix_model=cfg.fix_model,
+            )
+
+        phase_complete = True
+        break
+
     if not phase_complete:
         error(f"PHASE {phase_num} FAILED — max iterations ({cfg.max_iterations}) reached")
-        return False
+        return False, False
 
     phase_duration = time.monotonic() - phase_start
     success(f"PHASE {phase_num} COMPLETE after {iteration} iteration(s) ({format_duration(phase_duration)})")
-    return True
+    return True, phase_committed
 
 
 # ─── Main entry point ────────────────────────────────────────────────────────
@@ -437,6 +416,7 @@ async def run_phase_loop(
         return 1
 
     exit_code = 0
+    any_committed = False
 
     for phase in cfg.phases:
         if phase.number < start_phase:
@@ -444,7 +424,7 @@ async def run_phase_loop(
             continue
 
         phase_start = time.monotonic()
-        phase_ok = await _run_phase(
+        phase_ok, phase_committed = await _run_phase(
             phase=phase,
             cfg=cfg,
             project_dir=project_dir,
@@ -453,6 +433,8 @@ async def run_phase_loop(
             stats_path=stats_path,
         )
         phase_duration = time.monotonic() - phase_start
+        if phase_committed:
+            any_committed = True
 
         phase_results.append(
             {
@@ -474,7 +456,9 @@ async def run_phase_loop(
             await asyncio.sleep(3)
 
     # ── End-of-run local checks (quick mode: deferred to here) ──────────
-    if exit_code == 0 and cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
+    if exit_code == 0 and cfg.quick and not any_committed:
+        log("All phases were no-ops — skipping end-of-run checks")
+    elif exit_code == 0 and cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
         from runner.local_checks import run_local_checks  # noqa: PLC0415
 
         header("END-OF-RUN LOCAL CHECKS (full)")

@@ -55,6 +55,9 @@ class StageState(BaseModel):
     feature_description_file: str | None = None
     retries: int = 0
     infra_retries: int = 0
+    transient_retries: int = 0
+    first_transient_failure_ts: datetime | None = None
+    backoff_until: datetime | None = None
     last_exit_code: int | None = None
 
 
@@ -137,6 +140,8 @@ class ConductorState(BaseModel):
     preset: Optional[str] = None
     overnight: bool = True
     quick: bool = False
+    max_parallel: int = 1
+    worktrees_base: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

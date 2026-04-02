@@ -147,6 +147,8 @@ Phase execution engine. Drives Claude through implementation phases with quality
 
 **Steerable Sessions:** Uses `subprocess.PIPE` for bidirectional communication with Claude CLI — no named FIFOs, no fd inheritance issues. Completion detected via idle timeout after `end_turn`, not by polling for a result event.
 
+**Steering Queue:** The orchestrator steers running sessions via file-based IPC — writes atomic `.msg` files to `{feature_dir}/steer_inbox/`, which the runner polls every 2s and forwards to the active session. No external CLI dependencies needed.
+
 ### Integration
 
 Post-run features for merging and testing across runs.
@@ -180,6 +182,8 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
 │       ├── spec/                     # Speccer output (domains, progress)
 │       ├── prompts/                  # Per-phase prompt files
 │       ├── run.sh                    # Runner entry point
+│       ├── activity.log              # Runner activity log (read by orchestrator)
+│       ├── steer_inbox/              # Steering message queue (.msg files)
 │       ├── LEARNINGS.md              # Phase learnings
 │       └── STATS.json               # Per-feature cost tracking
 └── logs/
@@ -223,6 +227,8 @@ Key models:
 State mutations are atomic: write to temp file, then `os.rename`.
 
 ## Design Decisions
+
+Conductor is fully standalone — no external runtime dependencies beyond Python, Claude CLI, git, and tmux. Prompt templates, steering, and activity log detection are all self-contained.
 
 This is a Python rewrite of the original bash implementation. Key improvements:
 
