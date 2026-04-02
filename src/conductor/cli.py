@@ -578,6 +578,72 @@ def _cmd_plan(args):
     print(f"Review, then run: conductor run --name {args.name}")
 
 
+def _cmd_go(args):
+    """One-shot resumable command: init → copy brief → plan → run."""
+    repo_path = Path(args.project_dir or ".").resolve()
+    storage = StorageResolver(repo_path)
+    state_path = storage.conductor_state(args.name)
+    brief_path = storage.conductor_brief(args.name)
+
+    tty = _isatty()
+    def _phase(num: int, total: int, label: str, skip: bool = False):
+        action = "skipping" if skip else label
+        msg = f"==> Phase {num}/{total}: {action}"
+        if tty:
+            msg = f"{_CYAN}{msg}{_RESET}"
+        print(msg, file=sys.stderr)
+
+    has_state = state_path.exists()
+    def _brief_has_content(path: Path) -> bool:
+        if not path.exists():
+            return False
+        text = path.read_text(encoding="utf-8")
+        # Strip HTML comments, markdown headings, and whitespace to detect placeholder-only briefs
+        stripped = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        stripped = re.sub(r"^#+\s.*$", "", stripped, flags=re.MULTILINE)
+        return len(stripped.strip()) > 20
+
+    brief_populated = _brief_has_content(brief_path)
+    has_runs = False
+    if has_state:
+        existing = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        has_runs = bool(existing.runs)
+
+    # Phase 1: Init
+    if not has_state:
+        _phase(1, 3, "Initializing...")
+        _cmd_init(args)
+    else:
+        _phase(1, 3, "Initializing", skip=True)
+
+    # Copy brief from --plan if needed
+    if not brief_populated:
+        plan_file = getattr(args, "plan", None)
+        if not plan_file:
+            print("Error: Brief is empty and no --plan file provided.")
+            print(f"Either fill in {brief_path} or pass --plan <file>.")
+            sys.exit(1)
+        plan_path = Path(plan_file)
+        if not plan_path.is_absolute():
+            plan_path = Path.cwd() / plan_path
+        if not plan_path.exists():
+            print(f"Error: Plan file not found: {plan_path}")
+            sys.exit(1)
+        brief_path.write_text(plan_path.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  Copied brief from {plan_path}", file=sys.stderr)
+
+    # Phase 2: Plan
+    if not has_runs:
+        _phase(2, 3, "Planning...")
+        _cmd_plan(args)
+    else:
+        _phase(2, 3, "Planning", skip=True)
+
+    # Phase 3: Run
+    _phase(3, 3, "Running...")
+    _cmd_run(args)
+
+
 def _cmd_run(args):
     """Execute the conductor orchestration loop."""
     repo_path = Path(args.project_dir or ".").resolve()
@@ -1143,6 +1209,17 @@ def main():
     _add_common(p_plan)
     p_plan.add_argument("--base-branch", default=None)
 
+    p_go = subparsers.add_parser("go", help="One-shot resumable: init → plan → run")
+    _add_common(p_go)
+    p_go.add_argument("--plan", default=None, help="Path to brief/plan file (required on first run)")
+    p_go.add_argument("--preset", default="base", help="Preset name (default: base, auto-detected)")
+    p_go.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
+    p_go.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
+    p_go.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end")
+    p_go.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs")
+    p_go.add_argument("--worktrees-base", default=None, help="Base directory for worktrees")
+    p_go.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
+
     p_run = subparsers.add_parser("run", help="Execute the orchestration loop")
     _add_common(p_run)
     p_run.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
@@ -1197,6 +1274,7 @@ def main():
     handlers = {
         "init": _cmd_init,
         "plan": _cmd_plan,
+        "go": _cmd_go,
         "run": _cmd_run,
         "status": _cmd_status,
         "log": _cmd_log,

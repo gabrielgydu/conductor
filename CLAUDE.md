@@ -26,6 +26,54 @@ Key flags:
 - `--inside-tmux`: run the loop directly without creating a new tmux session
 - `--overnight`: auto-answer speccer questions via brain (no human input needed)
 
+## Go Mode (One-Shot)
+
+`conductor go` combines init → plan → run into a single resumable command. On resume after kill/crash, it detects completed phases and skips them.
+
+### Usage
+
+```bash
+# First run — provide a brief file
+conductor go \
+  --name my-proj \
+  --project-dir ~/repo \
+  --plan ~/.claude/plans/my-brief.md
+
+# Resume after kill/crash — same command, skips completed phases
+conductor go \
+  --name my-proj \
+  --project-dir ~/repo
+```
+
+### Running from Claude Code (no TTY)
+
+```bash
+tmux new-session -d -s conductor-go-<name> -n conductor
+
+tmux send-keys -t conductor-go-<name>:conductor \
+  "/home/user/development/conductor/conductor go --inside-tmux --name <name> --project-dir <path> --plan <brief.md>" Enter
+
+# Monitor
+tmux capture-pane -t conductor-go-<name>:conductor -p 2>&1 | tail -20
+conductor status --name <name> --project-dir <path>
+```
+
+### Phase resume logic
+
+| Condition | Phases executed |
+|---|---|
+| No state | init → copy brief → plan → run |
+| State exists, brief is placeholder | copy brief → plan → run |
+| State exists, brief populated, no runs | plan → run |
+| State exists, runs populated | run only |
+
+### Key flags
+
+- `--plan`: path to brief file (required on first run when brief is empty)
+- `--preset`: preset name (default: base, auto-detected)
+- `--base-branch`: base branch (auto-detected if omitted)
+- All `run` flags: `--no-overnight`, `--quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
+
 ## Loop Mode
 
 `conductor loop` is a persistent prompt loop for fix/improvement tasks on existing branches. Unlike `conductor run` (which goes through speccer → runner → integration), loop mode takes a plan file with a task checklist and runs Claude repeatedly until all tasks are done.
