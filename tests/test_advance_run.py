@@ -1,4 +1,5 @@
 """Tests for advance_run state machine transitions."""
+
 from __future__ import annotations
 
 import pytest
@@ -15,8 +16,13 @@ import conductor.core.orchestrator as orch
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_state(stage_status: StageStatus, overnight: bool = False, num_stages: int = 1) -> ConductorState:
-    stages = [StageState(name=f"stage-{i}", spec_mode="full") for i in range(num_stages)]
+
+def _make_state(
+    stage_status: StageStatus, overnight: bool = False, num_stages: int = 1
+) -> ConductorState:
+    stages = [
+        StageState(name=f"stage-{i}", spec_mode="full") for i in range(num_stages)
+    ]
     stages[0].status = stage_status
     stages[0].worktree = "/tmp/fake-wt"
     stages[0].branch = "conductor/proj/run-0/stage-0"
@@ -65,6 +71,7 @@ def _make_config(overnight: bool = False) -> ConductorConfig:
 # pending -> spec_init (mocks create_worktree, run_speccer_init)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_pending_creates_worktree_and_calls_speccer_init(tmp_path):
     state = _make_state(StageStatus.PENDING)
@@ -72,13 +79,15 @@ async def test_advance_run_pending_creates_worktree_and_calls_speccer_init(tmp_p
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "create_worktree") as mock_cw, \
-         patch.object(orch, "run_speccer_init", new_callable=AsyncMock) as mock_init, \
-         patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run, \
-         patch.object(orch, "speccer_exit_code_handler") as mock_exit, \
-         patch.object(orch, "write_feature_description") as mock_desc, \
-         patch.object(orch, "write_constitution") as mock_const, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "create_worktree") as mock_cw,
+        patch.object(orch, "run_speccer_init", new_callable=AsyncMock) as mock_init,
+        patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run,
+        patch.object(orch, "speccer_exit_code_handler") as mock_exit,
+        patch.object(orch, "write_feature_description") as mock_desc,
+        patch.object(orch, "write_constitution") as mock_const,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_cw.assert_called_once()
@@ -93,14 +102,16 @@ async def test_advance_run_pending_sets_spec_init_then_falls_through(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "create_worktree"), \
-         patch.object(orch, "run_speccer_init", new_callable=AsyncMock), \
-         patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run, \
-         patch.object(orch, "speccer_exit_code_handler") as mock_exit, \
-         patch.object(orch, "write_feature_description"), \
-         patch.object(orch, "write_constitution"), \
-         patch.object(orch, "pre_reset_speccer_status"), \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "create_worktree"),
+        patch.object(orch, "run_speccer_init", new_callable=AsyncMock),
+        patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run,
+        patch.object(orch, "speccer_exit_code_handler") as mock_exit,
+        patch.object(orch, "write_feature_description"),
+        patch.object(orch, "write_constitution"),
+        patch.object(orch, "pre_reset_speccer_status"),
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     # run_speccer_run must be called (fall-through to spec_init branch)
@@ -112,6 +123,7 @@ async def test_advance_run_pending_sets_spec_init_then_falls_through(tmp_path):
 # spec_init -> calls run_speccer_run + exit_code_handler
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_spec_init_calls_run_and_handler(tmp_path):
     state = _make_state(StageStatus.SPEC_INIT)
@@ -119,10 +131,12 @@ async def test_advance_run_spec_init_calls_run_and_handler(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "pre_reset_speccer_status") as mock_reset, \
-         patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run, \
-         patch.object(orch, "speccer_exit_code_handler") as mock_exit, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "pre_reset_speccer_status") as mock_reset,
+        patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run,
+        patch.object(orch, "speccer_exit_code_handler") as mock_exit,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_reset.assert_called_once()
@@ -137,10 +151,12 @@ async def test_advance_run_spec_running_also_calls_run(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "pre_reset_speccer_status"), \
-         patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run, \
-         patch.object(orch, "speccer_exit_code_handler"), \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "pre_reset_speccer_status"),
+        patch.object(orch, "run_speccer_run", new_callable=AsyncMock) as mock_run,
+        patch.object(orch, "speccer_exit_code_handler"),
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_run.assert_called_once()
@@ -150,6 +166,7 @@ async def test_advance_run_spec_running_also_calls_run(tmp_path):
 # spec_needs_input with overnight=True -> calls answer_questions + continue
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_spec_needs_input_overnight_answers_and_continues(tmp_path):
     state = _make_state(StageStatus.SPEC_NEEDS_INPUT, overnight=True)
@@ -157,10 +174,12 @@ async def test_advance_run_spec_needs_input_overnight_answers_and_continues(tmp_
     storage = _make_storage(tmp_path)
     config = _make_config(overnight=True)
 
-    with patch.object(orch, "answer_questions", new_callable=AsyncMock) as mock_aq, \
-         patch.object(orch, "run_speccer_continue", new_callable=AsyncMock) as mock_cont, \
-         patch.object(orch, "speccer_exit_code_handler") as mock_exit, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "answer_questions", new_callable=AsyncMock) as mock_aq,
+        patch.object(orch, "run_speccer_continue", new_callable=AsyncMock) as mock_cont,
+        patch.object(orch, "speccer_exit_code_handler") as mock_exit,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_aq.assert_called_once()
@@ -172,6 +191,7 @@ async def test_advance_run_spec_needs_input_overnight_answers_and_continues(tmp_
 # spec_needs_input with overnight=False -> returns (skips)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_spec_needs_input_not_overnight_skips(tmp_path):
     state = _make_state(StageStatus.SPEC_NEEDS_INPUT, overnight=False)
@@ -179,9 +199,11 @@ async def test_advance_run_spec_needs_input_not_overnight_skips(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config(overnight=False)
 
-    with patch.object(orch, "answer_questions", new_callable=AsyncMock) as mock_aq, \
-         patch.object(orch, "run_speccer_continue", new_callable=AsyncMock) as mock_cont, \
-         patch.object(orch, "atomic_save") as mock_save:
+    with (
+        patch.object(orch, "answer_questions", new_callable=AsyncMock) as mock_aq,
+        patch.object(orch, "run_speccer_continue", new_callable=AsyncMock) as mock_cont,
+        patch.object(orch, "atomic_save") as mock_save,
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_aq.assert_not_called()
@@ -194,6 +216,7 @@ async def test_advance_run_spec_needs_input_not_overnight_skips(tmp_path):
 # spec_complete -> calls run_speccer_generate, sets generated
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_spec_complete_generates_and_sets_generated(tmp_path):
     state = _make_state(StageStatus.SPEC_COMPLETE)
@@ -201,8 +224,10 @@ async def test_advance_run_spec_complete_generates_and_sets_generated(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "run_speccer_generate", new_callable=AsyncMock) as mock_gen, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "run_speccer_generate", new_callable=AsyncMock) as mock_gen,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_gen.assert_called_once()
@@ -213,6 +238,7 @@ async def test_advance_run_spec_complete_generates_and_sets_generated(tmp_path):
 # generated -> calls start_runner, sets executing
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_generated_starts_runner_and_sets_executing(tmp_path):
     state = _make_state(StageStatus.GENERATED)
@@ -220,8 +246,10 @@ async def test_advance_run_generated_starts_runner_and_sets_executing(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "start_runner", new_callable=AsyncMock) as mock_start, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "start_runner", new_callable=AsyncMock) as mock_start,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_start.assert_called_once()
@@ -232,6 +260,7 @@ async def test_advance_run_generated_starts_runner_and_sets_executing(tmp_path):
 # executing -> calls monitor_runner
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_executing_calls_monitor_runner(tmp_path):
     state = _make_state(StageStatus.EXECUTING)
@@ -239,8 +268,10 @@ async def test_advance_run_executing_calls_monitor_runner(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "monitor_runner", new_callable=AsyncMock) as mock_monitor, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "monitor_runner", new_callable=AsyncMock) as mock_monitor,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_monitor.assert_called_once()
@@ -250,16 +281,16 @@ async def test_advance_run_executing_calls_monitor_runner(tmp_path):
 # done -> increments current_stage
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_done_increments_current_stage_single_stage(tmp_path):
-    """Single stage done -> run marked DONE and PR created."""
+    """Single stage done -> run marked DONE."""
     state = _make_state(StageStatus.DONE)
     tmux = _make_tmux()
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "atomic_save"), \
-         patch.object(orch, "push_and_create_pr") as mock_pr:
+    with patch.object(orch, "atomic_save"):
         await advance_run(state, 0, tmux, storage, config)
 
     # current_stage advanced to 1 (past end of stages list)
@@ -285,6 +316,7 @@ async def test_advance_run_done_advances_to_next_stage(tmp_path):
 # failed -> calls handle_failure
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_advance_run_failed_calls_handle_failure(tmp_path):
     state = _make_state(StageStatus.FAILED)
@@ -292,8 +324,10 @@ async def test_advance_run_failed_calls_handle_failure(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "handle_failure", new_callable=AsyncMock) as mock_fail, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "handle_failure", new_callable=AsyncMock) as mock_fail,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_fail.assert_called_once()
@@ -306,8 +340,10 @@ async def test_advance_run_stalled_calls_handle_failure(tmp_path):
     storage = _make_storage(tmp_path)
     config = _make_config()
 
-    with patch.object(orch, "handle_failure", new_callable=AsyncMock) as mock_fail, \
-         patch.object(orch, "atomic_save"):
+    with (
+        patch.object(orch, "handle_failure", new_callable=AsyncMock) as mock_fail,
+        patch.object(orch, "atomic_save"),
+    ):
         await advance_run(state, 0, tmux, storage, config)
 
     mock_fail.assert_called_once()
@@ -316,6 +352,7 @@ async def test_advance_run_stalled_calls_handle_failure(tmp_path):
 # ---------------------------------------------------------------------------
 # blocked -> sets run status to blocked
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_advance_run_blocked_sets_run_status(tmp_path):

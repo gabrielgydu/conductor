@@ -473,11 +473,22 @@ async def run_integration_merge(
         await _run_git(["push", "origin", branch_name], wt)
 
     # --- PR ---
+    pr_url: str | None = None
     try:
-        rc, stdout, _ = await _run_git_gh(
-            ["gh", "pr", "list", "--head", branch_name, "--json", "number"],
-            wt,
-        )
+        # Check for existing PR
+        for pr_check_attempt in range(3):
+            rc, stdout, stderr = await _run_git_gh(
+                ["gh", "pr", "list", "--head", branch_name, "--json", "number,url"],
+                wt,
+            )
+            if rc == 0:
+                break
+            logger.warning(
+                "gh pr list attempt %d failed: %s", pr_check_attempt + 1, stderr.strip()
+            )
+            if pr_check_attempt < 2:
+                await asyncio.sleep(5)
+
         existing_prs = []
         if rc == 0 and stdout.strip():
             try:
@@ -485,25 +496,35 @@ async def run_integration_merge(
             except json.JSONDecodeError:
                 existing_prs = []
 
-        if not existing_prs:
+        if existing_prs:
+            pr_url = existing_prs[0].get("url")
+        else:
             body = _build_pr_body(merged_runs, conflicts_resolved, conflicts_unresolved)
             title = f"Integration: {state.project_name}"
-            await _run_git_gh(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--title",
-                    title,
-                    "--body",
-                    body,
-                    "--head",
-                    branch_name,
-                ],
-                wt,
-            )
+            for attempt in range(3):
+                rc, stdout, stderr = await _run_git_gh(
+                    [
+                        "gh", "pr", "create",
+                        "--title", title,
+                        "--body", body,
+                        "--head", branch_name,
+                        "--base", state.base_branch,
+                    ],
+                    wt,
+                )
+                if rc == 0:
+                    pr_url = stdout.strip()
+                    break
+                logger.warning(
+                    "gh pr create attempt %d/3 failed (rc=%d): %s",
+                    attempt + 1, rc, stderr.strip(),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(5)
+            else:
+                logger.error("PR creation failed after 3 attempts for branch %s", branch_name)
     except Exception as e:
-        logger.warning("PR creation failed (gh CLI may not be available): %s", e)
+        logger.error("PR creation failed: %s", e)
 
     # --- Cleanup worktree (non-fatal) ---
     try:
@@ -527,6 +548,7 @@ async def run_integration_merge(
         conflicts_resolved=conflicts_resolved,
         conflicts_unresolved=conflicts_unresolved,
         e2e=e2e_result,
+        pr_url=pr_url,
     )
 
 

@@ -12,8 +12,6 @@ from runner.logging import log, success, warn, error, dim
 async def sync_with_base_branch(
     project_dir: Path,
     base_branch: str,
-    push_enabled: bool = False,
-    push_remote: str = "origin",
     sync_dump_regen: list[tuple[str, str]] | None = None,
     fix_model: str | None = None,
 ) -> bool:
@@ -57,8 +55,6 @@ async def sync_with_base_branch(
 
     if result.returncode == 0:
         success("Merged cleanly")
-        if push_enabled:
-            _push_changes(project_dir, push_remote)
         return True
 
     # Conflicts — get conflicting files
@@ -134,10 +130,6 @@ async def sync_with_base_branch(
     if regen_commands:
         _run_dump_regen(project_dir, regen_commands, base_branch)
 
-    # Push
-    if push_enabled:
-        _push_changes(project_dir, push_remote)
-
     return True
 
 
@@ -203,24 +195,3 @@ def _run_dump_regen(
             cwd=project_dir, capture_output=True, text=True,
         )
         success("Committed dump-regen changes")
-
-
-def _push_changes(project_dir: Path, remote: str = "origin") -> None:
-    """Push to remote."""
-    result = subprocess.run(
-        ["git", "branch", "--show-current"],
-        cwd=project_dir, capture_output=True, text=True,
-    )
-    branch = result.stdout.strip()
-    if not branch:
-        return
-
-    log(f"Pushing to {remote}/{branch}...")
-    result = subprocess.run(
-        ["git", "push", remote, branch],
-        cwd=project_dir, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        warn(f"Push failed (non-fatal): {result.stderr.strip()}")
-    else:
-        success("Pushed")

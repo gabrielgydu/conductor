@@ -45,9 +45,6 @@ class RunConfig:
     # Preset name (base / acme / nodeapp)
     preset: Optional[str] = None
 
-    # Push after each phase?
-    push_enabled: bool = False
-
     # Fixer enabled?
     fixer_enabled: bool = False
 
@@ -59,9 +56,6 @@ class RunConfig:
 
     # Use steerable session?
     steerable: bool = False
-
-    # git remote name to push to
-    push_remote: str = "origin"
 
     # Quick mode: quality gate only between phases, full CI+review at end
     quick: bool = False
@@ -100,12 +94,10 @@ class RunConfig:
             phases=phases,
             model=data.get("model"),
             preset=data.get("preset"),
-            push_enabled=data.get("push_enabled", False),
             fixer_enabled=data.get("fixer_enabled", False),
             max_iterations=data.get("max_iterations", 10),
             max_gate_retries=data.get("max_gate_retries", 3),
             steerable=data.get("steerable", False),
-            push_remote=data.get("push_remote", "origin"),
             quick=data.get("quick", False),
             local_ci_enabled=data.get("local_ci_enabled", False),
             local_ci_command=data.get("local_ci_command", ""),
@@ -124,12 +116,10 @@ class RunConfig:
             "project_dir": self.project_dir,
             "model": self.model,
             "preset": self.preset,
-            "push_enabled": self.push_enabled,
             "fixer_enabled": self.fixer_enabled,
             "max_iterations": self.max_iterations,
             "max_gate_retries": self.max_gate_retries,
             "steerable": self.steerable,
-            "push_remote": self.push_remote,
             "quick": self.quick,
             "local_ci_enabled": self.local_ci_enabled,
             "local_ci_command": self.local_ci_command,

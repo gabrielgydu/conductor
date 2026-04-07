@@ -431,11 +431,6 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
                 task_index=task.index, commit=commit_hash,
             )
 
-            if preset.config.push_enabled and state.branch:
-                pushed = push_branch(cwd, state.branch)
-                if pushed:
-                    _log("PUSH", f"Pushed {state.branch}", log_path, audit_path)
-
             state.current_task_index += 1
 
         elif signal == "failed":

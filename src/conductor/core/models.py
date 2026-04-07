@@ -62,7 +62,7 @@ class StageState(BaseModel):
 
 
 class RunState(BaseModel):
-    model_config = ConfigDict(use_enum_values=True)
+    model_config = ConfigDict(use_enum_values=True, extra="ignore")
 
     index: int
     name: str
@@ -75,7 +75,6 @@ class RunState(BaseModel):
     monitor: MonitorState = MonitorState()
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    pr_url: str | None = None
 
 
 class DomainState(BaseModel):
@@ -125,6 +124,7 @@ class IntegrationState(BaseModel):
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     e2e: Optional[E2ETestState] = None
+    pr_url: str | None = None
 
 
 class ConductorState(BaseModel):

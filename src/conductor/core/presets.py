@@ -18,8 +18,6 @@ class GateResult:
 
 @dataclass
 class PresetConfig:
-    push_enabled: bool = False
-    push_remote: str = "origin"
     fixer_enabled: bool = False
     fixer_async: bool = False
     sync_enabled: bool = False
@@ -88,7 +86,6 @@ class BasePreset(Preset):
 class AcmePreset(BasePreset):
     def __init__(self) -> None:
         self.config = PresetConfig(
-            push_enabled=True,
             fixer_enabled=True,
             sync_enabled=True,
             sync_dump_regen=[
@@ -172,7 +169,6 @@ class AcmePreset(BasePreset):
 class NodeappPreset(BasePreset):
     def __init__(self) -> None:
         self.config = PresetConfig(
-            push_enabled=False,
             fixer_enabled=False,
             fix_model="sonnet",
         )

@@ -341,10 +341,6 @@ async def _run_phase(
         untracked_snapshot.unlink(missing_ok=True)
         phase_committed = True
 
-        # ── Push ───────────────────────────────────────────────────────
-        if cfg.push_enabled:
-            git_push(project_dir, cfg.push_remote)
-
         # ── Local checks (skip in quick mode) ─────────────────────────
         if not cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
             from runner.local_checks import run_local_checks  # noqa: PLC0415
@@ -403,7 +399,6 @@ async def run_phase_loop(
     log(f"Working directory: {project_dir}")
     log(f"Phases: {len(cfg.phases)}")
     log(f"Preset: {cfg.preset or 'base'}")
-    log(f"Push: {'enabled' if cfg.push_enabled else 'disabled'}")
     log(f"Steerable: {'yes' if cfg.steerable else 'no'}")
     if cfg.model:
         log(f"Model: {cfg.model}")

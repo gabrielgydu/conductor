@@ -1,10 +1,17 @@
 """Tests for preset config completeness — all PresetConfig fields present."""
+
 from __future__ import annotations
 
 import pytest
 from dataclasses import fields
 
-from conductor.core.presets import PresetConfig, BasePreset, AcmePreset, NodeappPreset, load_preset
+from conductor.core.presets import (
+    PresetConfig,
+    BasePreset,
+    AcmePreset,
+    NodeappPreset,
+    load_preset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -12,8 +19,6 @@ from conductor.core.presets import PresetConfig, BasePreset, AcmePreset, Nodeapp
 # ---------------------------------------------------------------------------
 
 EXPECTED_FIELDS = {
-    "push_enabled",
-    "push_remote",
     "fixer_enabled",
     "fixer_async",
     "sync_enabled",
@@ -48,8 +53,6 @@ def test_preset_config_has_all_expected_fields():
 
 def test_preset_config_default_values():
     cfg = PresetConfig()
-    assert cfg.push_enabled is False
-    assert cfg.push_remote == "origin"
     assert cfg.fixer_enabled is False
     assert cfg.fixer_async is False
     assert cfg.sync_enabled is False
@@ -78,10 +81,6 @@ def test_preset_config_default_values():
 # ---------------------------------------------------------------------------
 # AcmePreset config completeness
 # ---------------------------------------------------------------------------
-
-def test_acme_config_push_enabled():
-    cfg = AcmePreset().config
-    assert cfg.push_enabled is True
 
 
 def test_acme_config_fixer_enabled():
@@ -113,21 +112,19 @@ def test_acme_config_sync_dump_regen_has_4_entries():
 def test_acme_config_sync_dump_regen_format():
     cfg = AcmePreset().config
     for entry in cfg.sync_dump_regen:
-        assert len(entry) == 2, "Each sync_dump_regen entry must be (glob, command) tuple"
+        assert len(entry) == 2, (
+            "Each sync_dump_regen entry must be (glob, command) tuple"
+        )
         glob_pat, cmd = entry
         assert isinstance(glob_pat, str)
         assert isinstance(cmd, str)
         assert glob_pat  # non-empty
-        assert cmd       # non-empty
+        assert cmd  # non-empty
 
 
 # ---------------------------------------------------------------------------
 # NodeappPreset config completeness
 # ---------------------------------------------------------------------------
-
-def test_nodeapp_config_push_disabled():
-    cfg = NodeappPreset().config
-    assert cfg.push_enabled is False
 
 
 def test_nodeapp_config_model_set():
@@ -144,10 +141,6 @@ def test_nodeapp_config_fix_model_set():
 # BasePreset config — sensible defaults
 # ---------------------------------------------------------------------------
 
-def test_base_config_push_disabled():
-    cfg = BasePreset().config
-    assert cfg.push_enabled is False
-
 
 def test_base_config_fixer_disabled():
     cfg = BasePreset().config
@@ -162,6 +155,7 @@ def test_base_config_sync_disabled():
 # ---------------------------------------------------------------------------
 # All presets instantiate without error
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("name", ["base", "acme", "nodeapp"])
 def test_all_presets_load(name):

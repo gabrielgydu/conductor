@@ -70,7 +70,6 @@ def test_base_preflight_claude_missing(tmp_path):
 def test_acme_config_flags():
     preset = load_preset("acme")
     cfg = preset.config
-    assert cfg.push_enabled is True
     assert cfg.fixer_enabled is True
 
 

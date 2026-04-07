@@ -63,6 +63,57 @@ def _log(
     )
 
 
+async def _push_and_pr_for_branch(
+    branch: str,
+    base_branch: str,
+    project_name: str,
+    run: "RunState",
+    storage: "StorageResolver",
+) -> str | None:
+    """Push a branch to origin and create a non-draft PR. Returns PR URL or None."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    project_dir = Path(storage.repo_root)
+
+    # Push
+    proc = await asyncio.create_subprocess_exec(
+        "git", "push", "-u", "origin", branch,
+        cwd=str(project_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    # Create PR with retry
+    pr_url: str | None = None
+    title = f"{run.name}: {run.description[:60]}" if run.description else run.name
+    for attempt in range(3):
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "create",
+            "--title", title,
+            "--body", f"Conductor single-run output for **{project_name}**.",
+            "--head", branch,
+            "--base", base_branch,
+            cwd=str(project_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        if proc.returncode == 0:
+            pr_url = stdout_bytes.decode().strip()
+            break
+        logger.warning(
+            "gh pr create attempt %d failed: %s",
+            attempt + 1,
+            stderr_bytes.decode().strip(),
+        )
+        if attempt < 2:
+            await asyncio.sleep(5)
+
+    return pr_url
+
+
 # ---------------------------------------------------------------------------
 # Progress-file helpers
 # ---------------------------------------------------------------------------
@@ -892,12 +943,10 @@ def generate_run_config(
         phases=phase_configs,
         model=model,
         preset=None,  # preset quality gate loaded by name in phase_loop
-        push_enabled=preset_config.push_enabled,
         fixer_enabled=preset_config.fixer_enabled and not quick,
         max_iterations=preset_config.max_iterations_per_phase,
         max_gate_retries=preset_config.max_gate_retries,
         steerable=True,
-        push_remote=preset_config.push_remote,
         quick=quick,
         local_ci_enabled=preset_config.local_ci_enabled,
         local_ci_command=preset_config.local_ci_command,
@@ -1648,192 +1697,6 @@ async def restart_stage(
 
 
 # ---------------------------------------------------------------------------
-# Git push and PR creation
-# ---------------------------------------------------------------------------
-
-
-def build_pr_body(
-    state: ConductorState,
-    run_idx: int,
-    storage: StorageResolver,
-    conductor_dir: Path | None = None,
-) -> str:
-    """Build PR body with description, constitution, stages, and merge order."""
-    run = state.runs[run_idx]
-    cdir = conductor_dir or storage.conductor_dir(state.project_name)
-    parts: list[str] = []
-
-    # Feature description from first stage
-    if run.stages:
-        first_stage = run.stages[0]
-        if first_stage.feature_description_file:
-            desc_path = cdir / first_stage.feature_description_file
-            if desc_path.exists():
-                parts.append(
-                    "## Description\n\n" + desc_path.read_text(encoding="utf-8")
-                )
-
-    # Constitution
-    if run.constitution:
-        principles = "\n".join(f"- {c}" for c in run.constitution)
-        parts.append("## Constitution\n\n" + principles)
-
-    # Stage list with branches
-    stage_lines = []
-    for i, stage in enumerate(run.stages):
-        stage_lines.append(f"- **{stage.name}** (`{stage.branch}`)")
-    parts.append("## Stages\n\n" + "\n".join(stage_lines))
-
-    # Dependency merge order
-    if run.depends_on:
-        run_by_index = {r.index: r for r in state.runs}
-        merge_lines = ["Merge dependencies first:"]
-        for dep_idx in run.depends_on:
-            dep_run = run_by_index.get(dep_idx)
-            if dep_run is None:
-                continue
-            dep_pr = dep_run.pr_url
-            if dep_pr:
-                merge_lines.append(f"1. **{dep_run.name}** — {dep_pr}")
-            else:
-                merge_lines.append(f"1. **{dep_run.name}**")
-        parts.append("## Merge Order\n\n" + "\n".join(merge_lines))
-
-    return "\n\n".join(parts)
-
-
-def push_and_create_pr(
-    state: ConductorState,
-    run_idx: int,
-    storage: StorageResolver,
-    log_path: Path | None = None,
-    audit_path: Path | None = None,
-) -> None:
-    """Push last stage branch and create a draft PR via gh."""
-    run = state.runs[run_idx]
-    if not run.stages:
-        return
-
-    last_stage = run.stages[-1]
-    branch = last_stage.branch
-    if not branch:
-        _log(
-            "GIT_PUSH_FAILED",
-            f"No branch found for run {run_idx}",
-            log_path,
-            audit_path,
-            run=run_idx,
-            reason="no_branch",
-        )
-        return
-
-    base_branch = state.base_branch or "main"
-    project_dir = storage.repo_root
-
-    # Push
-    push_result = subprocess.run(
-        ["git", "-C", str(project_dir), "push", "-u", "origin", branch],
-        capture_output=True,
-        text=True,
-    )
-    if push_result.returncode != 0:
-        _log(
-            "GIT_PUSH_FAILED",
-            f"Push failed for {branch}: {push_result.stderr.strip()}",
-            log_path,
-            audit_path,
-            run=run_idx,
-            branch=branch,
-        )
-        return
-
-    _log(
-        "GIT_PUSH", f"Pushed {branch}", log_path, audit_path, run=run_idx, branch=branch
-    )
-
-    # Get repo slug
-    slug_result = subprocess.run(
-        ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
-        capture_output=True,
-        text=True,
-    )
-    if slug_result.returncode != 0:
-        _log(
-            "PR_CREATE_FAILED",
-            "Could not determine repo slug",
-            log_path,
-            audit_path,
-            run=run_idx,
-            reason="no_repo_slug",
-        )
-        return
-
-    raw_url = slug_result.stdout.strip()
-    # Strip protocol/host and .git suffix
-    repo_slug = re.sub(r"^(https?://[^/]+/|git@[^:]+:)", "", raw_url)
-    repo_slug = re.sub(r"\.git$", "", repo_slug)
-
-    if not repo_slug:
-        _log(
-            "PR_CREATE_FAILED",
-            "Could not determine repo slug",
-            log_path,
-            audit_path,
-            run=run_idx,
-            reason="no_repo_slug",
-        )
-        return
-
-    body = build_pr_body(state, run_idx, storage)
-
-    pr_result = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            repo_slug,
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-            "--title",
-            f"feat: {run.name}",
-            "--body",
-            body,
-            "--draft",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(project_dir),
-    )
-
-    if pr_result.returncode == 0:
-        pr_url = pr_result.stdout.strip()
-        run.pr_url = pr_url
-        _log(
-            "PR_CREATED",
-            pr_url,
-            log_path,
-            audit_path,
-            run=run_idx,
-            branch=branch,
-            base=base_branch,
-            pr_url=pr_url,
-        )
-    else:
-        _log(
-            "PR_CREATE_FAILED",
-            f"gh pr create failed: {pr_result.stdout.strip()} {pr_result.stderr.strip()}",
-            log_path,
-            audit_path,
-            run=run_idx,
-            branch=branch,
-            base=base_branch,
-        )
-
-
-# ---------------------------------------------------------------------------
 # Dependency helpers
 # ---------------------------------------------------------------------------
 
@@ -1984,7 +1847,6 @@ async def advance_run(
             name=run.name,
         )
         _teardown_run_containers(run, preset, log_path, audit_path)
-        push_and_create_pr(state, run_idx, storage, log_path, audit_path)
         return
 
     stage = run.stages[stage_idx]
@@ -2525,7 +2387,51 @@ async def conductor_run_loop(
         )
         done_count = sum(1 for r in state.runs if r.status == RunStatus.DONE)
 
-        # Integration merge trigger: check whenever all runs are terminal with 2+ done
+        # Single-run case: push the feature branch and create a PR directly
+        if all_terminal and done_count == 1 and state.integration is None:
+            done_run = next(r for r in state.runs if r.status == RunStatus.DONE)
+            last_stage = done_run.stages[-1] if done_run.stages else None
+            if last_stage and last_stage.branch:
+                try:
+                    pr_url = await _push_and_pr_for_branch(
+                        last_stage.branch,
+                        state.base_branch,
+                        state.project_name,
+                        done_run,
+                        storage,
+                    )
+                    from conductor.core.models import IntegrationState, IntegrationStatus
+
+                    state.integration = IntegrationState(
+                        status=IntegrationStatus.DONE,
+                        branch=last_stage.branch,
+                        merged_runs=[done_run.index],
+                        pr_url=pr_url,
+                    )
+                    atomic_save(state, storage.conductor_state(state.project_name))
+                    _log(
+                        "CONDUCTOR_EXIT",
+                        f"Single-run PR created: {pr_url or 'no URL'}",
+                        log_path,
+                        audit_path,
+                    )
+                except Exception as exc:
+                    from conductor.core.models import IntegrationState
+
+                    state.integration = IntegrationState(
+                        status="failed", branch=last_stage.branch or ""
+                    )
+                    atomic_save(state, storage.conductor_state(state.project_name))
+                    _log(
+                        "CONDUCTOR_EXIT",
+                        f"Single-run push/PR failed: {exc}",
+                        log_path,
+                        audit_path,
+                    )
+            exit_reason = "all_done"
+            break
+
+        # Multi-run integration merge trigger: check whenever all runs are terminal with 2+ done
         if all_terminal and done_count >= 2 and state.integration is None:
             try:
                 from conductor.integration.merge import run_integration_merge
