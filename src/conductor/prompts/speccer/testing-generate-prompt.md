@@ -102,8 +102,7 @@ Map domain specs to implementation phases:
    | 2 | Livewire Tests — [View 1] | P1 | PHPUnit component tests (fast, isolated) | Test file, mocks | Per domain |
    | 3 | Livewire Tests — [View 2] | P1+ | PHPUnit component tests | Test file, mocks | Per domain |
    | ... | ... | ... | ... | ... | ... |
-   | N-1 | Playwright E2E Tests | P1 | Browser tests for all views (slow, integrated) | Spec files, plan files | All views |
-   | N | Full Suite Verification | P1 | Run all tests, verify coverage matrix, fix gaps | Pass report | All |
+   | N | Playwright E2E Tests | P1 | Browser tests for all views (slow, integrated) | Spec files, plan files | All views |
 
 2. **Phase Details** — For each phase:
    - Goal (1 sentence)
@@ -114,7 +113,6 @@ Map domain specs to implementation phases:
    - **Phase 1 always:** Test infrastructure (config, helpers, stubs, routes)
    - **PHPUnit phases next:** One phase per view's Livewire component tests (fast, isolated, no browser needed)
    - **Playwright phases after:** E2E browser tests (depend on components working correctly)
-   - **Final phase:** Full suite verification — run everything, verify coverage matrix
    - Priority drives ordering within each group (P1 before P2)
    - Testing → PHPUnit first because they're fast and catch component-level bugs early
 
@@ -188,12 +186,11 @@ When a test failure reveals an actual application bug (not a selector/timing/tes
 2. Log the bug in LEARNINGS.md with reproduction steps
 3. Move on to the next test
 
-The **second-to-last phase** (the phase before Final Verification) must include a **Bug Fix step** at the end:
+The **final phase** must include a **Bug Fix step** at the end:
 1. Search for all `test.fixme('BUG:` markers across all test files
 2. For each one: fix the application bug, then remove the `test.fixme` wrapper so the test runs normally
 3. Run the affected test files to confirm fixes work
-
-The **Final Verification phase** must verify that zero `test.fixme('BUG:` markers remain.
+4. Verify that zero `test.fixme('BUG:` markers remain
 
 **Critical prompt generation rules:**
 
@@ -218,7 +215,7 @@ Classify each test as trivial or complex before writing it:
 - Final phase token should be `{FEATURE_NAME}_MODULE_COMPLETE` (uppercased feature name with hyphens as underscores)
 - PHPUnit quality gates: `php artisan test --filter={TestClass}` — 0 failures
 - Playwright quality gates: `npx playwright test tests/{file}.spec.ts` — 0 failures
-- Final phase quality gate: full `php artisan test` + `npx playwright test`
+- Final phase (Playwright E2E) quality gate: full `php artisan test` + `npx playwright test`
 
 {IF SINGLE_PR}
 ### 5. Runner Script (Single Sequence)
@@ -318,7 +315,7 @@ Before finishing, verify ALL of these:
 - [ ] TEST-PLAN.md covers every test domain with strategy and scope
 - [ ] TEST-ARCHITECTURE.md has complete Playwright setup, helper library, PHPUnit stubs, mock patterns, test data strategy
 - [ ] IMPLEMENTATION-PLAN.md maps every domain to a phase
-- [ ] Phase ordering: infrastructure → PHPUnit phases → Playwright phases → verification
+- [ ] Phase ordering: infrastructure → PHPUnit phases → Playwright E2E phase (final)
 - [ ] Every phase prompt follows the Conductor template (status tracking, context, steps, verification, promise token)
 - [ ] Every test case name from domain specs appears in a phase prompt
 - [ ] Every mock/stub definition from domain specs is referenced in a phase prompt
@@ -331,7 +328,7 @@ Before finishing, verify ALL of these:
 - [ ] Coverage matrix: every P1 AC has both PHPUnit and Playwright test cases
 - [ ] PHPUnit quality gates: `php artisan test --filter={TestClass}`
 - [ ] Playwright quality gates: `npx playwright test tests/{file}.spec.ts`
-- [ ] Final phase runs full `php artisan test` + `npx playwright test`
+- [ ] Final phase quality gate runs full `php artisan test` + `npx playwright test`
 {IF HAS_CONSTITUTION}
 - [ ] TEST-ARCHITECTURE.md includes Constitution Compliance section
 - [ ] No constitutional principles are violated by the test design

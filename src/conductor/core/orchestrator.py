@@ -315,14 +315,17 @@ async def run_speccer_init(
     # Context wiring
     wiring = stage.context_wiring
     if wiring is not None:
-        # The ContextWiring model has sources/targets list fields
-        # Try to handle the wiring object — it may have extra attrs in subclasses
-        # For now, use getattr to access bash-equivalent fields
-        wiring_dict = wiring.model_dump() if hasattr(wiring, "model_dump") else {}
-        source_run_i = wiring_dict.get("source_run")
-        source_stage_i = wiring_dict.get("source_stage")
-        source_path = wiring_dict.get("source_path")
-        wiring_type = wiring_dict.get("type")
+        import json as _json  # noqa: PLC0415
+
+        try:
+            wiring_data = _json.loads(wiring.sources[0])
+        except (_json.JSONDecodeError, IndexError):
+            wiring_data = {}
+
+        source_run_i = wiring_data.get("source_run")
+        source_stage_i = wiring_data.get("source_stage")
+        source_path = wiring_data.get("source_path")
+        wiring_type = wiring_data.get("type")
 
         if wiring_type == "external" and source_path:
             if not Path(source_path).exists():
@@ -898,6 +901,7 @@ def generate_run_config(
     preset_config: PresetConfig,
     *,
     quick: bool = False,
+    is_final_stage: bool = False,
 ) -> Path:
     """Parse a generated run.sh and write RUN-CONFIG.json for the Python runner.
 
@@ -948,11 +952,11 @@ def generate_run_config(
         max_gate_retries=preset_config.max_gate_retries,
         steerable=True,
         quick=quick,
-        local_ci_enabled=preset_config.local_ci_enabled,
+        local_ci_enabled=False,
         local_ci_command=preset_config.local_ci_command,
         local_ci_full_command=preset_config.local_ci_full_command,
         local_ci_max_retries=preset_config.local_ci_max_retries,
-        local_review_enabled=preset_config.local_review_enabled,
+        local_review_enabled=preset_config.local_review_enabled and is_final_stage,
         local_review_command=preset_config.local_review_command,
         local_review_full_command=preset_config.local_review_full_command,
         local_review_max_retries=preset_config.local_review_max_retries,
@@ -990,9 +994,12 @@ async def start_runner(
     preset = load_preset(state.preset)
     quick = getattr(state, "quick", False)
 
+    is_final_stage = stage_idx == len(run.stages) - 1
+
     try:
         config_path = generate_run_config(
             run_sh, fname, Path(wt), preset.config, quick=quick,
+            is_final_stage=is_final_stage,
         )
         # Also set the preset name so phase_loop can load it for quality gates
         import json  # noqa: PLC0415
