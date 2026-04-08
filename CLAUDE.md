@@ -72,7 +72,10 @@ conductor status --name <name> --project-dir <path>
 - `--plan`: path to brief file (required on first run when brief is empty)
 - `--preset`: preset name (default: base, auto-detected)
 - `--base-branch`: base branch (auto-detected if omitted)
-- All `run` flags: `--no-overnight`, `--quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
+- `--quick`: enabled by default (use `--no-quick` to disable)
+- `--max-parallel`: default 1 (sequential runs)
+- `--worktrees-base`: base directory for worktrees (also used for integration merge worktree; defaults to `/tmp` if unset)
+- All `run` flags: `--no-overnight`, `--no-quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
 
 ## Loop Mode
 

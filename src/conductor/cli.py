@@ -640,6 +640,9 @@ def _cmd_go(args):
         _phase(2, 3, "Planning", skip=True)
 
     # Phase 3: Run
+    # Handle --no-quick override (go defaults quick=True)
+    if getattr(args, "no_quick", False):
+        args.quick = False
     _phase(3, 3, "Running...")
     _cmd_run(args)
 
@@ -1145,7 +1148,10 @@ def _cmd_validate(args):
     # Determine project directory: integration worktree or repo root
     project_dir = repo_path
     if state.integration and state.integration.branch:
-        wt_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
+        if state.worktrees_base:
+            wt_path = Path(state.worktrees_base) / f"integration-{state.project_name}"
+        else:
+            wt_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
         if wt_path.exists():
             project_dir = wt_path
 
@@ -1215,8 +1221,9 @@ def main():
     p_go.add_argument("--preset", default="base", help="Preset name (default: base, auto-detected)")
     p_go.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_go.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
-    p_go.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end")
-    p_go.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs")
+    p_go.add_argument("--quick", action="store_true", default=True, help="Quality gate only between phases; full CI+review at end (default: on)")
+    p_go.add_argument("--no-quick", action="store_true", help="Disable quick mode (run full CI+review between phases)")
+    p_go.add_argument("--max-parallel", type=int, default=1, help="Max parallel runs (default: 1)")
     p_go.add_argument("--worktrees-base", default=None, help="Base directory for worktrees")
     p_go.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 

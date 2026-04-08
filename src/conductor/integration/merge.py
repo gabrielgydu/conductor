@@ -292,7 +292,10 @@ async def run_integration_merge(
     eligible_runs = get_activation_order(state)
 
     branch_name = f"integration/{state.project_name}"
-    worktree_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
+    if state.worktrees_base:
+        worktree_path = Path(state.worktrees_base) / f"integration-{state.project_name}"
+    else:
+        worktree_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
     repo_root = Path(storage.repo_root)
     _print(f"Starting integration merge: {len(eligible_runs)} runs → {branch_name}")
 
