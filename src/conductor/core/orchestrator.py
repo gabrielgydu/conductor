@@ -532,12 +532,24 @@ async def run_speccer_generate(
         stage.status = StageStatus.FAILED
         return
 
-    # Verify run.sh was actually created
+    # Verify run.sh was actually created and contains PHASES
     docs_dir = Path(wt) / "docs" / fname
-    if not (docs_dir / "run.sh").exists():
+    run_sh = docs_dir / "run.sh"
+    if not run_sh.exists():
         _log(
             "SPECCER_GENERATE_FAILED",
             f"speccer generate {fname} completed but run.sh not found",
+            log_path, audit_path, run=run_idx, stage=stage_idx,
+        )
+        stage.status = StageStatus.FAILED
+        return
+
+    run_sh_text = run_sh.read_text(encoding="utf-8")
+    if "PHASES[" not in run_sh_text:
+        _log(
+            "SPECCER_GENERATE_FAILED",
+            f"speccer generate {fname} produced run.sh without PHASES arrays — "
+            f"regeneration needed",
             log_path, audit_path, run=run_idx, stage=stage_idx,
         )
         stage.status = StageStatus.FAILED
@@ -1013,6 +1025,7 @@ async def start_runner(
             log_path, audit_path, run=run_idx, stage=stage_idx,
         )
         stage.status = StageStatus.FAILED
+        stage.last_exit_code = 1
         return
 
     storage_dir = str(docs_dir)
@@ -1947,7 +1960,8 @@ async def advance_run(
         await start_runner(
             state, run_idx, stage_idx, tmux, storage, log_path, audit_path
         )
-        stage.status = StageStatus.EXECUTING
+        if stage.status != StageStatus.FAILED:
+            stage.status = StageStatus.EXECUTING
         atomic_save(state, storage.conductor_state(state.project_name))
         return
 
