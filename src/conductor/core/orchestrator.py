@@ -1672,19 +1672,27 @@ async def restart_stage(
 
     if current_status in (StageStatus.FAILED, StageStatus.BLOCKED):
         # Determine where to restart based on how far the stage got.
-        # If run.sh exists, the spec phase completed — restart from runner.
+        # If run.sh exists AND is valid, the spec phase completed — restart from runner.
+        # If run.sh exists but lacks PHASES, delete it so speccer generate re-runs.
         wt = stage.worktree
         run_sh = Path(wt) / "docs" / fname / "run.sh" if wt else None
-        if run_sh and run_sh.exists():
+        run_sh_valid = (
+            run_sh is not None
+            and run_sh.exists()
+            and "PHASES[" in run_sh.read_text(encoding="utf-8")
+        )
+        if run_sh_valid:
             exit_file = Path(f"/tmp/conductor-exit-{fname}")
             exit_file.unlink(missing_ok=True)
             Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
             stage.status = StageStatus.GENERATED
         else:
-            pre_reset_speccer_status(state, run_idx, stage_idx, storage)
-            exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+            # run.sh missing or malformed — delete it and re-run speccer generate
+            if run_sh and run_sh.exists():
+                run_sh.unlink()
+            exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}-gen")
             exit_file.unlink(missing_ok=True)
-            stage.status = StageStatus.SPEC_INIT
+            stage.status = StageStatus.SPEC_COMPLETE
 
     elif current_status in (
         StageStatus.SPEC_INIT,
