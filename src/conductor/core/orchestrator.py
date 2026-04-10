@@ -285,13 +285,33 @@ async def run_speccer_init(
     log_path: Path | None = None,
     audit_path: Path | None = None,
 ) -> None:
-    """Spawn speccer init in tmux window and wait for completion."""
+    """Spawn speccer init in tmux window and wait for completion.
+
+    Idempotent: if the spec dir was already initialized (PROGRESS.md present),
+    skip the speccer invocation so resume flows can safely re-enter the
+    PENDING branch.
+    """
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
     wt = stage.worktree
     mode = stage.spec_mode
     window_name = f"run{run_idx}:{stage.name}"
+
+    progress_file = Path(wt) / "docs" / fname / "spec" / "PROGRESS.md"
+    if progress_file.exists():
+        _log(
+            "SPECCER_INVOKE",
+            f"speccer init {fname} (mode={mode}) skipped — already initialized",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+            command="speccer init",
+            mode=mode,
+            skipped=True,
+        )
+        return
 
     exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
     exit_file.unlink(missing_ok=True)
@@ -1671,9 +1691,9 @@ async def restart_stage(
     stage.last_exit_code = None
 
     if current_status in (StageStatus.FAILED, StageStatus.BLOCKED):
-        # Determine where to restart based on how far the stage got.
+        # Determine where to restart based on how far the stage got on disk.
         # If run.sh exists AND is valid, the spec phase completed — restart from runner.
-        # If run.sh exists but lacks PHASES, delete it so speccer generate re-runs.
+        # Otherwise, consult PROGRESS.md to re-enter the pipeline at the correct phase.
         wt = stage.worktree
         run_sh = Path(wt) / "docs" / fname / "run.sh" if wt else None
         run_sh_valid = (
@@ -1687,12 +1707,35 @@ async def restart_stage(
             Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
             stage.status = StageStatus.GENERATED
         else:
-            # run.sh missing or malformed — delete it and re-run speccer generate
+            # run.sh missing or malformed — delete it and consult speccer progress
+            # so we resume at the right spec phase instead of blindly re-running
+            # `speccer generate` (which errors if the spec is still at INIT).
             if run_sh and run_sh.exists():
                 run_sh.unlink()
-            exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}-gen")
-            exit_file.unlink(missing_ok=True)
-            stage.status = StageStatus.SPEC_COMPLETE
+            Path(f"/tmp/conductor-speccer-exit-{fname}-gen").unlink(missing_ok=True)
+            Path(f"/tmp/conductor-speccer-exit-{fname}").unlink(missing_ok=True)
+
+            progress_file = _progress_file_path(state, run_idx, stage_idx)
+            speccer_status = (
+                _read_progress_status(progress_file)
+                if progress_file is not None and progress_file.exists()
+                else None
+            )
+
+            if speccer_status in ("COMPLETE", "GENERATED"):
+                stage.status = StageStatus.SPEC_COMPLETE
+            elif speccer_status == "NEEDS_INPUT":
+                stage.status = StageStatus.SPEC_NEEDS_INPUT
+            elif speccer_status in ("INIT", "EXPLORING", "SPECCING"):
+                pre_reset_speccer_status(state, run_idx, stage_idx, storage)
+                # Re-enter the pipeline at PENDING so the natural startup
+                # sequence (create_worktree → speccer init → write feature
+                # description → write constitution) runs. run_speccer_init
+                # is idempotent against an already-initialized spec dir.
+                stage.status = StageStatus.PENDING
+            else:
+                # No progress file yet — restart from the very beginning.
+                stage.status = StageStatus.PENDING
 
     elif current_status in (
         StageStatus.SPEC_INIT,
