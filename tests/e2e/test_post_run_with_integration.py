@@ -1,4 +1,5 @@
 """E2E tests: Post-run pipeline (TDD — conductor.post_run not yet implemented)."""
+
 from __future__ import annotations
 
 import sys

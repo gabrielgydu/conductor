@@ -73,9 +73,7 @@ async def test_conductor_starts_runner_after_generate(
 
     # Runner window spawned (cmd contains run.sh or is a runner-type spawn)
     spawned = mock_tmux.get_spawned_commands()
-    assert any(
-        "run.sh" in entry["cmd"] or entry.get("runner") for entry in spawned
-    ), (
+    assert any("run.sh" in entry["cmd"] or entry.get("runner") for entry in spawned), (
         f"Expected runner spawn, got: {[e['cmd'] for e in spawned]}"
     )
 
@@ -188,7 +186,10 @@ async def test_conductor_detects_runner_stall(
     result = await conductor_run_loop(state, config)
 
     # Stage should be FAILED or BLOCKED after stall_count reaches 5
-    assert result.runs[0].stages[0].status in (StageStatus.FAILED, StageStatus.BLOCKED), (
+    assert result.runs[0].stages[0].status in (
+        StageStatus.FAILED,
+        StageStatus.BLOCKED,
+    ), (
         f"Expected FAILED or BLOCKED after stall cap, got {result.runs[0].stages[0].status}"
     )
 
@@ -202,7 +203,8 @@ async def test_conductor_detects_runner_stall(
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
     log_content = conductor_log.read_text()
     assert any(
-        keyword in log_content.lower() for keyword in ["stall", "stall_count", "auto-failed"]
+        keyword in log_content.lower()
+        for keyword in ["stall", "stall_count", "auto-failed"]
     ), f"Expected stall event in log, got: {log_content}"
 
 
@@ -256,8 +258,7 @@ async def test_conductor_steers_stalled_runner(
     assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
     log_content = conductor_log.read_text()
     assert any(
-        keyword in log_content.lower()
-        for keyword in ["brain", "diagnos", "stall"]
+        keyword in log_content.lower() for keyword in ["brain", "diagnos", "stall"]
     ), f"Expected brain call in log, got: {log_content}"
 
 
@@ -294,7 +295,10 @@ async def test_conductor_detects_dead_runner(
     result = await conductor_run_loop(state, config)
 
     # Stage should be either FAILED or BLOCKED (failed initially, then handled by brain)
-    assert result.runs[0].stages[0].status in (StageStatus.FAILED, StageStatus.BLOCKED), (
+    assert result.runs[0].stages[0].status in (
+        StageStatus.FAILED,
+        StageStatus.BLOCKED,
+    ), (
         f"Expected FAILED or BLOCKED after dead runner, got {result.runs[0].stages[0].status}"
     )
 

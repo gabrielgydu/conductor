@@ -1,4 +1,5 @@
 """Additional tests for conductor.core.claude — resolve_model, calculate_cost, NDJSON."""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +17,7 @@ from conductor.core.claude import (
 # ---------------------------------------------------------------------------
 # resolve_model
 # ---------------------------------------------------------------------------
+
 
 def test_resolve_model_opus():
     assert resolve_model("opus") == "claude-opus-4-6[1m]"
@@ -44,6 +46,7 @@ def test_resolve_model_empty_string_passthrough():
 # ---------------------------------------------------------------------------
 # calculate_cost
 # ---------------------------------------------------------------------------
+
 
 def test_calculate_cost_none_input():
     assert calculate_cost(None) is None
@@ -115,6 +118,7 @@ def test_calculate_cost_small_values():
 # SteerableSession.send() produces correct NDJSON
 # ---------------------------------------------------------------------------
 
+
 def _make_proc_with_lines(lines: list[bytes]) -> MagicMock:
     proc = MagicMock()
     proc.returncode = None
@@ -142,9 +146,11 @@ def _make_proc_with_lines(lines: list[bytes]) -> MagicMock:
 @pytest.mark.asyncio
 async def test_steerable_send_produces_correct_ndjson():
     """send() must produce {type, message, session_id, parent_tool_use_id} on one line."""
-    proc = _make_proc_with_lines([
-        b'{"type":"result","result":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n',
-    ])
+    proc = _make_proc_with_lines(
+        [
+            b'{"type":"result","result":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n',
+        ]
+    )
 
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         session = await run_claude_steerable("initial prompt")
@@ -170,9 +176,11 @@ async def test_steerable_send_produces_correct_ndjson():
 @pytest.mark.asyncio
 async def test_steerable_initial_write_is_correct_ndjson():
     """The initial prompt write must also be correct NDJSON."""
-    proc = _make_proc_with_lines([
-        b'{"type":"result","result":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n',
-    ])
+    proc = _make_proc_with_lines(
+        [
+            b'{"type":"result","result":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n',
+        ]
+    )
 
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         await run_claude_steerable("hello world")

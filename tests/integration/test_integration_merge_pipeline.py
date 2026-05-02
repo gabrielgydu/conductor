@@ -1,4 +1,5 @@
 """Integration tests: merge pipeline scenarios (DAG ordering, conflicts, edge cases)."""
+
 from __future__ import annotations
 
 import subprocess
@@ -117,15 +118,21 @@ async def test_merge_with_conflicts(real_merge_repo, tmp_path):
     shared.write_text("original content\n")
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
 
-    real_merge_repo.create_branch("conflict-a", {"shared.txt": "version from branch-a\n"})
-    real_merge_repo.create_branch("conflict-b", {"shared.txt": "version from branch-b\n"})
+    real_merge_repo.create_branch(
+        "conflict-a", {"shared.txt": "version from branch-a\n"}
+    )
+    real_merge_repo.create_branch(
+        "conflict-b", {"shared.txt": "version from branch-b\n"}
+    )
 
     project_name = _project_name(tmp_path)
     state = _make_state(
@@ -144,14 +151,18 @@ async def test_merge_with_conflicts(real_merge_repo, tmp_path):
 
     claude_calls: list[list[str]] = []
 
-    async def mock_claude(conflicting_files: list[str], run_description: str, cwd: Path) -> bool:
+    async def mock_claude(
+        conflicting_files: list[str], run_description: str, cwd: Path
+    ) -> bool:
         claude_calls.append(list(conflicting_files))
         for f in conflicting_files:
             (cwd / f).write_text("claude resolved content\n")
         return True
 
     with patch.object(merge_module, "_run_git", side_effect=patched_run_git):
-        with patch.object(merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude):
+        with patch.object(
+            merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude
+        ):
             with patch(
                 "conductor.integration.merge._run_git_gh",
                 new_callable=AsyncMock,
@@ -180,15 +191,21 @@ async def test_partial_merge(real_merge_repo, tmp_path):
     shared.write_text("original content\n")
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
 
-    real_merge_repo.create_branch("partial-a", {"shared.txt": "version from partial-a\n"})
-    real_merge_repo.create_branch("partial-b", {"shared.txt": "version from partial-b\n"})
+    real_merge_repo.create_branch(
+        "partial-a", {"shared.txt": "version from partial-a\n"}
+    )
+    real_merge_repo.create_branch(
+        "partial-b", {"shared.txt": "version from partial-b\n"}
+    )
 
     project_name = _project_name(tmp_path)
     state = _make_state(
@@ -205,11 +222,15 @@ async def test_partial_merge(real_merge_repo, tmp_path):
             return (1, "", "simulated -X theirs failure")
         return await original_run_git(args, cwd)
 
-    async def mock_claude_fail(conflicting_files: list[str], run_description: str, cwd: Path) -> bool:
+    async def mock_claude_fail(
+        conflicting_files: list[str], run_description: str, cwd: Path
+    ) -> bool:
         return False
 
     with patch.object(merge_module, "_run_git", side_effect=patched_run_git):
-        with patch.object(merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude_fail):
+        with patch.object(
+            merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude_fail
+        ):
             with patch(
                 "conductor.integration.merge._run_git_gh",
                 new_callable=AsyncMock,
@@ -224,7 +245,8 @@ async def test_partial_merge(real_merge_repo, tmp_path):
     branch_name = f"integration/{project_name}"
     branches = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout
     assert branch_name in branches
 
@@ -239,14 +261,20 @@ async def test_merge_skips_failed_runs(real_merge_repo, tmp_path):
     """BLOCKED runs are excluded from the integration merge."""
     real_merge_repo.create_branch("branch-a", {"file_a.txt": "content a\n"})
     real_merge_repo.create_branch("branch-b", {"file_b.txt": "content b\n"})
-    real_merge_repo.create_branch("branch-blocked", {"blocked_file.txt": "blocked content\n"})
+    real_merge_repo.create_branch(
+        "branch-blocked", {"blocked_file.txt": "blocked content\n"}
+    )
 
     project_name = _project_name(tmp_path)
     run_blocked = RunState(
         index=2,
         name="blocked",
         description="blocked desc",
-        stages=[StageState(name="impl", spec_mode="full", branch="branch-blocked", status="done")],
+        stages=[
+            StageState(
+                name="impl", spec_mode="full", branch="branch-blocked", status="done"
+            )
+        ],
         status=RunStatus.BLOCKED,
     )
     state = _make_state(
@@ -273,7 +301,8 @@ async def test_merge_skips_failed_runs(real_merge_repo, tmp_path):
     branch_name = f"integration/{project_name}"
     ls = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "ls-tree", "--name-only", branch_name],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     files = ls.stdout.splitlines()
     assert "blocked_file.txt" not in files

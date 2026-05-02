@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 
 from conductor.core.enums import IntegrationStatus, RunStatus, StageStatus
-from conductor.core.models import ConductorState, IntegrationState, RunState, StageState, load_state
+from conductor.core.models import (
+    ConductorState,
+    IntegrationState,
+    RunState,
+    StageState,
+    load_state,
+)
 
 
 # ---------------------------------------------------------------------------

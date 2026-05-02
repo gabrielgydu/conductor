@@ -1,4 +1,5 @@
 """Tests for fixer supersede_older_fixers logic."""
+
 from __future__ import annotations
 
 import json
@@ -15,6 +16,7 @@ from runner.fixer import supersede_older_fixers, write_fixer_status
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _write_status(log_dir: Path, phase: int, status: str, pid: int) -> Path:
     sf = log_dir / f".fixer-status-phase-{phase}"
@@ -34,10 +36,22 @@ def _write_status(log_dir: Path, phase: int, status: str, pid: int) -> Path:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 def test_supersede_no_other_fixers(tmp_path):
     """Only current phase status file present -> adopted = [current_phase]."""
     current_sf = tmp_path / ".fixer-status-phase-3"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 3, "pid": os.getpid(), "phases": [3], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 3,
+                "pid": os.getpid(),
+                "phases": [3],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     adopted = supersede_older_fixers(tmp_path, 3, current_sf)
 
@@ -47,7 +61,18 @@ def test_supersede_no_other_fixers(tmp_path):
 def test_supersede_dead_waiting_ci_fixer_adopted(tmp_path):
     """A dead fixer in waiting_ci state: adopt its phases even if process is dead."""
     current_sf = tmp_path / ".fixer-status-phase-5"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 5, "pid": os.getpid(), "phases": [5], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 5,
+                "pid": os.getpid(),
+                "phases": [5],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     # PID that doesn't exist (very large number)
     dead_pid = 9_999_999
@@ -62,7 +87,18 @@ def test_supersede_dead_waiting_ci_fixer_adopted(tmp_path):
 def test_supersede_non_waiting_ci_fixer_not_adopted(tmp_path):
     """A fixer in 'fixing' state (not waiting_ci) should not be adopted."""
     current_sf = tmp_path / ".fixer-status-phase-5"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 5, "pid": os.getpid(), "phases": [5], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 5,
+                "pid": os.getpid(),
+                "phases": [5],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     dead_pid = 9_999_998
     _write_status(tmp_path, 2, "fixing", dead_pid)
@@ -75,15 +111,34 @@ def test_supersede_non_waiting_ci_fixer_not_adopted(tmp_path):
 def test_supersede_returns_sorted_unique_phases(tmp_path):
     """Adopted phases list is sorted and deduplicated."""
     current_sf = tmp_path / ".fixer-status-phase-5"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 5, "pid": os.getpid(), "phases": [5], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 5,
+                "pid": os.getpid(),
+                "phases": [5],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     # Two dead fixers with waiting_ci
     for phase in [1, 3]:
         sf = tmp_path / f".fixer-status-phase-{phase}"
-        sf.write_text(json.dumps({
-            "status": "waiting_ci", "phase": phase, "pid": 9_999_990 + phase,
-            "phases": [phase], "timestamp": "", "detail": ""
-        }))
+        sf.write_text(
+            json.dumps(
+                {
+                    "status": "waiting_ci",
+                    "phase": phase,
+                    "pid": 9_999_990 + phase,
+                    "phases": [phase],
+                    "timestamp": "",
+                    "detail": "",
+                }
+            )
+        )
 
     adopted = supersede_older_fixers(tmp_path, 5, current_sf)
 
@@ -94,7 +149,18 @@ def test_supersede_returns_sorted_unique_phases(tmp_path):
 def test_supersede_inherits_adopted_phases_from_old_fixer(tmp_path):
     """If old fixer had adopted_phases [1, 2], inherit both."""
     current_sf = tmp_path / ".fixer-status-phase-5"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 5, "pid": os.getpid(), "phases": [5], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 5,
+                "pid": os.getpid(),
+                "phases": [5],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     old_sf = tmp_path / ".fixer-status-phase-2"
     old_data = {
@@ -117,7 +183,18 @@ def test_supersede_inherits_adopted_phases_from_old_fixer(tmp_path):
 def test_supersede_corrupted_status_file_skipped(tmp_path):
     """Corrupted JSON file should not crash; just skip it."""
     current_sf = tmp_path / ".fixer-status-phase-5"
-    current_sf.write_text(json.dumps({"status": "waiting_ci", "phase": 5, "pid": os.getpid(), "phases": [5], "timestamp": "", "detail": ""}))
+    current_sf.write_text(
+        json.dumps(
+            {
+                "status": "waiting_ci",
+                "phase": 5,
+                "pid": os.getpid(),
+                "phases": [5],
+                "timestamp": "",
+                "detail": "",
+            }
+        )
+    )
 
     bad_sf = tmp_path / ".fixer-status-phase-1"
     bad_sf.write_text("not valid json", encoding="utf-8")

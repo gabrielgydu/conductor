@@ -1,4 +1,5 @@
 """Integration tests: E2E testing pipeline (TDD — conductor.integration.e2e not yet implemented)."""
+
 from __future__ import annotations
 
 import subprocess
@@ -61,11 +62,25 @@ def _make_state(project_name: str, *runs: RunState) -> ConductorState:
 
 def _add_file_to_branch(repo_path: Path, branch: str, filename: str, content: str):
     """Checkout branch, add file, commit, checkout main."""
-    subprocess.run(["git", "-C", str(repo_path), "checkout", branch], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo_path), "checkout", branch],
+        check=True,
+        capture_output=True,
+    )
     (repo_path / filename).write_text(content)
-    subprocess.run(["git", "-C", str(repo_path), "add", filename], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo_path), "commit", "-m", f"add {filename}"], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo_path), "checkout", "main"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo_path), "add", filename], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_path), "commit", "-m", f"add {filename}"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_path), "checkout", "main"],
+        check=True,
+        capture_output=True,
+    )
 
 
 def _make_state_with_integration(project_name: str, branch_name: str) -> ConductorState:
@@ -121,10 +136,20 @@ async def test_e2e_generation_and_execution(real_merge_repo, tmp_path):
     # Mock process with communicate() returning 3 passed
     mock_proc = MagicMock()
     mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(b"3 passed, 0 failed, 0 skipped", b""))
+    mock_proc.communicate = AsyncMock(
+        return_value=(b"3 passed, 0 failed, 0 skipped", b"")
+    )
 
-    with patch("conductor.integration.e2e.run_claude", new_callable=AsyncMock, return_value="// generated tests"):
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
+    with patch(
+        "conductor.integration.e2e.run_claude",
+        new_callable=AsyncMock,
+        return_value="// generated tests",
+    ):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=mock_proc,
+        ):
             result = await run_integration_testing(state, storage)
 
     assert isinstance(result, E2ETestState)
@@ -209,10 +234,20 @@ async def test_e2e_failures_dont_block(real_merge_repo, tmp_path):
     # Mock process returning exit code 1 with 1 passed, 2 failed
     mock_proc = MagicMock()
     mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(return_value=(b"1 passed, 2 failed, 0 skipped", b""))
+    mock_proc.communicate = AsyncMock(
+        return_value=(b"1 passed, 2 failed, 0 skipped", b"")
+    )
 
-    with patch("conductor.integration.e2e.run_claude", new_callable=AsyncMock, return_value="// generated tests"):
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
+    with patch(
+        "conductor.integration.e2e.run_claude",
+        new_callable=AsyncMock,
+        return_value="// generated tests",
+    ):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=mock_proc,
+        ):
             result = await run_integration_testing(state, storage)
 
     # Function must return normally — no exception raised

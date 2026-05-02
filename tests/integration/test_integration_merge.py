@@ -1,4 +1,5 @@
 """Integration tests: real git operations for merge pipeline."""
+
 from __future__ import annotations
 
 import subprocess
@@ -105,15 +106,21 @@ async def test_conflict_theirs_real_git(real_merge_repo, tmp_path):
     shared.write_text("original content\n")
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
 
-    real_merge_repo.create_branch("conflict-a", {"shared.txt": "version from branch-a\n"})
-    real_merge_repo.create_branch("conflict-b", {"shared.txt": "version from branch-b\n"})
+    real_merge_repo.create_branch(
+        "conflict-a", {"shared.txt": "version from branch-a\n"}
+    )
+    real_merge_repo.create_branch(
+        "conflict-b", {"shared.txt": "version from branch-b\n"}
+    )
 
     project_name = _project_name(tmp_path)
     state = _make_state(
@@ -158,11 +165,13 @@ async def test_conflict_markers_real_git(real_merge_repo, tmp_path):
     shared.write_text("original content\n")
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     real_merge_repo.create_branch("claude-a", {"shared.txt": "version from a\n"})
     real_merge_repo.create_branch("claude-b", {"shared.txt": "version from b\n"})
@@ -185,14 +194,18 @@ async def test_conflict_markers_real_git(real_merge_repo, tmp_path):
 
     claude_calls: list[list[str]] = []
 
-    async def mock_claude(conflicting_files: list[str], run_description: str, cwd: Path) -> bool:
+    async def mock_claude(
+        conflicting_files: list[str], run_description: str, cwd: Path
+    ) -> bool:
         claude_calls.append(conflicting_files)
         for f in conflicting_files:
             (cwd / f).write_text("claude resolved content\n")
         return True
 
     with patch.object(merge_module, "_run_git", side_effect=patched_run_git):
-        with patch.object(merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude):
+        with patch.object(
+            merge_module, "resolve_conflicts_with_claude", side_effect=mock_claude
+        ):
             with patch(
                 "conductor.integration.merge._run_git_gh",
                 new_callable=AsyncMock,
@@ -226,12 +239,16 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
 
     head_before = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
     branch_before = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
     with patch(
@@ -243,16 +260,22 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
 
     head_after = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
     branch_after = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
     assert head_before == head_after, "Main repo HEAD changed during integration merge"
-    assert branch_before == branch_after, "Main repo branch changed during integration merge"
+    assert branch_before == branch_after, (
+        "Main repo branch changed during integration merge"
+    )
     assert result.status == IntegrationStatus.DONE
 
 
@@ -287,7 +310,8 @@ async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
     branch_name = f"integration/{project_name}"
     branches = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout
     assert branch_name in branches
 
@@ -302,6 +326,7 @@ async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
     # Integration branch still exists (freshly created)
     branches_after = subprocess.run(
         ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout
     assert branch_name in branches_after

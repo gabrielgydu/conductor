@@ -191,7 +191,9 @@ class MockTmux:
             if asyncio.iscoroutine(result):
                 await result
 
-    async def spawn_runner_in_window(self, name: str, cmd: str, *, exit_file=None, cwd=None) -> None:
+    async def spawn_runner_in_window(
+        self, name: str, cmd: str, *, exit_file=None, cwd=None
+    ) -> None:
         """Non-blocking spawn (runner). Optionally writes exit file."""
         self._spawned_commands.append({"window": name, "cmd": cmd, "runner": True})
         if name not in self._windows:
@@ -203,7 +205,9 @@ class MockTmux:
             if asyncio.iscoroutine(result):
                 await result
 
-    async def spawn_in_window_and_wait(self, name: str, cmd: str, *, exit_file=None, cwd=None) -> int:
+    async def spawn_in_window_and_wait(
+        self, name: str, cmd: str, *, exit_file=None, cwd=None
+    ) -> int:
         self._spawned_commands.append({"window": name, "cmd": cmd, "waited": True})
         if name not in self._windows:
             self._windows[name] = {"alive": False, "exit_code": 0}
@@ -256,6 +260,7 @@ def mock_tmux(monkeypatch) -> MockTmux:
 def mock_conductor_post_run(monkeypatch):
     """Prevent conductor_post_run from hitting real Claude API in all integration tests."""
     from unittest.mock import AsyncMock
+
     monkeypatch.setattr(
         "conductor.core.orchestrator.conductor_post_run",
         AsyncMock(return_value=None),
@@ -266,8 +271,13 @@ def mock_conductor_post_run(monkeypatch):
 def clean_tmp_files():
     """Clean up conductor temp files before each test."""
     import glob
+
     # Remove old conductor exit and activity files to avoid test pollution
-    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+    for pattern in [
+        "/tmp/conductor-exit-*",
+        "/tmp/ralph-activity-*",
+        "/tmp/conductor-speccer-exit-*",
+    ]:
         for f in glob.glob(pattern):
             try:
                 Path(f).unlink()
@@ -275,7 +285,11 @@ def clean_tmp_files():
                 pass
     yield
     # Also clean up after test
-    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+    for pattern in [
+        "/tmp/conductor-exit-*",
+        "/tmp/ralph-activity-*",
+        "/tmp/conductor-speccer-exit-*",
+    ]:
         for f in glob.glob(pattern):
             try:
                 Path(f).unlink()
@@ -290,7 +304,9 @@ def patch_orchestrator_create_worktree(monkeypatch, tmp_path):
 
     _wt_counter = [0]
 
-    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+    def mock_create_worktree(
+        state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs
+    ):
         run = state.runs[run_idx]
         stage = run.stages[stage_idx]
         _wt_counter[0] += 1
@@ -406,7 +422,11 @@ class MockSpeccer:
                 project_dir = Path(parts[i + 1])
             elif part == "--feature" and i + 1 < len(parts):
                 feature_name = parts[i + 1]
-            elif part == "init" and i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+            elif (
+                part == "init"
+                and i + 1 < len(parts)
+                and not parts[i + 1].startswith("-")
+            ):
                 # speccer init <feature_name>
                 feature_name = parts[i + 1]
 
@@ -524,32 +544,64 @@ class RealMergeRepo:
 
     def create_branch(self, name: str, files: dict[str, str]) -> None:
         """Create a branch from main with the given file contents."""
-        subprocess.run(["git", "-C", str(self.path), "checkout", "main"], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(self.path), "checkout", "-b", name], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.path), "checkout", "main"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.path), "checkout", "-b", name],
+            check=True,
+            capture_output=True,
+        )
         for filename, content in files.items():
             file_path = self.path / filename
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content)
-            subprocess.run(["git", "-C", str(self.path), "add", filename], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(self.path), "add", filename],
+                check=True,
+                capture_output=True,
+            )
         subprocess.run(
             ["git", "-C", str(self.path), "commit", "-m", f"changes on {name}"],
             check=True,
             capture_output=True,
         )
-        subprocess.run(["git", "-C", str(self.path), "checkout", "main"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.path), "checkout", "main"],
+            check=True,
+            capture_output=True,
+        )
 
 
 @pytest.fixture
 def real_merge_repo(tmp_path) -> RealMergeRepo:
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@test.com"], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
     readme = repo / "README.md"
     readme.write_text("# Test Repo\n")
-    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
     return RealMergeRepo(repo)
 
 

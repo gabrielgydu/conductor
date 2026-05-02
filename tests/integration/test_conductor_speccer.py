@@ -34,6 +34,7 @@ def _make_spawn_callback(mock_speccer, mock_tmux, *, write_progress: bool = True
         if name.endswith("-exec"):
             # This is a runner spawn — write exit_code=0 so stage transitions to DONE
             import re
+
             # Extract fname from cmd: "cd {wt} && bash docs/{fname}/run.sh ..."
             m = re.search(r"bash docs/([^/]+)/run\.sh", cmd)
             if m:
@@ -75,9 +76,11 @@ async def test_conductor_advances_through_spec_stages(
     result = await conductor_run_loop(state, config)
 
     # Final stage status - should reach GENERATED or later (EXECUTING or DONE if runner also runs)
-    assert result.runs[0].stages[0].status in (StageStatus.GENERATED, StageStatus.EXECUTING, StageStatus.DONE), (
-        f"Expected GENERATED or later, got {result.runs[0].stages[0].status}"
-    )
+    assert result.runs[0].stages[0].status in (
+        StageStatus.GENERATED,
+        StageStatus.EXECUTING,
+        StageStatus.DONE,
+    ), f"Expected GENERATED or later, got {result.runs[0].stages[0].status}"
 
     # Speccer window was spawned with a command containing 'speccer'
     spawned = mock_tmux.get_spawned_commands()
@@ -114,9 +117,13 @@ async def test_conductor_handles_spec_needs_input(
 
     # Stage reached some terminal status (may be BLOCKED if PROGRESS.md not found)
     final_status = result.runs[0].stages[0].status
-    assert final_status in (StageStatus.SPEC_COMPLETE, StageStatus.GENERATED, StageStatus.DONE, StageStatus.BLOCKED, StageStatus.FAILED), (
-        f"Expected terminal status, got {final_status}"
-    )
+    assert final_status in (
+        StageStatus.SPEC_COMPLETE,
+        StageStatus.GENERATED,
+        StageStatus.DONE,
+        StageStatus.BLOCKED,
+        StageStatus.FAILED,
+    ), f"Expected terminal status, got {final_status}"
 
     # A speccer spawn with --continue may occur (if PROGRESS.md was found)
     spawned = mock_tmux.get_spawned_commands()
@@ -151,9 +158,10 @@ async def test_conductor_detects_dead_speccer(
     result = await conductor_run_loop(state, config)
 
     # Stage marked FAILED or BLOCKED — detected via no PROGRESS.md + handle_failure
-    assert result.runs[0].stages[0].status in (StageStatus.FAILED, StageStatus.BLOCKED), (
-        f"Expected FAILED or BLOCKED, got {result.runs[0].stages[0].status}"
-    )
+    assert result.runs[0].stages[0].status in (
+        StageStatus.FAILED,
+        StageStatus.BLOCKED,
+    ), f"Expected FAILED or BLOCKED, got {result.runs[0].stages[0].status}"
 
     # CONDUCTOR-LOG.md contains failure event
     conductor_log = tmp_storage_dir / "conductor" / "test-project" / "CONDUCTOR-LOG.md"
@@ -197,16 +205,20 @@ async def test_conductor_retries_failed_spec(
 
     # At least 2 speccer RUN spawns occurred (initial run + retry)
     spawned = mock_tmux.get_spawned_commands()
-    speccer_run_spawns = [e for e in spawned if "speccer" in e["cmd"] and " run " in e["cmd"]]
+    speccer_run_spawns = [
+        e for e in spawned if "speccer" in e["cmd"] and " run " in e["cmd"]
+    ]
     assert len(speccer_run_spawns) >= 2, (
         f"Expected at least 2 speccer run spawns, got {len(speccer_run_spawns)}: {[e['cmd'] for e in speccer_run_spawns]}"
     )
 
     # Stage eventually reaches GENERATED or DONE (fully recovered from failure)
     final_status = result.runs[0].stages[0].status
-    assert final_status in (StageStatus.SPEC_COMPLETE, StageStatus.GENERATED, StageStatus.DONE), (
-        f"Expected SPEC_COMPLETE, GENERATED, or DONE, got {final_status}"
-    )
+    assert final_status in (
+        StageStatus.SPEC_COMPLETE,
+        StageStatus.GENERATED,
+        StageStatus.DONE,
+    ), f"Expected SPEC_COMPLETE, GENERATED, or DONE, got {final_status}"
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +259,9 @@ async def test_conductor_fails_after_max_retries(
 
     # At least 3 speccer RUN spawns occurred (3 failures)
     spawned = mock_tmux.get_spawned_commands()
-    speccer_run_spawns = [e for e in spawned if "speccer" in e["cmd"] and " run " in e["cmd"]]
+    speccer_run_spawns = [
+        e for e in spawned if "speccer" in e["cmd"] and " run " in e["cmd"]
+    ]
     assert len(speccer_run_spawns) >= 3, (
         f"Expected at least 3 speccer run spawns, got {len(speccer_run_spawns)}"
     )

@@ -69,7 +69,17 @@ def test_speccer_init_creates_progress(tmp_path):
 
     spec_dir = tmp_path / "spec"
     stdout, stderr, code = _run_main(
-        main, ["speccer", "init", "--feature", "test", "--mode", "backend", "--spec-dir", str(spec_dir)]
+        main,
+        [
+            "speccer",
+            "init",
+            "--feature",
+            "test",
+            "--mode",
+            "backend",
+            "--spec-dir",
+            str(spec_dir),
+        ],
     )
     assert code == 0
     assert (spec_dir / "PROGRESS.md").exists()

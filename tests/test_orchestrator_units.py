@@ -6,6 +6,7 @@ Covers:
 - speccer_exit_code_handler (exit 0, non-zero recoverable, non-zero unrecoverable, no exit file)
 - Post-run learnings parsing (<<<FILE: path>>>...<<<END>>> format)
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -30,13 +31,22 @@ from conductor.core.orchestrator import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_state_with_worktree(tmp_path: Path) -> tuple[ConductorState, Path]:
     """Create a state with a stage whose worktree is set to tmp_path."""
     wt = tmp_path / "worktree"
     wt.mkdir(exist_ok=True)
-    stage = StageState(name="stage-0", spec_mode="full", status=StageStatus.SPEC_RUNNING)
+    stage = StageState(
+        name="stage-0", spec_mode="full", status=StageStatus.SPEC_RUNNING
+    )
     stage.worktree = str(wt)
-    run = RunState(index=0, name="run-0", description="test", stages=[stage], status=RunStatus.ACTIVE)
+    run = RunState(
+        index=0,
+        name="run-0",
+        description="test",
+        stages=[stage],
+        status=RunStatus.ACTIVE,
+    )
     state = ConductorState(project_name="proj", base_branch="main", runs=[run])
     return state, wt
 
@@ -57,6 +67,7 @@ def _make_storage() -> MagicMock:
 # compute_progress_hash — hashes last 20 lines only
 # ---------------------------------------------------------------------------
 
+
 def test_compute_progress_hash_uses_last_20_lines(tmp_path):
     """Hash must be derived from the last 20 lines, NOT the whole file."""
     state, wt = _make_state_with_worktree(tmp_path)
@@ -71,6 +82,7 @@ def test_compute_progress_hash_uses_last_20_lines(tmp_path):
     activity_log.write_text("\n".join(first_20 + last_20), encoding="utf-8")
 
     import glob as _glob
+
     with patch("glob.glob", return_value=[str(activity_log)]):
         h = compute_progress_hash(state, 0, 0, _make_storage())
 
@@ -93,6 +105,7 @@ def test_compute_progress_hash_different_first_same_last_equal(tmp_path):
     log_b.write_text("\n".join(tail), encoding="utf-8")
 
     import glob as _glob
+
     with patch("glob.glob", return_value=[str(log_a)]):
         ha = compute_progress_hash(state, 0, 0, _make_storage())
     with patch("glob.glob", return_value=[str(log_b)]):
@@ -128,6 +141,7 @@ def test_compute_progress_hash_spec_running_uses_progress_md(tmp_path):
 # pre_reset_speccer_status
 # ---------------------------------------------------------------------------
 
+
 def test_pre_reset_exploring_becomes_init(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "EXPLORING")
@@ -158,8 +172,9 @@ def test_pre_reset_other_statuses_unchanged(tmp_path):
         pre_reset_speccer_status(state, 0, 0, _make_storage())
 
         pf = wt / "docs" / "run-0" / "spec" / "PROGRESS.md"
-        assert f"STATUS: {status}" in pf.read_text(encoding="utf-8"), \
+        assert f"STATUS: {status}" in pf.read_text(encoding="utf-8"), (
             f"Status {status} was unexpectedly mutated"
+        )
 
 
 def test_pre_reset_no_progress_file_is_noop(tmp_path):
@@ -172,6 +187,7 @@ def test_pre_reset_no_progress_file_is_noop(tmp_path):
 # ---------------------------------------------------------------------------
 # speccer_exit_code_handler
 # ---------------------------------------------------------------------------
+
 
 def test_exit_handler_exit_0_calls_sync(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
@@ -242,7 +258,9 @@ def test_exit_handler_no_exit_file_no_progress_sets_failed(tmp_path):
     """No exit file + no PROGRESS.md -> FAILED."""
     stage = StageState(name="stage-0", spec_mode="full")
     stage.worktree = str(tmp_path)
-    run = RunState(index=0, name="run-0", description="t", stages=[stage], status=RunStatus.ACTIVE)
+    run = RunState(
+        index=0, name="run-0", description="t", stages=[stage], status=RunStatus.ACTIVE
+    )
     state = ConductorState(project_name="proj", base_branch="main", runs=[run])
 
     fname = "run-0"
@@ -258,6 +276,7 @@ def test_exit_handler_no_exit_file_no_progress_sets_failed(tmp_path):
 # Post-run learnings parsing — <<<FILE: path>>>...<<<END>>> format
 # ---------------------------------------------------------------------------
 
+
 def _parse_learnings_blocks(response_text: str, project_dir: Path) -> dict[str, str]:
     """Replicate the regex logic from _review_learnings for testing."""
     updates: dict[str, str] = {}
@@ -268,7 +287,8 @@ def _parse_learnings_blocks(response_text: str, project_dir: Path) -> dict[str, 
             continue
         content_match = re.search(
             rf"<<<FILE:\s*{re.escape(file_path)}\s*>>>(.*?)<<<END>>>",
-            response_text, re.DOTALL
+            response_text,
+            re.DOTALL,
         )
         if content_match:
             addition = content_match.group(1).strip()
@@ -282,11 +302,7 @@ def test_learnings_parsing_single_file(tmp_path):
     claude_md.parent.mkdir(parents=True)
     claude_md.write_text("# Existing content\n", encoding="utf-8")
 
-    response = (
-        "<<<FILE: .claude/CLAUDE.md>>>\n"
-        "New learning content here\n"
-        "<<<END>>>\n"
-    )
+    response = "<<<FILE: .claude/CLAUDE.md>>>\nNew learning content here\n<<<END>>>\n"
 
     updates = _parse_learnings_blocks(response, tmp_path)
 
@@ -344,13 +360,7 @@ def test_learnings_parsing_multiline_content(tmp_path):
     f = tmp_path / "multi.md"
     f.write_text("existing\n")
 
-    response = (
-        "<<<FILE: multi.md>>>\n"
-        "Line 1\n"
-        "Line 2\n"
-        "Line 3\n"
-        "<<<END>>>\n"
-    )
+    response = "<<<FILE: multi.md>>>\nLine 1\nLine 2\nLine 3\n<<<END>>>\n"
 
     updates = _parse_learnings_blocks(response, tmp_path)
 

@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -295,6 +296,86 @@ def _log(event: str, message: str, log_path: Path | None, audit_path: Path | Non
 
 
 # ---------------------------------------------------------------------------
+# Zombie / stall detection
+# ---------------------------------------------------------------------------
+
+# Consecutive shallow-pstree polls before declaring zombie
+_ZOMBIE_SHALLOW_THRESHOLD = 3
+# Seconds with no new output before declaring stall (Claude stuck)
+_STALL_TIMEOUT_SECS = 1800  # 30 minutes
+
+
+async def _wait_for_exit(
+    exit_file: Path,
+    output_file: Path,
+    tmux: "TmuxManager",
+    window_name: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    """Poll for exit file with zombie and stall detection.
+
+    Detects two failure modes that leave the loop stuck forever:
+    1. Zombie — Claude exited but orphaned children hold the pipe open,
+       preventing stream_filter EOF and exit-file creation.
+    2. Stall — Claude is stuck (e.g. waiting on hung children) and has
+       produced no output for an extended period.
+    """
+    from conductor.core.tmux import check_pstree_depth
+
+    shallow_count = 0
+    last_activity = time.monotonic()
+    last_output_size = 0
+
+    while not exit_file.exists():
+        await asyncio.sleep(15)
+
+        # ---- window disappeared (crash, user killed it) ----
+        if not await tmux.is_window_alive(window_name):
+            _log("ZOMBIE_DETECTED",
+                 f"Window '{window_name}' gone, writing synthetic exit",
+                 log_path, audit_path)
+            exit_file.write_text("1")
+            return
+
+        # ---- track output progress ----
+        if output_file.exists():
+            try:
+                sz = output_file.stat().st_size
+                if sz > last_output_size:
+                    last_output_size = sz
+                    last_activity = time.monotonic()
+                    shallow_count = 0
+            except OSError:
+                pass
+
+        # ---- zombie: Claude exited, pipe stuck ----
+        pane_pid = await tmux.get_pane_pid(window_name)
+        if pane_pid is not None and not check_pstree_depth(pane_pid):
+            shallow_count += 1
+            if shallow_count >= _ZOMBIE_SHALLOW_THRESHOLD:
+                _log("ZOMBIE_DETECTED",
+                     f"Shallow process tree ({shallow_count} consecutive checks), "
+                     f"killing '{window_name}'",
+                     log_path, audit_path)
+                await tmux.kill_window(window_name)
+                exit_file.write_text("1")
+                return
+        elif pane_pid is not None:
+            shallow_count = 0
+
+        # ---- stall: no output for too long ----
+        stall_secs = time.monotonic() - last_activity
+        if stall_secs > _STALL_TIMEOUT_SECS:
+            _log("STALL_DETECTED",
+                 f"No output for {int(stall_secs)}s, killing '{window_name}'",
+                 log_path, audit_path)
+            await tmux.kill_window(window_name)
+            exit_file.write_text("1")
+            return
+
+
+# ---------------------------------------------------------------------------
 # Loop runner (tmux-based)
 # ---------------------------------------------------------------------------
 
@@ -381,20 +462,21 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
             f"< {prompt_file}"
         )
 
-        # Wrap to capture output and exit code
+        # Pipe through stream_filter: pretty-prints to terminal + saves raw json to file
+        filter_mod = "conductor.core.stream_filter"
         wrapped_cmd = (
-            f"cd {cwd} && {claude_cmd} > {output_file} 2>/dev/null; "
-            f"echo $? > {exit_file}"
+            f"cd {cwd} && {claude_cmd} 2>/dev/null "
+            f"| python3 -m {filter_mod} {output_file}; "
+            f"echo ${{PIPESTATUS[0]}} > {exit_file}"
         )
 
         log_file = storage.tmux_log(state.name, f"task-{task.index}_session-{state.session_count}")
         await tmux.spawn_in_window(window_name, wrapped_cmd, cwd=str(cwd), detached=True, log_file=log_file)
 
-        # Wait for completion by polling exit file
+        # Wait for completion (with zombie/stall detection)
         _log("CLAUDE_RUNNING", f"Claude running in window '{window_name}'", log_path, audit_path)
 
-        while not exit_file.exists():
-            await asyncio.sleep(15)
+        await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
 
         # Read results
         try:

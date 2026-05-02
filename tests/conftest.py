@@ -74,7 +74,11 @@ def tmp_state_dir(tmp_path: Path) -> Path:
 def clean_tmp_files():
     """Clean up conductor temp files before and after each test."""
     # Remove old conductor exit and activity files to avoid test pollution
-    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+    for pattern in [
+        "/tmp/conductor-exit-*",
+        "/tmp/ralph-activity-*",
+        "/tmp/conductor-speccer-exit-*",
+    ]:
         for f in glob.glob(pattern):
             try:
                 Path(f).unlink()
@@ -82,7 +86,11 @@ def clean_tmp_files():
                 pass
     yield
     # Also clean up after test
-    for pattern in ["/tmp/conductor-exit-*", "/tmp/ralph-activity-*", "/tmp/conductor-speccer-exit-*"]:
+    for pattern in [
+        "/tmp/conductor-exit-*",
+        "/tmp/ralph-activity-*",
+        "/tmp/conductor-speccer-exit-*",
+    ]:
         for f in glob.glob(pattern):
             try:
                 Path(f).unlink()
@@ -97,7 +105,9 @@ def patch_orchestrator_create_worktree(monkeypatch, tmp_path):
 
     _wt_counter = [0]
 
-    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+    def mock_create_worktree(
+        state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs
+    ):
         run = state.runs[run_idx]
         stage = run.stages[stage_idx]
         _wt_counter[0] += 1

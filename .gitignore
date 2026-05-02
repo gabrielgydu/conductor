@@ -5,3 +5,8 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+storage/
+docs/
+bugs/
+IMPLEMENTATION-PLAN.md
+PLAN-integration-validation.md

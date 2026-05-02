@@ -1,4 +1,5 @@
 """Integration test: full pipeline with orchestrator triggering integration merge."""
+
 from __future__ import annotations
 
 import sys

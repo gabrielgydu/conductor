@@ -29,6 +29,7 @@ from tests.integration.conftest import (  # noqa: F401
 def mock_conductor_post_run_e2e(monkeypatch):
     """Prevent conductor_post_run from hitting real Claude API in all e2e tests."""
     from unittest.mock import AsyncMock
+
     monkeypatch.setattr(
         "conductor.core.orchestrator.conductor_post_run",
         AsyncMock(return_value=None),
@@ -42,7 +43,9 @@ def patch_orchestrator_create_worktree_e2e(monkeypatch, tmp_path):
 
     _wt_counter = [0]
 
-    def mock_create_worktree(state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs):
+    def mock_create_worktree(
+        state, run_idx, stage_idx, storage_or_project_dir, *args, **kwargs
+    ):
         run = state.runs[run_idx]
         stage = run.stages[stage_idx]
         _wt_counter[0] += 1
