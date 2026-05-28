@@ -1127,6 +1127,161 @@ def _cmd_loop_status(args):
     print(f"\n  {green}{completed}{reset} done, {red}{failed}{reset} failed / {len(state.tasks)} total")
 
 
+def _cmd_manual_test(args):
+    """Start, resume, or initialize a manual-test run."""
+    import shlex
+
+    repo_path = Path(args.project_dir or ".").resolve()
+    storage = StorageResolver(repo_path)
+    conductor_dir = storage.conductor_dir(args.name)
+
+    from conductor.core.manual_test import (
+        format_manual_status,
+        initialize_manual_state,
+        load_manual_state,
+        manual_state_path,
+        run_manual_test_in_tmux,
+    )
+    from conductor.core.presets import detect_preset
+
+    state_path = manual_state_path(conductor_dir)
+    inside_tmux = getattr(args, "inside_tmux", False)
+
+    if state_path.exists() and not getattr(args, "reset", False):
+        state = load_manual_state(conductor_dir)
+        done = sum(1 for s in state.scenarios if s.status in {"passed", "failed", "blocked", "policy_violation"})
+        print(f"Resuming manual-test: {state.name} ({done}/{len(state.scenarios)} scenarios terminal)")
+    else:
+        if not args.plan:
+            print("Error: --plan is required for new manual-test runs.")
+            sys.exit(1)
+
+        plan_path = Path(args.plan)
+        if not plan_path.is_absolute():
+            plan_path = repo_path / plan_path
+        if not plan_path.exists():
+            print(f"Error: Plan file not found: {plan_path}")
+            sys.exit(1)
+
+        preset_name = getattr(args, "preset", None) or detect_preset(repo_path)
+        try:
+            state = initialize_manual_state(
+                name=args.name,
+                project_dir=repo_path,
+                plan_file=plan_path,
+                preset=preset_name,
+                model=getattr(args, "model", None),
+                max_turns=getattr(args, "max_turns", 200),
+                conductor_dir=conductor_dir,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
+        print(f"Initialized manual-test: {state.name}")
+        print(f"  Scenarios: {len(state.scenarios)}")
+        print(f"  Preset: {preset_name}")
+        print(f"  State: {state_path}")
+
+    if getattr(args, "init_only", False):
+        print()
+        print(format_manual_status(state))
+        return
+
+    if not inside_tmux:
+        from conductor.core.tmux import TmuxManager
+
+        session_name = f"conductor-manual-test-{state.name}"
+        tmux = TmuxManager(session_name=session_name)
+        if tmux.session_exists():
+            tmux._run_tmux("kill-session", "-t", session_name, check=False)
+
+        conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
+        reexec = [
+            conductor_bin,
+            "manual-test",
+            "--inside-tmux",
+            "--name",
+            args.name,
+            "--project-dir",
+            str(repo_path),
+        ]
+        if state.plan_file:
+            reexec.extend(["--plan", state.plan_file])
+        if state.preset:
+            reexec.extend(["--preset", state.preset])
+        if state.model:
+            reexec.extend(["--model", state.model])
+        reexec.extend(["--max-turns", str(state.max_turns)])
+
+        cmd = " ".join(shlex.quote(part) for part in reexec)
+        tmux._run_tmux(
+            "new-session", "-d", "-s", session_name, "-n", "manual-test",
+            f"bash -lc {shlex.quote(cmd)}",
+        )
+        tmux._run_tmux(
+            "set-option", "-t", f"{session_name}:manual-test",
+            "remain-on-exit", "on", check=False,
+        )
+        log_file = storage.tmux_log(state.name, "manual-test-main")
+        tmux._run_tmux(
+            "pipe-pane", "-t", f"{session_name}:manual-test",
+            f"cat >> {log_file}", check=False,
+        )
+
+        tmux_env = os.environ.get("TMUX", "")
+        if not tmux_env:
+            os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
+        else:
+            subprocess.run(["tmux", "switch-client", "-t", session_name], check=False)
+            sys.exit(0)
+    else:
+        run_manual_test_in_tmux(state, repo_path, storage)
+
+
+def _cmd_manual_test_status(args):
+    """Show manual-test status."""
+    repo_path = Path(args.project_dir or ".").resolve()
+    storage = StorageResolver(repo_path)
+    conductor_dir = storage.conductor_dir(args.name)
+
+    from conductor.core.manual_test import (
+        format_manual_status,
+        load_manual_state,
+        manual_state_path,
+    )
+
+    if not manual_state_path(conductor_dir).exists():
+        print("No manual-test found. Run 'conductor manual-test' first.")
+        sys.exit(0)
+
+    state = load_manual_state(conductor_dir)
+    print(format_manual_status(state))
+
+
+def _cmd_manual_test_report(args):
+    """Generate and print the manual-test report."""
+    repo_path = Path(args.project_dir or ".").resolve()
+    storage = StorageResolver(repo_path)
+    conductor_dir = storage.conductor_dir(args.name)
+
+    from conductor.core.manual_test import (
+        generate_manual_report,
+        load_manual_state,
+        manual_state_path,
+        write_manual_report,
+    )
+
+    if not manual_state_path(conductor_dir).exists():
+        print("No manual-test found. Run 'conductor manual-test' first.")
+        sys.exit(0)
+
+    state = load_manual_state(conductor_dir)
+    path = write_manual_report(state, conductor_dir)
+    print(f"Report written: {path}\n")
+    print(generate_manual_report(state), end="")
+
+
 def _cmd_validate(args):
     """Run validation checks against the project."""
     repo_path = Path(args.project_dir or ".").resolve()
@@ -1265,6 +1420,22 @@ def main():
     p_loop_status = subparsers.add_parser("loop-status", help="Show loop progress")
     _add_common(p_loop_status)
 
+    p_manual_test = subparsers.add_parser("manual-test", help="Run manual browser QA scenarios from a plan")
+    _add_common(p_manual_test)
+    p_manual_test.add_argument("--plan", required=False, help="Path to manual-test plan markdown file")
+    p_manual_test.add_argument("--preset", default=None, help="Preset name (auto-detected if omitted)")
+    p_manual_test.add_argument("--model", default=None, help="Claude model to use")
+    p_manual_test.add_argument("--max-turns", type=int, default=200, help="Max Claude turns per generation")
+    p_manual_test.add_argument("--init-only", action="store_true", help="Initialize state without launching Claude")
+    p_manual_test.add_argument("--reset", action="store_true", help="Reset and re-initialize manual-test state")
+    p_manual_test.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
+
+    p_manual_test_status = subparsers.add_parser("manual-test-status", help="Show manual-test progress")
+    _add_common(p_manual_test_status)
+
+    p_manual_test_report = subparsers.add_parser("manual-test-report", help="Generate manual-test report")
+    _add_common(p_manual_test_report)
+
     p_validate = subparsers.add_parser("validate", help="Run validation checks")
     _add_common(p_validate)
     p_validate.add_argument(
@@ -1289,6 +1460,9 @@ def main():
         "learnings": _cmd_learnings,
         "loop": _cmd_loop,
         "loop-status": _cmd_loop_status,
+        "manual-test": _cmd_manual_test,
+        "manual-test-status": _cmd_manual_test_status,
+        "manual-test-report": _cmd_manual_test_report,
         "validate": _cmd_validate,
     }
 
