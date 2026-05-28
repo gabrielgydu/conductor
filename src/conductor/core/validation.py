@@ -374,7 +374,7 @@ async def validate_and_fix(
         )
         await run_claude(
             prompt,
-            model="claude-opus-4-6[1m]",
+            model="claude-opus-4-8[1m]",
             max_turns=30,
             cwd=str(ctx.project_dir),
         )

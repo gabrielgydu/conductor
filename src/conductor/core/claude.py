@@ -466,8 +466,8 @@ async def run_claude_steerable(
 def resolve_model(name: str) -> str:
     """Resolve short model names to full Claude model IDs."""
     _MODEL_MAP = {
-        "opus": "claude-opus-4-6",
-        "opus-200k": "claude-opus-4-6",
+        "opus": "claude-opus-4-8[1m]",
+        "opus-200k": "claude-opus-4-8",
         "sonnet": "claude-sonnet-4-6",
         "haiku": "claude-haiku-4-5",
     }

@@ -652,7 +652,7 @@ async def _cmd_run_async(
 
     result = await run_claude(
         prompt,
-        model="claude-opus-4-6",
+        model="claude-opus-4-8",
         max_turns=200,
         cwd=str(spec_dir),
     )
@@ -774,7 +774,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
 
     result = await run_claude(
         prompt,
-        model="claude-opus-4-6",
+        model="claude-opus-4-8",
         max_turns=200,
         cwd=str(docs_dir),
     )

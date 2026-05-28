@@ -267,7 +267,7 @@ def _generate_and_review_plan(
     result = asyncio.run(
         run_claude(
             prompt,
-            model="claude-opus-4-6",
+            model="claude-opus-4-8",
             max_turns=10,
             cwd=str(repo_path),
             on_event=_plan_progress_callback,
@@ -302,7 +302,7 @@ def _generate_and_review_plan(
     result = asyncio.run(
         run_claude(
             prompt,
-            model="claude-opus-4-6",
+            model="claude-opus-4-8",
             max_turns=10,
             cwd=str(repo_path),
             on_event=_plan_progress_callback,

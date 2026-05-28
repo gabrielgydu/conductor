@@ -148,7 +148,7 @@ async def run_integration_testing(
     try:
         await run_claude(
             prompt,
-            model="claude-opus-4-6[1m]",
+            model="claude-opus-4-8[1m]",
             max_turns=50,
             cwd=str(worktree_path),
         )

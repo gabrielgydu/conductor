@@ -20,11 +20,11 @@ from conductor.core.claude import (
 
 
 def test_resolve_model_opus():
-    assert resolve_model("opus") == "claude-opus-4-6[1m]"
+    assert resolve_model("opus") == "claude-opus-4-8[1m]"
 
 
 def test_resolve_model_opus_200k():
-    assert resolve_model("opus-200k") == "claude-opus-4-6"
+    assert resolve_model("opus-200k") == "claude-opus-4-8"
 
 
 def test_resolve_model_sonnet():

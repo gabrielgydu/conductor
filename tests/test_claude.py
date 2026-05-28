@@ -77,11 +77,11 @@ async def test_run_claude_with_model():
     with patch(
         "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
     ) as mock_exec:
-        await run_claude("hello", model="claude-opus-4-6")
+        await run_claude("hello", model="claude-opus-4-8")
     call_args = mock_exec.call_args[0]
     assert "--model" in call_args
     idx = list(call_args).index("--model")
-    assert call_args[idx + 1] == "claude-opus-4-6"
+    assert call_args[idx + 1] == "claude-opus-4-8"
 
 
 @pytest.mark.asyncio

@@ -43,7 +43,7 @@ _PRICING_TABLE: list[tuple[str, ModelPricing]] = [
 _DEFAULT_PRICING = ModelPricing(3.00, 15.00, 0.30, 3.75)
 
 _MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-6",
+    "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }

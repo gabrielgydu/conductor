@@ -124,7 +124,7 @@ async def brain_answer_questions(
         f"This section is important for auditability — always include it.\n"
     )
 
-    result = await run_claude(prompt, model="claude-opus-4-6[1m]", max_turns=20)
+    result = await run_claude(prompt, model="claude-opus-4-8[1m]", max_turns=20)
 
     # Extract assistant content from stream-json output
     answer_text = ""

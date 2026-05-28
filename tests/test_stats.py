@@ -33,7 +33,7 @@ SAMPLE_STREAM_JSON = "\n".join(
 
 
 def test_resolve_model_opus():
-    assert resolve_model("opus") == "claude-opus-4-6"
+    assert resolve_model("opus") == "claude-opus-4-8"
 
 
 def test_resolve_model_sonnet():
@@ -45,7 +45,7 @@ def test_resolve_model_haiku():
 
 
 def test_resolve_model_passthrough():
-    assert resolve_model("claude-opus-4-6[1m]") == "claude-opus-4-6[1m]"
+    assert resolve_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ def test_resolve_model_passthrough():
 
 
 def test_get_pricing_opus():
-    pricing = get_pricing("claude-opus-4-6")
+    pricing = get_pricing("claude-opus-4-8")
     assert pricing.input_per_mtok == 15.00
     assert pricing.output_per_mtok == 75.00
     assert pricing.cache_read_per_mtok == 1.50
