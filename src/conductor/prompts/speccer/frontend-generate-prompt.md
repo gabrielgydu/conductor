@@ -9,12 +9,6 @@ The spec loop has produced detailed domain specs for this feature. Read them all
 - Project root: `{PROJECT_DIR}`
 - Spec directory: `{SPEC_DIR}`
 - Docs directory: `{DOCS_DIR}`
-- Conductor framework: `{CONDUCTOR_DIR}`
-
-**Read the framework documentation first:**
-- `{CONDUCTOR_DIR}/FRAMEWORK.md` — Complete framework docs (§2.2 Phase N Template, §3 Architecture)
-- `{CONDUCTOR_DIR}/run-feature.sh` — Thin runner template (sources lib/runner.sh)
-- `{CONDUCTOR_DIR}/presets/` — Available presets (base.sh, acme.sh)
 
 ### Feature Description
 
@@ -61,15 +55,15 @@ This is the **source of truth** for implementation detail — phase prompts refe
 
 Synthesize into Technical Design:
 
-1. **Architecture Overview** — Patterns, conventions observed in the APP codebase
+1. **Architecture Overview** — Patterns, conventions observed in the codebase
 2. **API Contracts Consumed** — Endpoints the frontend hits, request/response shapes, error codes (from backend context + domain specs)
    - §2.1, §2.2, etc. per API group
-3. **Livewire Component Architecture** — Component hierarchy, BaseComponent extensions, shared vs view-specific components
+3. **Component Architecture** — Component hierarchy, shared base component/hook usage, shared vs view-specific components
    - §3.1, §3.2, etc. per component group
-4. **Routes & Middleware** — Web routes, auth middleware, route groups, sidebar/settings menu entries (both BS3 and BS5 variants)
-5. **View Architecture** — Blade layouts, template hierarchy, partials, slots
-6. **JavaScript Architecture** — JS modules, Alpine.js usage, Echo/Pusher integration
-7. **Styling Architecture** — SCSS structure, Bootstrap usage patterns, responsive strategy
+4. **Routes & Middleware** — Web routes, auth middleware, route groups, navigation menu entries (every active navigation surface)
+5. **View Architecture** — Template layouts, template hierarchy, partials, slots
+6. **JavaScript Architecture** — JS modules, reactive framework usage, real-time/websocket integration
+7. **Styling Architecture** — Stylesheet structure, CSS framework usage patterns, responsive strategy
 8. **Key Design Decisions** — D1, D2, etc. with rationale. Gather from across all domain specs.
 {IF HAS_CONSTITUTION}
 9. **Constitution Compliance** — How the design satisfies each constitutional principle. Reference specific sections/decisions that ensure compliance.
@@ -83,8 +77,8 @@ Map domain specs to implementation phases:
 
    | Phase | Name | Priority | Focus | Key Deliverables | Domains |
    |-------|------|----------|-------|------------------|---------|
-   | 1 | Shared Components & Layout | P1 | Layout, shared components, route scaffolding | Layouts, BaseComponent, common partials | Foundation |
-   | 2+ | View Implementation | P1+ | One phase per view/page (or group of small related views) | Views, routes, Livewire components | Per domain |
+   | 1 | Shared Components & Layout | P1 | Layout, shared components, route scaffolding | Layouts, shared base component, common partials | Foundation |
+   | 2+ | View Implementation | P1+ | One phase per view/page (or group of small related views) | Views, routes, components | Per domain |
    | Final | Polish & Integration | P1 | Cross-view testing, real-time integration | Browser tests, E2E verification | Integration |
 
 2. **Phase Details** — For each phase:
@@ -100,7 +94,7 @@ Map domain specs to implementation phases:
      - Phase 1: Shared components, layouts, route scaffolding (always first)
      - Phase 2+: One phase per view/page or group of small related views
      - Final phase: Polish, cross-view testing, real-time integration
-   - Testing → distributed as TDD within each phase (Livewire::test(), Dusk)
+   - Testing → distributed as TDD within each phase (component/unit tests, end-to-end browser tests)
    - i18n → distributed into the phase that creates each component
    - Styling → included in each view's phase
 
@@ -108,7 +102,7 @@ Map domain specs to implementation phases:
 
 Create `{DOCS_DIR}/prompts/` with one prompt file per phase.
 
-Each prompt **MUST** follow the Conductor template from `{CONDUCTOR_DIR}/FRAMEWORK.md` §2.2:
+Each prompt **MUST** follow this template:
 
 ```
 # Phase {N} — {Phase Name}
@@ -163,9 +157,9 @@ Edge cases:
 ## Step N: ...
 
 ## Final Verification
-1. Run `npm run dev` — asset compilation must succeed
-2. Run `Livewire::test()` — ALL component tests must pass
-3. Run `php artisan dusk` — browser tests must pass
+1. Run the project's frontend build — asset compilation must succeed
+2. Run the project's component/unit test suite — ALL tests must pass
+3. Run the project's end-to-end browser tests — must pass
 4. Manual verification:
    - [ ] {Specific check from domain spec}
    - [ ] {Another specific check}
@@ -181,71 +175,49 @@ automatically after the quality gate passes.
 
 Classify each sub-task as trivial or complex before writing it:
 
-**Trivial work** (CRUD, column additions, getters, DI wiring, route declarations, component boilerplate, Blade template sections):
+**Trivial work** (CRUD, column additions, getters, DI wiring, route declarations, component boilerplate, template sections):
 - One line: "Implement per TECHNICAL-DESIGN.md §X.Y" + file list. NO code blocks, no interface skeletons, no step-by-step.
 
 **Complex work** (algorithms, orchestration, business rules with branching, non-obvious transformations, reactive data handling, state management):
-- Key algorithmic details inline. Code blocks ONLY for genuinely tricky parts (decision trees, state machines, concurrency, complex Livewire logic). Reference TECHNICAL-DESIGN.md for context, but include enough detail that the phase is self-contained.
+- Key algorithmic details inline. Code blocks ONLY for genuinely tricky parts (decision trees, state machines, concurrency, complex component logic). Reference TECHNICAL-DESIGN.md for context, but include enough detail that the phase is self-contained.
 
 **Always include regardless of complexity:**
 - TDD test case names from the Testing domain specs
 - Acceptance criteria from the relevant domain specs — each phase must include the Given/When/Then ACs from its domains, mapped to test cases
 - i18n keys from the i18n domain spec in relevant frontend phases
 - Edge cases: one-line list for trivial work, handling strategy for complex work
-- File paths for every sub-task (use APP conventions: app/Livewire/, resources/views/livewire/, tests/Feature/Livewire/, etc.)
+- File paths for every sub-task, following the project's existing directory conventions
 
 **Structure rules:**
 - Reference, don't duplicate — point to PRD.md §X and TECHNICAL-DESIGN.md §Y instead of copying content
 - Each phase must be self-contained and runnable autonomously
 - Final phase token should be `{FEATURE_NAME}_MODULE_COMPLETE` (uppercased feature name with hyphens as underscores)
-- Quality gates use `npm run dev`, `Livewire::test()`, Laravel Dusk
-- TDD patterns use Livewire test helpers
+- Quality gates use the project's frontend build, component/unit tests, and end-to-end browser tests (see CONSTITUTION.md or the repo's CI config for the exact commands)
+- TDD patterns use the project's component test helpers
 
 {IF SINGLE_PR}
 ### 5. Runner Script (Single Sequence)
 
-Create a **thin** `{DOCS_DIR}/run.sh` that sources the Conductor library. Do NOT copy the full runner — use the template format:
+Create `{DOCS_DIR}/run.sh` as a phase manifest. Conductor parses it to build the runner config — this file is not executed directly. Use this format:
 
 ```bash
 #!/bin/bash
-set -euo pipefail
+# Phase manifest for {FEATURE_NAME}.
+# Conductor parses the arrays below to build the runner config; this file is not executed directly.
 
 FEATURE_NAME="{FEATURE_NAME}"
-PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PROMPT_DIR="$PROJECT_DIR/docs/$FEATURE_NAME/prompts"
-LOG_DIR="$PROJECT_DIR/storage/logs/${FEATURE_NAME}-build"
-
-# Resolve Conductor directory
-CONDUCTOR_DIR="${CONDUCTOR_DIR:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
-if [[ ! -f "$CONDUCTOR_DIR/lib/runner.sh" ]]; then
-  if command -v conductor &>/dev/null; then
-    CONDUCTOR_DIR="$(conductor dir)"
-  elif command -v speccer &>/dev/null; then
-    CONDUCTOR_DIR="$(cd "$(dirname "$(readlink -f "$(which speccer)")")" && pwd)"
-  else
-    echo "Error: Cannot find Conductor. Set CONDUCTOR_DIR or add conductor to PATH."
-    exit 1
-  fi
-fi
-
-# Choose preset: source the preset specified during speccer init
-source "$CONDUCTOR_DIR/presets/{PRESET}.sh"
-
 CONDUCTOR_MODEL="{MODEL}"
 CONDUCTOR_FIX_MODEL="{MODEL}"
 
 declare -A PHASES PHASE_TOKENS PHASE_NAMES
-# Fill in phases matching your prompt files:
+# One entry per prompt file in {DOCS_DIR}/prompts/:
 PHASES[1]="phase-1-{name}.md";  PHASE_TOKENS[1]="PHASE_1_COMPLETE";  PHASE_NAMES[1]="{Phase 1 Name}"
 # ...add more phases...
-# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercoded)
-
-source "$CONDUCTOR_DIR/lib/runner.sh"
+# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercased, hyphens as underscores)
 ```
 
 Customize:
-- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays
-- The runner auto-executes when sourced — no additional code needed
+- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays, one entry per phase prompt file
 
 Add PR boundary comments in IMPLEMENTATION-PLAN.md:
 
@@ -270,7 +242,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 ├── IMPLEMENTATION-PLAN.md      # Shared
 ├── spec/                       # Domain specs (input, keep as-is)
 ├── pr-1/
-│   ├── run.sh                  # Thin runner (sources lib/runner.sh)
+│   ├── run.sh                  # Phase manifest
 │   ├── SCOPE.md                # What's in this PR, dependencies
 │   └── prompts/
 │       ├── phase-1-....md
@@ -283,7 +255,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 └── ...
 ```
 
-Each PR's `run.sh` is a thin script that sources `$CONDUCTOR_DIR/lib/runner.sh` with its own phases. See the single-sequence template above for the format. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
+Each PR's `run.sh` is a phase manifest listing its own phases, in the same format as the single-sequence template above. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
 
 Shared docs (PRD, Technical Design, Implementation Plan) stay at `{DOCS_DIR}/` level.
 {ENDIF SPLIT_PRS}
@@ -301,14 +273,14 @@ Before finishing, verify ALL of these:
 - [ ] Every test case name from domain specs appears in a phase prompt
 - [ ] Every i18n key from domain specs appears in the relevant phase prompt
 - [ ] Every edge case has handling instructions in some phase prompt (trivial: listed; complex: handling strategy)
-- [ ] run.sh is a thin template sourcing a preset + lib/runner.sh (NOT a full copy)
-- [ ] Phase prompts reference PRD/Tech Design sections instead of duplicating content — especially for trivial/boilerplate work (no code blocks for standard component scaffolding, route declarations, Blade partials)
+- [ ] run.sh declares PHASES, PHASE_TOKENS and PHASE_NAMES for every phase prompt
+- [ ] Phase prompts reference PRD/Tech Design sections instead of duplicating content — especially for trivial/boilerplate work (no code blocks for standard component scaffolding, route declarations, template partials)
 - [ ] Code blocks in phase prompts appear ONLY for complex/non-obvious logic
 - [ ] Final phase token uses `{FEATURE_NAME}_MODULE_COMPLETE` format (uppercased)
 - [ ] Phase prompts do NOT include git add/commit instructions (runner handles this)
 - [ ] Every Given/When/Then acceptance criterion appears as a test case or verification step
-- [ ] Quality gates use `npm run dev`, `Livewire::test()`, Laravel Dusk
-- [ ] File paths use APP conventions (app/Livewire/, resources/views/livewire/, tests/Feature/Livewire/, etc.)
+- [ ] Quality gates use the project's frontend build, component/unit tests, and end-to-end browser tests
+- [ ] File paths follow the project's existing directory conventions
 {IF HAS_CONSTITUTION}
 - [ ] TECHNICAL-DESIGN.md includes Constitution Compliance section
 - [ ] No constitutional principles are violated by the design
@@ -320,9 +292,6 @@ Before finishing, verify ALL of these:
 
 - DO NOT ask for confirmation or present options — generate everything
 - READ the domain specs thoroughly before writing anything
-- READ `{CONDUCTOR_DIR}/FRAMEWORK.md` to understand the Conductor prompt format
-- READ `{CONDUCTOR_DIR}/run-feature.sh` to understand the thin runner template
-- READ `{CONDUCTOR_DIR}/presets/` to understand available presets
 - WRITE all files directly — do not describe what you would write
 - If a domain spec is ambiguous, make a reasonable decision and note it in TECHNICAL-DESIGN.md under Key Design Decisions
-- START by reading framework docs, then domain specs, then generate artifacts in order: PRD → Tech Design → Impl Plan → Prompts → Runner
+- START by reading the domain specs, then generate artifacts in order: PRD → Tech Design → Impl Plan → Prompts → Runner

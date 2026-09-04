@@ -9,12 +9,6 @@ The spec loop has produced detailed domain specs for this feature. Read them all
 - Project root: `{PROJECT_DIR}`
 - Spec directory: `{SPEC_DIR}`
 - Docs directory: `{DOCS_DIR}`
-- Conductor framework: `{CONDUCTOR_DIR}`
-
-**Read the framework documentation first:**
-- `{CONDUCTOR_DIR}/FRAMEWORK.md` — Complete framework docs (§2.2 Phase N Template, §3 Architecture)
-- `{CONDUCTOR_DIR}/run-feature.sh` — Thin runner template (sources lib/runner.sh)
-- `{CONDUCTOR_DIR}/presets/` — Available presets (base.sh, acme.sh)
 
 ### Feature Description
 
@@ -144,7 +138,7 @@ Map domain specs to implementation phases:
 
 Create `{DOCS_DIR}/prompts/` with one prompt file per phase.
 
-Each prompt **MUST** follow the Conductor template from `{CONDUCTOR_DIR}/FRAMEWORK.md` §2.2:
+Each prompt **MUST** follow this template:
 
 ```
 # Phase {N} — {Phase Name}
@@ -199,8 +193,8 @@ Edge cases:
 ## Step N: ...
 
 ## Final Verification
-1. Run `php artisan test` — ALL tests must pass
-2. Run `./vendor/bin/phpstan analyse` — must show no errors
+1. Run the project's full test suite (see CONSTITUTION.md or the repo's CI config for the exact command) — ALL tests must pass
+2. Run the project's static analysis / type checker — must show no errors
 3. Manual verification:
    - [ ] {Specific check from domain spec}
    - [ ] {Another specific check}
@@ -236,48 +230,26 @@ Classify each sub-task as trivial or complex before writing it:
 {IF SINGLE_PR}
 ### 6. Runner Script (Single Sequence)
 
-Create a **thin** `{DOCS_DIR}/run.sh` that sources the Conductor library. Do NOT copy the full runner — use the template format:
+Create `{DOCS_DIR}/run.sh` as a phase manifest. Conductor parses it to build the runner config — this file is not executed directly. Use this format:
 
 ```bash
 #!/bin/bash
-set -euo pipefail
+# Phase manifest for {FEATURE_NAME}.
+# Conductor parses the arrays below to build the runner config; this file is not executed directly.
 
 FEATURE_NAME="{FEATURE_NAME}"
-PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PROMPT_DIR="$PROJECT_DIR/docs/$FEATURE_NAME/prompts"
-LOG_DIR="$PROJECT_DIR/storage/logs/${FEATURE_NAME}-build"
-
-# Resolve Conductor directory
-CONDUCTOR_DIR="${{CONDUCTOR_DIR:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}}"
-if [[ ! -f "$CONDUCTOR_DIR/lib/runner.sh" ]]; then
-  if command -v conductor &>/dev/null; then
-    CONDUCTOR_DIR="$(conductor dir)"
-  elif command -v speccer &>/dev/null; then
-    CONDUCTOR_DIR="$(cd "$(dirname "$(readlink -f "$(which speccer)")")" && pwd)"
-  else
-    echo "Error: Cannot find Conductor. Set CONDUCTOR_DIR or add conductor to PATH."
-    exit 1
-  fi
-fi
-
-# Choose preset: source the preset specified during speccer init
-source "$CONDUCTOR_DIR/presets/{PRESET}.sh"
-
 CONDUCTOR_MODEL="{MODEL}"
 CONDUCTOR_FIX_MODEL="{MODEL}"
 
 declare -A PHASES PHASE_TOKENS PHASE_NAMES
-# Fill in phases matching your prompt files:
+# One entry per prompt file in {DOCS_DIR}/prompts/:
 PHASES[1]="phase-1-{name}.md";  PHASE_TOKENS[1]="PHASE_1_COMPLETE";  PHASE_NAMES[1]="{Phase 1 Name}"
 # ...add more phases...
-# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercased)
-
-source "$CONDUCTOR_DIR/lib/runner.sh"
+# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercased, hyphens as underscores)
 ```
 
 Customize:
-- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays
-- The runner auto-executes when sourced — no additional code needed
+- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays, one entry per phase prompt file
 
 Add PR boundary comments in IMPLEMENTATION-PLAN.md:
 
@@ -303,7 +275,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 ├── IMPLEMENTATION-PLAN.md      # Shared
 ├── spec/                       # Domain specs (input, keep as-is)
 ├── pr-1/
-│   ├── run.sh                  # Thin runner (sources lib/runner.sh)
+│   ├── run.sh                  # Phase manifest
 │   ├── SCOPE.md                # What's in this PR, dependencies
 │   └── prompts/
 │       ├── phase-1-....md
@@ -316,7 +288,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 └── ...
 ```
 
-Each PR's `run.sh` is a thin script that sources `$CONDUCTOR_DIR/lib/runner.sh` with its own phases. See the single-sequence template above for the format. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
+Each PR's `run.sh` is a phase manifest listing its own phases, in the same format as the single-sequence template above. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
 
 Shared docs (PRD, Technical Design, API Contracts, Implementation Plan) stay at `{DOCS_DIR}/` level.
 {ENDIF SPLIT_PRS}
@@ -334,7 +306,7 @@ Before finishing, verify ALL of these:
 - [ ] Every phase prompt follows the Conductor template (status tracking, context, steps, TDD, verification, promise token)
 - [ ] Every test case name from domain specs appears in a phase prompt
 - [ ] Every edge case has handling instructions in some phase prompt (trivial: listed; complex: handling strategy)
-- [ ] run.sh is a thin template sourcing a preset + lib/runner.sh (NOT a full copy)
+- [ ] run.sh declares PHASES, PHASE_TOKENS and PHASE_NAMES for every phase prompt
 - [ ] Phase prompts reference PRD/Tech Design sections instead of duplicating content — especially for trivial/boilerplate work (no code blocks for standard CRUD, getters, column additions)
 - [ ] Code blocks in phase prompts appear ONLY for complex/non-obvious logic
 - [ ] Final phase token uses `{FEATURE_NAME}_MODULE_COMPLETE` format (uppercased)
@@ -351,9 +323,6 @@ Before finishing, verify ALL of these:
 
 - DO NOT ask for confirmation or present options — generate everything
 - READ the domain specs thoroughly before writing anything
-- READ `{CONDUCTOR_DIR}/FRAMEWORK.md` to understand the Conductor prompt format
-- READ `{CONDUCTOR_DIR}/run-feature.sh` to understand the thin runner template
-- READ `{CONDUCTOR_DIR}/presets/` to understand available presets
 - WRITE all files directly — do not describe what you would write
 - If a domain spec is ambiguous, make a reasonable decision and note it in TECHNICAL-DESIGN.md under Key Design Decisions
-- START by reading framework docs, then domain specs, then generate artifacts in order: PRD → Tech Design → API Contracts → Impl Plan → Prompts → Runner
+- START by reading the domain specs, then generate artifacts in order: PRD → Tech Design → API Contracts → Impl Plan → Prompts → Runner

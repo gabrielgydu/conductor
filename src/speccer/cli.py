@@ -496,7 +496,7 @@ Immutable principles that ALL specs and implementations must respect. The spec a
 ## Technology Constraints
 
 <!-- Hard constraints on technology choices. Examples: -->
-<!-- - Backend: PHP 8.2+ with Laravel 11 -->
+<!-- - Backend: <language/framework and version> -->
 <!-- - No new JavaScript dependencies over 50KB gzipped -->
 <!-- - Database: PostgreSQL only (no MySQL-specific features) -->
 
@@ -504,7 +504,7 @@ Immutable principles that ALL specs and implementations must respect. The spec a
 
 <!-- Minimum quality standards. Examples: -->
 <!-- - All new code must have >80% test coverage -->
-<!-- - PHPStan level 6 must pass with zero errors -->
+<!-- - Static analysis (e.g. PHPStan, mypy, tsc) must pass with zero errors -->
 <!-- - All API endpoints must have OpenAPI documentation -->
 """
         (spec_dir / "CONSTITUTION.md").write_text(constitution_content, encoding="utf-8")

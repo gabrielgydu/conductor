@@ -9,12 +9,6 @@ The spec loop has produced detailed test domain specs for this feature. Read the
 - Project root: `{PROJECT_DIR}`
 - Spec directory: `{SPEC_DIR}`
 - Docs directory: `{DOCS_DIR}`
-- Conductor framework: `{CONDUCTOR_DIR}`
-
-**Read the framework documentation first:**
-- `{CONDUCTOR_DIR}/FRAMEWORK.md` — Complete framework docs (§2.2 Phase N Template, §3 Architecture)
-- `{CONDUCTOR_DIR}/run-feature.sh` — Thin runner template (sources lib/runner.sh)
-- `{CONDUCTOR_DIR}/presets/` — Available presets (base.sh, acme.sh)
 
 ### Feature Description
 
@@ -48,11 +42,11 @@ Create the following files in `{DOCS_DIR}/`:
 
 Synthesize domain specs into a Test Plan:
 
-1. **Test Strategy Overview** — Goals, coverage targets, test type rationale (why both PHPUnit and Playwright)
+1. **Test Strategy Overview** — Goals, coverage targets, test type rationale (why both component/unit and end-to-end tests)
 2. **Scope** — What's tested, what's explicitly out of scope
-3. **Test Types** — PHPUnit/Livewire component tests (fast, isolated) and Playwright E2E browser tests (slow, integrated). What each type covers and why.
-4. **Coverage Goals** — AC coverage matrix summary. P1 ACs must have both PHPUnit and Playwright coverage. P2 ACs need at least one type.
-5. **Environment Requirements** — Docker setup, test data, CI integration, env vars
+3. **Test Types** — Component/unit tests (fast, isolated) and end-to-end browser tests (slow, integrated). What each type covers and why.
+4. **Coverage Goals** — AC coverage matrix summary. P1 ACs must have both component/unit and end-to-end coverage. P2 ACs need at least one type.
+5. **Environment Requirements** — Local test environment setup, test data, CI integration, env vars
 
 ### 2. TEST-ARCHITECTURE.md
 
@@ -60,25 +54,25 @@ This is the **source of truth** for test implementation detail — phase prompts
 
 Synthesize into Test Architecture:
 
-1. **Playwright Setup** — Config (`playwright.config.ts`), project structure, browser settings, serial execution, timeouts
+1. **End-to-End Setup** — Config, project structure, browser settings, serial execution, timeouts
    - §1.1 Config file
    - §1.2 Directory structure
    - §1.3 Browser and timeout settings
-2. **Helper Library** — auth.ts (`loginAsAirport`), livewire.ts (`waitForLivewireUpdate`, `setupConsoleMonitor`), feature-specific helpers
+2. **Helper Library** — auth helper, framework-specific wait-for-update/console-monitor helpers, feature-specific helpers
    - §2.1 Auth helpers
-   - §2.2 Livewire helpers
+   - §2.2 Framework-specific helpers
    - §2.3 Feature-specific helpers
-3. **PHPUnit Base Setup** — TestCase extensions, stubs (FakeUser, FakePartnerClient, FakeShopwareClient), traits
+3. **Unit Test Base Setup** — base test case extensions, stubs/fakes (auth, API clients), traits
    - §3.1 Base test class
    - §3.2 Test stubs
    - §3.3 Shared traits
-4. **Test Routes** — `routes/test.php` additions needed (login routes, data setup routes)
+4. **Test Routes** — test-only route additions needed (login routes, data setup routes)
    - §4.1 Existing test routes
    - §4.2 New test routes needed
-5. **Mock & Fake Patterns** — Http::fake(), mock response factories, Mockery patterns
-   - §5.1 PartnerClient mocks
-   - §5.2 ShopwareClient mocks
-   - §5.3 ACDBApi mocks
+5. **Mock & Fake Patterns** — HTTP mocking, mock response factories, test double patterns
+   - §5.1 Primary API client mocks
+   - §5.2 Secondary API client mocks
+   - §5.3 External service mocks
    - §5.4 Response factories
 6. **Test Data & Fixtures** — Seed data, factories, state reset patterns
    - §6.1 Database seeding
@@ -98,11 +92,11 @@ Map domain specs to implementation phases:
 
    | Phase | Name | Priority | Focus | Key Deliverables | Domains |
    |-------|------|----------|-------|------------------|---------|
-   | 1 | Test Infrastructure | P1 | Playwright config, helpers, PHPUnit stubs, test routes | Config, helpers, stubs | Test Infra |
-   | 2 | Livewire Tests — [View 1] | P1 | PHPUnit component tests (fast, isolated) | Test file, mocks | Per domain |
-   | 3 | Livewire Tests — [View 2] | P1+ | PHPUnit component tests | Test file, mocks | Per domain |
+   | 1 | Test Infrastructure | P1 | E2E config, helpers, unit test stubs, test routes | Config, helpers, stubs | Test Infra |
+   | 2 | Component Tests — [View 1] | P1 | Component/unit tests (fast, isolated) | Test file, mocks | Per domain |
+   | 3 | Component Tests — [View 2] | P1+ | Component/unit tests | Test file, mocks | Per domain |
    | ... | ... | ... | ... | ... | ... |
-   | N | Playwright E2E Tests | P1 | Browser tests for all views (slow, integrated) | Spec files, plan files | All views |
+   | N | End-to-End Tests | P1 | Browser tests for all views (slow, integrated) | Spec files, plan files | All views |
 
 2. **Phase Details** — For each phase:
    - Goal (1 sentence)
@@ -111,16 +105,16 @@ Map domain specs to implementation phases:
 
 3. **Phase Ordering Rules:**
    - **Phase 1 always:** Test infrastructure (config, helpers, stubs, routes)
-   - **PHPUnit phases next:** One phase per view's Livewire component tests (fast, isolated, no browser needed)
-   - **Playwright phases after:** E2E browser tests (depend on components working correctly)
+   - **Component/unit test phases next:** One phase per view's component tests (fast, isolated, no browser needed)
+   - **End-to-end phases after:** browser tests (depend on components working correctly)
    - Priority drives ordering within each group (P1 before P2)
-   - Testing → PHPUnit first because they're fast and catch component-level bugs early
+   - Testing → component/unit tests first because they're fast and catch component-level bugs early
 
 ### 4. Phase Prompts
 
 Create `{DOCS_DIR}/prompts/` with one prompt file per phase.
 
-Each prompt **MUST** follow the Conductor template from `{CONDUCTOR_DIR}/FRAMEWORK.md` §2.2:
+Each prompt **MUST** follow this template:
 
 ```
 # Phase {N} — {Phase Name}
@@ -133,7 +127,7 @@ Each prompt **MUST** follow the Conductor template from `{CONDUCTOR_DIR}/FRAMEWO
 ## Context
 Do NOT read files eagerly. Read only the specific file you need for the step you're currently working on. Never read TEST-PLAN.md or TEST-ARCHITECTURE.md in full — the relevant details are already included in each step below. When a step references "per TEST-ARCHITECTURE.md §X.Y", read only that section when you reach that step.
 
-IMPORTANT: Run all test commands (playwright, phpunit, phpstan) directly via Bash — do NOT use run_in_background or TaskOutput. Tests complete in under 2 minutes. Use timeout of 300000ms for Bash calls.
+IMPORTANT: Run all test commands (the project's test runner, linter, static analyzer, and E2E framework) directly via Bash — do NOT use run_in_background or TaskOutput. Tests complete in under 2 minutes. Use timeout of 300000ms for Bash calls.
 
 ## Step 1: Verify Previous Phase Completion
 **Mark as [IN_PROGRESS] before starting.**
@@ -158,7 +152,7 @@ Mock setup per TEST-ARCHITECTURE.md §X.Y.
 {For complex tests, include:}
 - Mock response chain
 - Step-by-step interaction sequence
-- Selector table for Playwright
+- Selector table for end-to-end tests
 - Timing/async strategy
 
 **Mark as [COMPLETED] when {specific criterion}.**
@@ -166,8 +160,8 @@ Mock setup per TEST-ARCHITECTURE.md §X.Y.
 ## Step N: ...
 
 ## Final Verification
-1. Run `php artisan test --filter={TestClass}` — 0 failures (PHPUnit phases)
-   OR `npx playwright test tests/{file}.spec.ts` — 0 failures (Playwright phases)
+1. Run the project's test command scoped to the specific test file/class — 0 failures (component/unit test phases)
+   OR the project's E2E test command scoped to the specific spec file — 0 failures (end-to-end phases)
 2. Verify coverage:
    - [ ] {AC from domain spec} → {test case that covers it}
    - [ ] {Another AC} → {test case}
@@ -205,65 +199,41 @@ Classify each test as trivial or complex before writing it:
 **Always include regardless of complexity:**
 - Test case names from the domain specs
 - Mock/stub requirements from the domain specs
-- Selectors table for Playwright tests (from domain spec §7)
-- Async timing strategy for tests involving Livewire updates or PARTNER polling
+- Selectors table for end-to-end tests (from domain spec §7)
+- Async timing strategy for tests involving reactive updates or polling
 - Coverage mapping: which ACs each test covers
 
 **Structure rules:**
 - Reference, don't duplicate — point to TEST-PLAN.md §X and TEST-ARCHITECTURE.md §Y instead of copying
 - Each phase must be self-contained and runnable autonomously
 - Final phase token should be `{FEATURE_NAME}_MODULE_COMPLETE` (uppercased feature name with hyphens as underscores)
-- PHPUnit quality gates: `php artisan test --filter={TestClass}` — 0 failures
-- Playwright quality gates: `npx playwright test tests/{file}.spec.ts` — 0 failures
-- Final phase (Playwright E2E) quality gate: full `php artisan test` + `npx playwright test`
+- Component/unit test quality gates: the project's test command scoped to the changed test file/class — 0 failures
+- End-to-end quality gates: the project's E2E test command scoped to the changed spec file — 0 failures
+- Final phase (end-to-end) quality gate: the project's full test suite + full E2E suite (see CONSTITUTION.md or the repo's CI config for exact commands)
 
 {IF SINGLE_PR}
 ### 5. Runner Script (Single Sequence)
 
-Create a **thin** `{DOCS_DIR}/run.sh` that sources the Conductor library. Do NOT copy the full runner — use the template format:
+Create `{DOCS_DIR}/run.sh` as a phase manifest. Conductor parses it to build the runner config — this file is not executed directly. Use this format:
 
 ```bash
 #!/bin/bash
-set -euo pipefail
+# Phase manifest for {FEATURE_NAME}.
+# Conductor parses the arrays below to build the runner config; this file is not executed directly.
 
 FEATURE_NAME="{FEATURE_NAME}"
-PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PROMPT_DIR="$PROJECT_DIR/docs/$FEATURE_NAME/prompts"
-LOG_DIR="$PROJECT_DIR/storage/logs/${FEATURE_NAME}-build"
-
-# Resolve Conductor directory
-CONDUCTOR_DIR="${CONDUCTOR_DIR:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
-if [[ ! -f "$CONDUCTOR_DIR/lib/runner.sh" ]]; then
-  if command -v conductor &>/dev/null; then
-    CONDUCTOR_DIR="$(conductor dir)"
-  elif command -v speccer &>/dev/null; then
-    CONDUCTOR_DIR="$(cd "$(dirname "$(readlink -f "$(which speccer)")")" && pwd)"
-  else
-    echo "Error: Cannot find Conductor. Set CONDUCTOR_DIR or add conductor to PATH."
-    exit 1
-  fi
-fi
-
-# Choose preset: source the preset specified during speccer init
-source "$CONDUCTOR_DIR/presets/{PRESET}.sh"
-
-TESTING_MODE=true
-
 CONDUCTOR_MODEL="{MODEL}"
 CONDUCTOR_FIX_MODEL="{MODEL}"
 
 declare -A PHASES PHASE_TOKENS PHASE_NAMES
-# Fill in phases matching your prompt files:
+# One entry per prompt file in {DOCS_DIR}/prompts/:
 PHASES[1]="phase-1-{name}.md";  PHASE_TOKENS[1]="PHASE_1_COMPLETE";  PHASE_NAMES[1]="{Phase 1 Name}"
 # ...add more phases...
-# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercased)
-
-source "$CONDUCTOR_DIR/lib/runner.sh"
+# Final phase token should use {FEATURE_NAME}_MODULE_COMPLETE (uppercased, hyphens as underscores)
 ```
 
 Customize:
-- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays
-- The runner auto-executes when sourced — no additional code needed
+- Fill in all PHASES, PHASE_TOKENS, and PHASE_NAMES arrays, one entry per phase prompt file
 
 Add PR boundary comments in IMPLEMENTATION-PLAN.md:
 
@@ -288,7 +258,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 ├── IMPLEMENTATION-PLAN.md      # Shared
 ├── spec/                       # Domain specs (input, keep as-is)
 ├── pr-1/
-│   ├── run.sh                  # Thin runner (sources lib/runner.sh)
+│   ├── run.sh                  # Phase manifest
 │   ├── SCOPE.md                # What's in this PR, dependencies
 │   └── prompts/
 │       ├── phase-1-....md
@@ -301,7 +271,7 @@ Create separate directories per PR under `{DOCS_DIR}/`:
 └── ...
 ```
 
-Each PR's `run.sh` is a thin script that sources `$CONDUCTOR_DIR/lib/runner.sh` with its own phases. See the single-sequence template above for the format. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
+Each PR's `run.sh` is a phase manifest listing its own phases, in the same format as the single-sequence template above. Each `SCOPE.md` describes what domains are included and any dependencies on previous PRs.
 
 Shared docs (TEST-PLAN, TEST-ARCHITECTURE, IMPLEMENTATION-PLAN) stay at `{DOCS_DIR}/` level.
 {ENDIF SPLIT_PRS}
@@ -313,22 +283,22 @@ Shared docs (TEST-PLAN, TEST-ARCHITECTURE, IMPLEMENTATION-PLAN) stay at `{DOCS_D
 Before finishing, verify ALL of these:
 
 - [ ] TEST-PLAN.md covers every test domain with strategy and scope
-- [ ] TEST-ARCHITECTURE.md has complete Playwright setup, helper library, PHPUnit stubs, mock patterns, test data strategy
+- [ ] TEST-ARCHITECTURE.md has complete end-to-end setup, helper library, unit test stubs, mock patterns, test data strategy
 - [ ] IMPLEMENTATION-PLAN.md maps every domain to a phase
-- [ ] Phase ordering: infrastructure → PHPUnit phases → Playwright E2E phase (final)
+- [ ] Phase ordering: infrastructure → component/unit test phases → end-to-end phase (final)
 - [ ] Every phase prompt follows the Conductor template (status tracking, context, steps, verification, promise token)
 - [ ] Every test case name from domain specs appears in a phase prompt
 - [ ] Every mock/stub definition from domain specs is referenced in a phase prompt
-- [ ] Every selector from domain spec §7 appears in the relevant Playwright phase prompt
-- [ ] run.sh is a thin template sourcing a preset + lib/runner.sh (NOT a full copy)
+- [ ] Every selector from domain spec §7 appears in the relevant end-to-end phase prompt
+- [ ] run.sh declares PHASES, PHASE_TOKENS and PHASE_NAMES for every phase prompt
 - [ ] Phase prompts reference TEST-PLAN/TEST-ARCHITECTURE sections instead of duplicating content
 - [ ] Code blocks in phase prompts appear ONLY for complex test scenarios
 - [ ] Final phase token uses `{FEATURE_NAME}_MODULE_COMPLETE` format (uppercased)
 - [ ] Phase prompts do NOT include git add/commit instructions (runner handles this)
-- [ ] Coverage matrix: every P1 AC has both PHPUnit and Playwright test cases
-- [ ] PHPUnit quality gates: `php artisan test --filter={TestClass}`
-- [ ] Playwright quality gates: `npx playwright test tests/{file}.spec.ts`
-- [ ] Final phase quality gate runs full `php artisan test` + `npx playwright test`
+- [ ] Coverage matrix: every P1 AC has both component/unit and end-to-end test cases
+- [ ] Component/unit test quality gates use the project's scoped test command
+- [ ] End-to-end quality gates use the project's scoped E2E test command
+- [ ] Final phase quality gate runs the project's full test suite plus the full E2E suite
 {IF HAS_CONSTITUTION}
 - [ ] TEST-ARCHITECTURE.md includes Constitution Compliance section
 - [ ] No constitutional principles are violated by the test design
@@ -340,9 +310,6 @@ Before finishing, verify ALL of these:
 
 - DO NOT ask for confirmation or present options — generate everything
 - READ the domain specs thoroughly before writing anything
-- READ `{CONDUCTOR_DIR}/FRAMEWORK.md` to understand the Conductor prompt format
-- READ `{CONDUCTOR_DIR}/run-feature.sh` to understand the thin runner template
-- READ `{CONDUCTOR_DIR}/presets/` to understand available presets
 - WRITE all files directly — do not describe what you would write
 - If a domain spec is ambiguous, make a reasonable decision and note it in TEST-ARCHITECTURE.md under Key Design Decisions
-- START by reading framework docs, then domain specs, then generate artifacts in order: TEST-PLAN → TEST-ARCHITECTURE → IMPLEMENTATION-PLAN → Prompts → Runner
+- START by reading the domain specs, then generate artifacts in order: TEST-PLAN → TEST-ARCHITECTURE → IMPLEMENTATION-PLAN → Prompts → Runner
