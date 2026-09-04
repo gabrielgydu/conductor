@@ -202,9 +202,9 @@ def _cmd_init(args):
             preset_name = preset_name or "base"
 
     try:
-        load_preset(preset_name)
-    except ValueError:
-        print(f"Error: Unknown preset: {preset_name!r}")
+        load_preset(preset_name, repo_path)
+    except ValueError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
 
     brief_path = storage.conductor_brief(args.name)
@@ -1005,7 +1005,7 @@ def _cmd_loop(args):
             if cli_wt_base:
                 wt_base = Path(cli_wt_base).resolve()
             elif preset_name:
-                _preset = _load_preset(preset_name)
+                _preset = _load_preset(preset_name, repo_path)
                 if _preset and _preset.config.worktrees_base:
                     wt_base = Path(_preset.config.worktrees_base)
             branch_name = f"loop-{args.name}"

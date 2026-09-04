@@ -393,7 +393,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
     log_path = storage.conductor_dir(state.name) / "LOOP-LOG.md"
     audit_path = storage.conductor_dir(state.name) / "LOOP-AUDIT.jsonl"
 
-    preset = load_preset(state.preset)
+    preset = load_preset(state.preset, project_dir)
     tmux = TmuxManager(session_name=f"conductor-loop-{state.name}")
     await tmux.ensure_session()
 

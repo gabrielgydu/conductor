@@ -42,7 +42,7 @@ class RunConfig:
     # Model selection
     model: Optional[str] = None
 
-    # Preset name (base / acme / nodeapp)
+    # Preset name (base, or a preset file name — see conductor.core.presets)
     preset: Optional[str] = None
 
     # Fixer enabled?

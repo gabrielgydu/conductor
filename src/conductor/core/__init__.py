@@ -41,10 +41,12 @@ from conductor.core.templates import load_template, render_template
 from conductor.core.presets import (
     Preset,
     BasePreset,
-    AcmePreset,
-    NodeappPreset,
+    ConfigPreset,
     load_preset,
+    detect_preset,
     PresetConfig,
+    ValidationSettings,
+    ManualTestPolicy,
     GateResult,
 )
 
@@ -67,6 +69,6 @@ __all__ = [
     # templates
     "load_template", "render_template",
     # presets
-    "Preset", "BasePreset", "AcmePreset", "NodeappPreset",
-    "load_preset", "PresetConfig", "GateResult",
+    "Preset", "BasePreset", "ConfigPreset",
+    "load_preset", "detect_preset", "PresetConfig", "ValidationSettings", "ManualTestPolicy", "GateResult",
 ]

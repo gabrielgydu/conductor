@@ -173,8 +173,8 @@ async def test_conductor_detects_runner_stall(
     mock_tmux.set_window_alive(window_name, True)
 
     # Activity log exists but never changes (stall condition)
-    # The orchestrator looks for /tmp/ralph-activity-{fname}*
-    activity_log = Path("/tmp/ralph-activity-test-run")
+    # The orchestrator looks for /tmp/conductor-activity-{fname}*
+    activity_log = Path("/tmp/conductor-activity-test-run")
     activity_log.write_text("stuck here\n")
 
     # Brain returns retry action when diagnosed
@@ -238,8 +238,8 @@ async def test_conductor_steers_stalled_runner(
     mock_tmux.set_window_alive(window_name, True)
 
     # Activity log never changes
-    # The orchestrator looks for /tmp/ralph-activity-{fname}*
-    activity_log = Path("/tmp/ralph-activity-test-run")
+    # The orchestrator looks for /tmp/conductor-activity-{fname}*
+    activity_log = Path("/tmp/conductor-activity-test-run")
     activity_log.write_text("working on task\n")
 
     steer_message = "Focus on the database migration"

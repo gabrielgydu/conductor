@@ -23,6 +23,7 @@ from conductor.core.manual_test import (
     save_manual_state,
     scan_policy_shortcuts,
 )
+from conductor.core.presets import CheckCommandRule, FatalPattern, ManualTestPolicy
 from conductor.core.storage import StorageResolver
 
 
@@ -30,9 +31,34 @@ PLAN_TABLE = """# Manual Plan
 
 | Area | Scenario | Primary Evidence |
 |---|---|---|
-| Admin rollout | Enable showNewDispatch via UI | Admin screenshot, config readback |
+| Admin rollout | Enable showNewCheckout via UI | Admin screenshot, config readback |
 | Mailer UI | Create SMTP mailer | UI screenshot, MailHog test email |
 """
+
+POLICY = ManualTestPolicy(
+    policy_text=(
+        "- CRITICAL: Feature flags showNewCheckout/useNewCheckout must ALWAYS be toggled through\n"
+        "  the admin UI. NEVER change them via SQL."
+    ),
+    coverage_focus="Cover the admin tenant settings pages.",
+    fatal_patterns=[
+        FatalPattern(
+            pattern=r"\b(showNewCheckout|useNewCheckout)\b",
+            reason="feature flags must be toggled through the admin UI",
+        )
+    ],
+    check_commands=[
+        CheckCommandRule(argv=["make", "phpstan-api"], path_prefix="api/", suffixes=[".php"]),
+        CheckCommandRule(argv=["make", "phpstan-app"], path_prefix="app/", suffixes=[".php"]),
+        CheckCommandRule(
+            argv=["make", "build-app"],
+            path_prefix="app/",
+            suffixes=[".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".vue"],
+        ),
+        CheckCommandRule(argv=["make", "e2e", "{path}"], suffixes=[".spec.ts", ".spec.js"]),
+    ],
+    blocked_reason_words=["data", "fixture", "customer", "cart"],
+)
 
 
 def _run_main(main_fn, args):
@@ -65,7 +91,7 @@ def test_parse_scenarios_from_table():
 
     assert [scenario.index for scenario in scenarios] == [0, 1]
     assert scenarios[0].area == "Admin rollout"
-    assert scenarios[0].name == "Enable showNewDispatch via UI"
+    assert scenarios[0].name == "Enable showNewCheckout via UI"
     assert "Admin screenshot" in scenarios[0].description
 
 
@@ -89,10 +115,10 @@ def test_initialize_manual_state_serializes_files(tmp_path):
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
 
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         preset="base",
@@ -113,9 +139,9 @@ def test_save_manual_state_can_preserve_scenario_markdown(tmp_path):
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -125,7 +151,7 @@ def test_save_manual_state_can_preserve_scenario_markdown(tmp_path):
 
 | # | Status | Priority | Area | Scenario | Evidence Target | Findings |
 |---|---|---|---|---|---|---|
-| 0 | pending | medium | Admin rollout | Enable showNewDispatch via UI | Admin screenshot | |
+| 0 | pending | medium | Admin rollout | Enable showNewCheckout via UI | Admin screenshot | |
 | 1 | pending | medium | Discovered | New route from coverage | Screenshot | |
 """
     scenarios_path.write_text(discovered, encoding="utf-8")
@@ -141,16 +167,18 @@ def test_prompt_builders_include_policy_and_required_tags(tmp_path):
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
     )
 
-    coverage_prompt = build_coverage_prompt(state, PLAN_TABLE, conductor_dir)
-    scenario_prompt = build_scenario_prompt(state, PLAN_TABLE, state.scenarios[0], conductor_dir)
+    coverage_prompt = build_coverage_prompt(state, PLAN_TABLE, conductor_dir, policy=POLICY)
+    scenario_prompt = build_scenario_prompt(state, PLAN_TABLE, state.scenarios[0], conductor_dir, policy=POLICY)
+    plain_coverage_prompt = build_coverage_prompt(state, PLAN_TABLE, conductor_dir)
+    plain_scenario_prompt = build_scenario_prompt(state, PLAN_TABLE, state.scenarios[0], conductor_dir)
     handoff = conductor_dir / "generations" / "generation-001-handoff.md"
     handoff.write_text("Read this before retrying", encoding="utf-8")
     state.scenarios[0].handoff_notes = f"See {handoff}"
@@ -162,7 +190,12 @@ def test_prompt_builders_include_policy_and_required_tags(tmp_path):
     assert "Data Setup Policy" in scenario_prompt
     assert "<manual-pass/>" in scenario_prompt
     assert "<manual-finding/>" in scenario_prompt
-    assert "showNewDispatch/useNewDispatch" in scenario_prompt
+    assert "showNewCheckout/useNewCheckout" in scenario_prompt
+    assert "Project Focus" in coverage_prompt
+    assert POLICY.coverage_focus in coverage_prompt
+    assert "NEVER change them via SQL" not in plain_scenario_prompt
+    assert "Data Setup Policy" in plain_scenario_prompt
+    assert "Project Focus" not in plain_coverage_prompt
     assert "Previous Handoff" in handoff_prompt
     assert "Read this before retrying" in handoff_prompt
 
@@ -194,9 +227,9 @@ def test_parse_manual_finding_and_blocked_validation():
   <severity>ux</severity>
   <category>ux</category>
   <title>Sidebar link is hidden during visibility rollout</title>
-  <reproduction><step>Enable showNewDispatch only</step><step>Open APP sidebar</step></reproduction>
-  <expected>Dispatch settings link remains discoverable</expected>
-  <actual>No dispatch entry appears</actual>
+  <reproduction><step>Enable showNewCheckout only</step><step>Open app sidebar</step></reproduction>
+  <expected>Checkout settings link remains discoverable</expected>
+  <actual>No checkout entry appears</actual>
   <evidence><screenshot>artifacts/screenshots/sidebar.png</screenshot></evidence>
 </manual-result>
 <manual-finding/>"""
@@ -205,7 +238,7 @@ def test_parse_manual_finding_and_blocked_validation():
         """<manual-result status="blocked">
   <reason>No data</reason>
   <code_read>app/routes.php</code_read>
-  <data_attempts>Created basket fixture</data_attempts>
+  <data_attempts>Created cart fixture</data_attempts>
   <why_not_fixable_now>Environment unavailable</why_not_fixable_now>
 </manual-result>
 <manual-blocked/>"""
@@ -213,7 +246,7 @@ def test_parse_manual_finding_and_blocked_validation():
 
     assert finding.valid is True
     assert finding.severity == "ux"
-    assert finding.reproduction == ["Enable showNewDispatch only", "Open APP sidebar"]
+    assert finding.reproduction == ["Enable showNewCheckout only", "Open app sidebar"]
     assert blocked.valid is False
     assert "missing data" in "; ".join(blocked.errors).lower()
 
@@ -223,14 +256,14 @@ def test_blocked_requires_evidence_and_rejects_missing_data_variants():
         """<manual-result status="blocked">
   <reason>Environment unavailable</reason>
   <code_read>app/routes.php</code_read>
-  <data_attempts>Created basket fixture</data_attempts>
+  <data_attempts>Created cart fixture</data_attempts>
   <why_not_fixable_now>Docker is down</why_not_fixable_now>
 </manual-result>
 <manual-blocked/>"""
     )
     missing_fixture = parse_manual_signal(
         """<manual-result status="blocked">
-  <reason>Missing fixture data for baskets</reason>
+  <reason>Missing fixture data for carts</reason>
   <code_read>app/routes.php</code_read>
   <data_attempts>Checked seed data</data_attempts>
   <why_not_fixable_now>Could not create it</why_not_fixable_now>
@@ -310,7 +343,7 @@ def test_policy_scanner_rejects_incomplete_and_forbidden_shortcuts():
                     {
                         "type": "tool_use",
                         "name": "bash",
-                        "input": {"command": "mysql -e 'update airports set useNewDispatch=1'"},
+                        "input": {"command": "mysql -e 'update tenants set useNewCheckout=1'"},
                     }
                 ]
             },
@@ -325,7 +358,7 @@ def test_policy_scanner_rejects_incomplete_and_forbidden_shortcuts():
                         "type": "text",
                         "text": """<manual-result status="pass">
   <evidence><db_readback>flag updated</db_readback></evidence>
-  <shortcut><reason>Fast setup</reason><command_or_route>mysql -e 'update airports set useNewDispatch=1'</command_or_route><user_flow_supported>Admin rollout</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
+  <shortcut><reason>Fast setup</reason><command_or_route>mysql -e 'update tenants set useNewCheckout=1'</command_or_route><user_flow_supported>Admin rollout</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
 </manual-result><manual-pass/>""",
                     }
                 ]
@@ -363,8 +396,14 @@ def test_policy_scanner_rejects_incomplete_and_forbidden_shortcuts():
         }
     )
 
-    rollout_flags = scan_policy_shortcuts(f"{rollout_tool}\n{rollout_result}")
-    rollout = parse_manual_signal(f"{rollout_tool}\n{rollout_result}", policy_flags=rollout_flags)
+    rollout_flags = scan_policy_shortcuts(f"{rollout_tool}\n{rollout_result}", POLICY)
+    rollout = parse_manual_signal(
+        f"{rollout_tool}\n{rollout_result}", policy_flags=rollout_flags, policy=POLICY
+    )
+    unpoliced_flags = scan_policy_shortcuts(f"{rollout_tool}\n{rollout_result}")
+    unpoliced = parse_manual_signal(
+        f"{rollout_tool}\n{rollout_result}", policy_flags=unpoliced_flags
+    )
     incomplete_flags = scan_policy_shortcuts(f"{incomplete_tool}\n{incomplete_result}")
     incomplete = parse_manual_signal(
         f"{incomplete_tool}\n{incomplete_result}",
@@ -372,7 +411,9 @@ def test_policy_scanner_rejects_incomplete_and_forbidden_shortcuts():
     )
 
     assert rollout.valid is False
-    assert "admin airport edit UI" in "; ".join(rollout.errors)
+    assert "toggled through the admin UI" in "; ".join(rollout.errors)
+    # Without a preset policy the same shortcut is merely a non-fatal, declared shortcut.
+    assert unpoliced.valid is True
     assert incomplete.valid is False
     assert "DataShortcut" in "; ".join(incomplete.errors)
 
@@ -386,7 +427,7 @@ def test_policy_scanner_flags_test_routes_without_shortcut():
                     {
                         "type": "tool_use",
                         "name": "playwright",
-                        "input": {"url": "https://app.example/_test/dispatch-process"},
+                        "input": {"url": "https://app.example/_test/checkout-process"},
                     }
                 ]
             },
@@ -399,7 +440,7 @@ def test_policy_scanner_flags_test_routes_without_shortcut():
                 "content": [
                     {
                         "type": "text",
-                        "text": "<manual-result status=\"pass\"><evidence><url>https://app.example/_test/dispatch-process</url></evidence></manual-result><manual-pass/>",
+                        "text": "<manual-result status=\"pass\"><evidence><url>https://app.example/_test/checkout-process</url></evidence></manual-result><manual-pass/>",
                     }
                 ]
             },
@@ -419,9 +460,9 @@ def test_status_and_report_output(tmp_path):
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -438,51 +479,55 @@ def test_status_and_report_output(tmp_path):
             category="app_bug",
             title="Send button fails",
             status="verified",
-            verification=["./scripts/worktree-env.sh phpstan app: exit 0"],
+            verification=["make phpstan-app: exit 0"],
         )
     )
 
     status = format_manual_status(state)
     report = generate_manual_report(state)
 
-    assert "Manual Test: dispatch-manual" in status
+    assert "Manual Test: checkout-manual" in status
     assert "Scenarios:" in status
     assert "# Manual Test Report" in report
     assert "Scenario Matrix" in report
     assert "Findings By Status" in report
     assert "verified: 1" in report
     assert "Checks Run" in report
-    assert "phpstan app" in report
+    assert "phpstan-app" in report
     assert "Scenario Evidence" in report
     assert "artifacts/screenshots/admin.png" in report
 
 
 def test_detect_relevant_check_commands():
-    commands = detect_relevant_check_commands(
-        [
-            "partner/src/DispatchService.php",
-            "app/src/DispatchController.php",
-            "app/assets/dispatch.ts",
-            "app/tests/Playwright/dispatch.spec.ts",
-        ]
-    )
+    changed = [
+        "api/src/CheckoutService.php",
+        "app/src/CheckoutController.php",
+        "app/assets/checkout.ts",
+        "app/tests/Playwright/checkout.spec.ts",
+    ]
+    commands = detect_relevant_check_commands(changed, POLICY)
 
-    assert ["./scripts/worktree-env.sh", "phpstan", "partner"] in commands
-    assert ["./scripts/worktree-env.sh", "phpstan", "app"] in commands
-    assert ["./scripts/worktree-env.sh", "npm", "app", "run", "prod"] in commands
-    assert ["./scripts/worktree-env.sh", "playwright", "app/tests/Playwright/dispatch.spec.ts"] in commands
+    assert commands == [
+        ["make", "phpstan-api"],
+        ["make", "phpstan-app"],
+        ["make", "build-app"],
+        ["make", "e2e", "app/tests/Playwright/checkout.spec.ts"],
+    ]
+    # Without preset rules nothing is detected.
+    assert detect_relevant_check_commands(changed) == []
+    assert detect_relevant_check_commands(changed, ManualTestPolicy()) == []
 
 
 def test_git_changed_files_includes_staged_files(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    path = repo / "app" / "src" / "DispatchController.php"
+    path = repo / "app" / "src" / "CheckoutController.php"
     path.parent.mkdir(parents=True)
     path.write_text("<?php\n", encoding="utf-8")
     subprocess.run(["git", "add", "--", str(path.relative_to(repo))], cwd=repo, check=True)
 
-    assert "app/src/DispatchController.php" in manual_test._git_changed_files(repo)
+    assert "app/src/CheckoutController.php" in manual_test._git_changed_files(repo)
 
 
 @pytest.mark.asyncio
@@ -491,9 +536,9 @@ async def test_fix_and_verify_finding_marks_verified(tmp_path, monkeypatch):
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -504,7 +549,7 @@ async def test_fix_and_verify_finding_marks_verified(tmp_path, monkeypatch):
         severity="medium",
         category="app_bug",
         title="Send button fails",
-        reproduction=["Open dispatch preview", "Click send"],
+        reproduction=["Open checkout preview", "Click send"],
         expected="Email sends",
         actual="Send fails",
         evidence=ManualEvidence(screenshots=["artifacts/screenshots/fail.png"]),
@@ -539,11 +584,15 @@ async def test_fix_and_verify_finding_marks_verified(tmp_path, monkeypatch):
         changed_calls.append(True)
         if len(changed_calls) == 1:
             return []
-        return ["app/src/DispatchController.php"]
+        return ["app/src/CheckoutController.php"]
 
     monkeypatch.setattr(manual_test, "_run_generation", fake_run_generation)
     monkeypatch.setattr(manual_test, "_git_changed_files", fake_git_changed_files)
-    monkeypatch.setattr(manual_test, "_run_relevant_checks", lambda _cwd, _files: (True, ["phpstan app: exit 0"]))
+    monkeypatch.setattr(
+        manual_test,
+        "_run_relevant_checks",
+        lambda _cwd, _files, policy=None: (True, ["phpstan-app: exit 0"]),
+    )
     monkeypatch.setattr(manual_test, "_commit_verified_finding", lambda _cwd, _finding, _files: "abc123")
 
     await manual_test._fix_and_verify_finding(
@@ -562,7 +611,7 @@ async def test_fix_and_verify_finding_marks_verified(tmp_path, monkeypatch):
     assert finding.status == "verified"
     assert finding.fix_commits == ["abc123"]
     assert state.scenarios[0].status == "passed"
-    assert "phpstan app: exit 0" in finding.verification
+    assert "phpstan-app: exit 0" in finding.verification
 
 
 @pytest.mark.asyncio
@@ -571,9 +620,9 @@ async def test_fix_and_verify_skips_when_worktree_is_dirty(tmp_path, monkeypatch
     repo.mkdir()
     plan = tmp_path / "plan.md"
     plan.write_text(PLAN_TABLE, encoding="utf-8")
-    conductor_dir = tmp_path / "conductor" / "dispatch-manual"
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="dispatch-manual",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -584,7 +633,7 @@ async def test_fix_and_verify_skips_when_worktree_is_dirty(tmp_path, monkeypatch
         severity="medium",
         category="app_bug",
         title="Send button fails",
-        reproduction=["Open dispatch preview", "Click send"],
+        reproduction=["Open checkout preview", "Click send"],
         expected="Email sends",
         actual="Send fails",
         evidence=ManualEvidence(screenshots=["artifacts/screenshots/fail.png"]),
@@ -631,7 +680,7 @@ def test_manual_test_cli_init_status_report(tmp_path):
                 "conductor",
                 "manual-test",
                 "--name",
-                "dispatch-manual",
+                "checkout-manual",
                 "--project-dir",
                 str(repo),
                 "--plan",
@@ -645,7 +694,7 @@ def test_manual_test_cli_init_status_report(tmp_path):
                 "conductor",
                 "manual-test-status",
                 "--name",
-                "dispatch-manual",
+                "checkout-manual",
                 "--project-dir",
                 str(repo),
             ],
@@ -656,18 +705,18 @@ def test_manual_test_cli_init_status_report(tmp_path):
                 "conductor",
                 "manual-test-report",
                 "--name",
-                "dispatch-manual",
+                "checkout-manual",
                 "--project-dir",
                 str(repo),
             ],
         )
 
-    state_path = tmp_path / "storage" / "conductor" / "dispatch-manual" / "MANUAL-TEST-STATE.json"
+    state_path = tmp_path / "storage" / "conductor" / "checkout-manual" / "MANUAL-TEST-STATE.json"
     assert code == 0
     assert "Initialized manual-test" in stdout
     assert state_path.exists()
     assert status_code == 0
-    assert "Manual Test: dispatch-manual" in status_stdout
+    assert "Manual Test: checkout-manual" in status_stdout
     assert report_code == 0
     assert "Report written:" in report_stdout
     assert "# Manual Test Report" in report_stdout

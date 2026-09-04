@@ -194,23 +194,35 @@ The project key is derived from the repo root path: `/home/user/dev/repo` → `-
 
 ## Presets
 
-Presets customize quality gates, preflight checks, and teardown per project type.
+Presets customize quality gates, preflight checks, teardown, post-run validation, and manual-test policy per project. They are TOML files that live outside this repository, so project-specific tooling never has to be committed here.
 
-| Preset | Quality Gate | Teardown | Push/Fixer |
-|--------|-------------|----------|------------|
-| `base` | No-op (always passes) | No-op | Disabled |
-| `acme` | PHPStan via pre-commit hook | `docker compose down` | Enabled |
-| `nodeapp` | tsc + eslint + pnpm test per package | No-op | Enabled |
+| Location | Purpose |
+|----------|---------|
+| `<project>/.conductor/preset.toml` | Project-local preset, auto-detected when present |
+| `~/.conductor/presets/<name>.toml` | User-level presets, selected with `--preset <name>` or auto-detected via `[detect] paths` |
+| `--preset /path/to/file.toml` | Explicit preset file |
 
-Custom presets: subclass `Preset` in `src/conductor/core/presets.py`.
+`CONDUCTOR_PRESETS_DIR` overrides the user-level directory. Without any preset file the built-in `base` preset is used: no-op quality gate, no teardown, generated smoke tests.
 
-```python
-class MyPreset(BasePreset):
-    def quality_gate(self, cwd: Path) -> GateResult:
-        result = subprocess.run(["make", "check"], cwd=cwd, capture_output=True)
-        if result.returncode != 0:
-            return GateResult(passed=False, failures=[result.stderr])
-        return GateResult(passed=True)
+See [`examples/preset.example.toml`](examples/preset.example.toml) for the full schema. A minimal preset:
+
+```toml
+name = "myproject"
+
+[detect]
+paths = ["backend", "frontend"]
+
+[config]
+fixer_enabled = true
+local_ci_enabled = true
+local_ci_command = "make ci"
+
+[[quality_gate.checks]]
+name = "lint"
+command = "make lint"
+
+[teardown]
+stage = ["docker compose down"]
 ```
 
 ## State Models

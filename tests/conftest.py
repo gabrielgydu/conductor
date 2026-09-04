@@ -76,7 +76,7 @@ def clean_tmp_files():
     # Remove old conductor exit and activity files to avoid test pollution
     for pattern in [
         "/tmp/conductor-exit-*",
-        "/tmp/ralph-activity-*",
+        "/tmp/conductor-activity-*",
         "/tmp/conductor-speccer-exit-*",
     ]:
         for f in glob.glob(pattern):
@@ -88,7 +88,7 @@ def clean_tmp_files():
     # Also clean up after test
     for pattern in [
         "/tmp/conductor-exit-*",
-        "/tmp/ralph-activity-*",
+        "/tmp/conductor-activity-*",
         "/tmp/conductor-speccer-exit-*",
     ]:
         for f in glob.glob(pattern):

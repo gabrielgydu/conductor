@@ -1,0 +1,106 @@
+# Conductor preset — every section is optional.
+#
+# Where presets live:
+#   <project>/.conductor/preset.toml      project-local, auto-detected when present
+#   ~/.conductor/presets/<name>.toml      user-level, selected with --preset <name>
+#                                         or auto-detected through [detect] paths
+#   --preset /path/to/file.toml           explicit file
+#   CONDUCTOR_PRESETS_DIR                 overrides the user-level directory
+#
+# Commands may be written as a shell string ("make ci") or an argv list
+# (["make", "ci"]). Strings are split with shlex; nothing runs through a shell.
+
+name = "example"
+
+[detect]
+# Auto-select this preset when ALL of these paths exist under the project dir.
+paths = ["backend", "frontend"]
+
+[config]
+# Any field of conductor.core.presets.PresetConfig.
+fixer_enabled = true              # run the PR-review fixer after pushes
+sync_enabled = true               # sync feature branches with the base branch
+sync_base_branch = "main"
+# Regenerate fixtures when files matching a glob change during sync: [glob, command]
+sync_dump_regen = [["fixtures/*.sql", "make fixtures-regen"]]
+local_ci_enabled = true
+local_ci_command = "make ci"
+local_ci_full_command = "make ci-full"
+local_review_enabled = true
+local_review_command = "./scripts/local-review.sh"
+local_review_full_command = "./scripts/local-review.sh --full"
+fix_model = "sonnet"              # model used by fix/retry loops
+# phase_models = { 1 = "sonnet" } # per-phase model overrides
+# worktrees_base = "~/worktrees"  # where feature worktrees are created
+
+[preflight]
+# Each command must exit 0 before a runner starts (claude on PATH is always checked).
+commands = ["docker info"]
+timeout = 30
+
+# Quality-gate checks run between phases. A check fails on non-zero exit, on a
+# timeout, or when `fail_pattern` matches its output. `requires` skips the
+# check when the path does not exist.
+[[quality_gate.checks]]
+name = "lint"
+command = "make lint"
+timeout = 300
+
+[[quality_gate.checks]]
+name = "typecheck"
+command = "npx tsc --noEmit"
+cwd = "frontend"
+requires = "frontend/tsconfig.json"
+
+[prompt]
+# Extra instructions appended to every runner prompt. "{cwd}" is the worktree path.
+extra = """
+- Run the full test suite with: make test
+- Never edit files under vendor/
+"""
+
+[teardown]
+stage = ["make down"]             # after each stage (runner exit)
+run = ["make down --volumes"]     # after a whole run completes
+timeout = 60
+
+[validation]
+# Post-run validation (conductor.core.validation). Built-in tool checks
+# (frontend build, phpstan, phpunit) are wrapped with exec_wrapper when set,
+# e.g. to run inside a container: exec_wrapper + ["vendor/bin/phpunit"].
+exec_wrapper = ["./scripts/env.sh", "exec"]
+# When smoke_command is set it replaces the generated Playwright smoke test.
+smoke_up_command = "./scripts/env.sh up"
+smoke_command = "./scripts/env.sh ci"
+smoke_timeout = 1800
+
+[[validation.checks]]
+name = "api-tests"
+command = "make test-api"
+requires = "backend/Makefile"
+
+[manual_test]
+# Rules for `conductor manual-test`.
+policy_text = """
+- Feature flags must be toggled through the admin UI, never via SQL.
+"""
+coverage_focus = """
+Include the admin settings pages and every notification template flow.
+"""
+# Words that make a "blocked" reason count as "only missing data" (rejected).
+blocked_reason_words = ["data", "fixture", "record", "account"]
+
+# Tool inputs matching a fatal pattern fail validation with no override.
+[[manual_test.fatal_patterns]]
+pattern = "\\b(showNewFlow|useNewFlow)\\b"
+reason = "feature flags must be toggled through the admin UI"
+
+# Focused verification commands for files the fixer changed. "{path}" is the file.
+[[manual_test.check_commands]]
+path_prefix = "backend/"
+suffixes = [".php"]
+command = "make phpstan-backend"
+
+[[manual_test.check_commands]]
+suffixes = [".spec.ts", ".spec.js"]
+command = "make e2e {path}"

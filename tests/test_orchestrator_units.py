@@ -76,7 +76,7 @@ def test_compute_progress_hash_uses_last_20_lines(tmp_path):
 
     # Create activity log with 40 distinct lines
     fname = "run-0"
-    activity_log = tmp_path / f"ralph-activity-{fname}-001.log"
+    activity_log = tmp_path / f"activity-{fname}-001.log"
     first_20 = [f"line-{i:03d}" for i in range(20)]
     last_20 = [f"line-{i:03d}" for i in range(20, 40)]
     activity_log.write_text("\n".join(first_20 + last_20), encoding="utf-8")
@@ -97,8 +97,8 @@ def test_compute_progress_hash_different_first_same_last_equal(tmp_path):
     stage.status = StageStatus.EXECUTING
 
     fname = "run-0"
-    log_a = tmp_path / f"ralph-activity-{fname}-a.log"
-    log_b = tmp_path / f"ralph-activity-{fname}-b.log"
+    log_a = tmp_path / f"activity-{fname}-a.log"
+    log_b = tmp_path / f"activity-{fname}-b.log"
 
     tail = [f"tail-line-{i}" for i in range(20)]
     log_a.write_text("\n".join(["different-prefix"] + tail), encoding="utf-8")

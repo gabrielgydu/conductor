@@ -1023,7 +1023,7 @@ async def start_runner(
     # Generate RUN-CONFIG.json from the speccer-generated run.sh
     docs_dir = Path(wt) / "docs" / fname
     run_sh = docs_dir / "run.sh"
-    preset = load_preset(state.preset)
+    preset = load_preset(state.preset, storage.repo_root)
     quick = getattr(state, "quick", False)
 
     is_final_stage = stage_idx == len(run.stages) - 1
@@ -2414,7 +2414,7 @@ async def conductor_run_loop(
     storage = StorageResolver(project_root)
     log_path = storage.conductor_log(state.project_name)
     audit_path = storage.conductor_audit(state.project_name)
-    preset = load_preset(state.preset)
+    preset = load_preset(state.preset, project_root)
 
     # Apply worktrees_base from preset if not set from CLI
     if not state.worktrees_base and preset and preset.config.worktrees_base:

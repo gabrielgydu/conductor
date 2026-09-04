@@ -8,19 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from conductor.core.claude import run_claude
+from conductor.core.presets import CommandSpec, ValidationSettings, load_preset
 
 if TYPE_CHECKING:
     from conductor.core.models import ConductorState
 
 logger = logging.getLogger(__name__)
 
-# Ordered list of all known check names — run_validation preserves this order.
+# Built-in check names in canonical order. Preset-defined checks run between
+# the tool checks and "smoke" (see _check_order).
 _CHECK_ORDER = ["frontend-build", "phpstan", "phpunit", "smoke", "integration-tests"]
 
 
@@ -76,23 +79,26 @@ async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]
 # ---------------------------------------------------------------------------
 
 
-def _worktree_env(ctx: ValidationContext) -> Path | None:
-    """Return path to worktree-env.sh if it exists, else None."""
-    p = ctx.project_dir / "scripts" / "worktree-env.sh"
-    return p if p.exists() else None
+def _preset_validation(ctx: ValidationContext) -> ValidationSettings:
+    """Validation hooks from the project's preset (base defaults when unavailable)."""
+    name = ctx.state.preset if ctx.state else None
+    try:
+        return load_preset(name, ctx.project_dir).validation
+    except ValueError as exc:
+        logger.warning("Preset %r not loadable (%s) — using base validation", name, exc)
+        return ValidationSettings()
 
 
 async def _check_frontend_build(ctx: ValidationContext) -> CheckResult:
     start = time.monotonic()
-    env = _worktree_env(ctx)
-    frontend_dir = ctx.project_dir / "frontend"
-    if env:
-        # worktree-env.sh exec runs inside Docker at /var/www/html
-        cmd = [str(env), "exec", "cd frontend && npm run build"]
+    settings = _preset_validation(ctx)
+    if settings.exec_wrapper:
+        # The preset's wrapper runs the shell command inside its environment.
+        cmd = settings.exec_wrapper + ["cd frontend && npm run build"]
         cwd = ctx.project_dir
     else:
         cmd = ["npm", "run", "build"]
-        cwd = frontend_dir
+        cwd = ctx.project_dir / "frontend"
     exit_code, output = await _run_cmd(cmd, cwd=cwd, timeout=300)
     return CheckResult(
         name="frontend-build",
@@ -104,9 +110,9 @@ async def _check_frontend_build(ctx: ValidationContext) -> CheckResult:
 
 async def _check_phpstan(ctx: ValidationContext) -> CheckResult:
     start = time.monotonic()
-    env = _worktree_env(ctx)
-    if env:
-        cmd = [str(env), "exec", "vendor/bin/phpstan analyse --memory-limit=512M"]
+    settings = _preset_validation(ctx)
+    if settings.exec_wrapper:
+        cmd = settings.exec_wrapper + ["vendor/bin/phpstan analyse --memory-limit=512M"]
     else:
         cmd = ["vendor/bin/phpstan", "analyse", "--memory-limit=512M"]
     exit_code, output = await _run_cmd(cmd, cwd=ctx.project_dir, timeout=300)
@@ -120,9 +126,9 @@ async def _check_phpstan(ctx: ValidationContext) -> CheckResult:
 
 async def _check_phpunit(ctx: ValidationContext) -> CheckResult:
     start = time.monotonic()
-    env = _worktree_env(ctx)
-    if env:
-        cmd = [str(env), "exec", "vendor/bin/phpunit"]
+    settings = _preset_validation(ctx)
+    if settings.exec_wrapper:
+        cmd = settings.exec_wrapper + ["vendor/bin/phpunit"]
     else:
         cmd = ["vendor/bin/phpunit"]
 
@@ -138,29 +144,31 @@ async def _check_phpunit(ctx: ValidationContext) -> CheckResult:
 async def _check_smoke(ctx: ValidationContext) -> CheckResult:
     start = time.monotonic()
 
-    # Acme preset: use worktree-env.sh to start containers and run CI
-    env = _worktree_env(ctx)
-    preset = ctx.state.preset if ctx.state else None
-    if preset == "acme" and env:
-        logger.warning("Smoke check: worktree-env.sh up --all (%s)", ctx.project_dir)
-        print(f"  smoke: worktree-env.sh up --all ...", flush=True)
-        exit_code, output = await _run_cmd(
-            [str(env), "up", "--all"], cwd=ctx.project_dir, timeout=600,
-        )
-        if exit_code != 0:
-            print(f"  smoke: up --all FAILED (exit {exit_code})", flush=True)
-            return CheckResult(
-                name="smoke",
-                passed=False,
-                output=f"worktree-env.sh up --all failed:\n{output}",
-                duration_s=time.monotonic() - start,
+    # Preset-defined smoke: optionally bring the environment up, then run its CI.
+    settings = _preset_validation(ctx)
+    if settings.smoke_command:
+        if settings.smoke_up_command:
+            up_text = " ".join(settings.smoke_up_command)
+            logger.warning("Smoke check: %s (%s)", up_text, ctx.project_dir)
+            print(f"  smoke: {up_text} ...", flush=True)
+            exit_code, output = await _run_cmd(
+                settings.smoke_up_command, cwd=ctx.project_dir, timeout=settings.smoke_timeout,
             )
-        print(f"  smoke: containers up, running CI ...", flush=True)
-        logger.warning("Smoke check: worktree-env.sh ci")
+            if exit_code != 0:
+                print(f"  smoke: {up_text} FAILED (exit {exit_code})", flush=True)
+                return CheckResult(
+                    name="smoke",
+                    passed=False,
+                    output=f"{up_text} failed:\n{output}",
+                    duration_s=time.monotonic() - start,
+                )
+        ci_text = " ".join(settings.smoke_command)
+        logger.warning("Smoke check: %s", ci_text)
+        print(f"  smoke: {ci_text} ...", flush=True)
         exit_code, output = await _run_cmd(
-            [str(env), "ci", "auto"], cwd=ctx.project_dir, timeout=1800,
+            settings.smoke_command, cwd=ctx.project_dir, timeout=settings.smoke_timeout,
         )
-        print(f"  smoke: CI {'PASSED' if exit_code == 0 else 'FAILED'} (exit {exit_code})", flush=True)
+        print(f"  smoke: {'PASSED' if exit_code == 0 else 'FAILED'} (exit {exit_code})", flush=True)
         return CheckResult(
             name="smoke",
             passed=exit_code == 0,
@@ -230,6 +238,32 @@ async def _check_integration_tests(ctx: ValidationContext) -> CheckResult:
     )
 
 
+async def _run_preset_check(ctx: ValidationContext, spec: CommandSpec) -> CheckResult:
+    """Run one ``[[validation.checks]]`` entry from the preset."""
+    start = time.monotonic()
+    if spec.requires and not (ctx.project_dir / spec.requires).exists():
+        return CheckResult(
+            name=spec.name,
+            passed=True,
+            output=f"skipped: {spec.requires} not present",
+            duration_s=0.0,
+        )
+    cwd = ctx.project_dir / spec.cwd if spec.cwd else ctx.project_dir
+    exit_code, output = await _run_cmd(spec.argv, cwd=cwd, timeout=spec.timeout)
+    passed = exit_code == 0 and not (spec.fail_pattern and re.search(spec.fail_pattern, output))
+    return CheckResult(
+        name=spec.name,
+        passed=passed,
+        output=output,
+        duration_s=time.monotonic() - start,
+    )
+
+
+def _check_order(settings: ValidationSettings) -> list[str]:
+    preset_names = [c.name for c in settings.checks]
+    return _CHECK_ORDER[:3] + preset_names + _CHECK_ORDER[3:]
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -261,6 +295,8 @@ async def detect_checks(ctx: ValidationContext) -> list[str]:
     if (ctx.project_dir / "vendor" / "bin" / "phpunit").exists():
         checks.append("phpunit")
 
+    checks.extend(c.name for c in _preset_validation(ctx).checks)
+
     if ctx.stage == "integration":
         checks.append("smoke")
         checks.append("integration-tests")
@@ -272,6 +308,10 @@ async def run_check(name: str, ctx: ValidationContext) -> CheckResult:
     """Dispatch to the appropriate check function and time it."""
     fn = _CHECK_DISPATCH.get(name)
     if fn is None:
+        spec = next((c for c in _preset_validation(ctx).checks if c.name == name), None)
+        if spec is not None:
+            logger.info("Running preset check: %s (stage=%s)", name, ctx.stage)
+            return await _run_preset_check(ctx, spec)
         return CheckResult(
             name=name,
             passed=False,
@@ -294,16 +334,17 @@ async def run_validation(
     """Run all requested checks sequentially and return aggregate result.
 
     If *checks* is None, detect_checks() is called automatically.
-    Checks run in canonical order: frontend-build, phpstan, phpunit, smoke,
-    integration-tests.
+    Checks run in canonical order: frontend-build, phpstan, phpunit, preset
+    checks, smoke, integration-tests.
     """
     if checks is None:
         checks = await detect_checks(ctx)
 
-    # Sort by canonical order; unknown names go to the end.
+    # Sort by canonical order (preset checks before smoke); unknown names go to the end.
+    order = _check_order(_preset_validation(ctx))
     ordered = sorted(
         checks,
-        key=lambda n: _CHECK_ORDER.index(n) if n in _CHECK_ORDER else len(_CHECK_ORDER),
+        key=lambda n: order.index(n) if n in order else len(order),
     )
 
     results: list[CheckResult] = []

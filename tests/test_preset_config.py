@@ -6,10 +6,9 @@ import pytest
 from dataclasses import fields
 
 from conductor.core.presets import (
+    PRESETS_DIR_ENV,
     PresetConfig,
     BasePreset,
-    AcmePreset,
-    NodeappPreset,
     load_preset,
 )
 
@@ -42,6 +41,7 @@ EXPECTED_FIELDS = {
     "fixer_ci_poll_interval",
     "fixer_ci_max_wait",
     "fixer_skip_patterns",
+    "worktrees_base",
 }
 
 
@@ -76,65 +76,44 @@ def test_preset_config_default_values():
     assert cfg.fixer_ci_poll_interval == 60
     assert cfg.fixer_ci_max_wait == 5400
     assert cfg.fixer_skip_patterns == "coverage|Coverage|codecov|Codecov"
+    assert cfg.worktrees_base == ""
 
 
 # ---------------------------------------------------------------------------
-# AcmePreset config completeness
+# Every PresetConfig field is settable from a TOML [config] section
 # ---------------------------------------------------------------------------
 
 
-def test_acme_config_fixer_enabled():
-    cfg = AcmePreset().config
-    assert cfg.fixer_enabled is True
+@pytest.fixture
+def presets_dir(tmp_path, monkeypatch):
+    directory = tmp_path / "presets"
+    directory.mkdir()
+    monkeypatch.setenv(PRESETS_DIR_ENV, str(directory))
+    return directory
 
 
-def test_acme_config_sync_enabled():
-    cfg = AcmePreset().config
-    assert cfg.sync_enabled is True
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, list):
+        return "[]"
+    if isinstance(value, dict):
+        return "{}"
+    raise TypeError(type(value))
 
 
-def test_acme_config_local_ci_command():
-    cfg = AcmePreset().config
-    assert cfg.local_ci_command != ""
-    assert "worktree-env" in cfg.local_ci_command
-
-
-def test_acme_config_local_review_enabled():
-    cfg = AcmePreset().config
-    assert cfg.local_review_enabled is True
-
-
-def test_acme_config_sync_dump_regen_has_4_entries():
-    cfg = AcmePreset().config
-    assert len(cfg.sync_dump_regen) == 4
-
-
-def test_acme_config_sync_dump_regen_format():
-    cfg = AcmePreset().config
-    for entry in cfg.sync_dump_regen:
-        assert len(entry) == 2, (
-            "Each sync_dump_regen entry must be (glob, command) tuple"
-        )
-        glob_pat, cmd = entry
-        assert isinstance(glob_pat, str)
-        assert isinstance(cmd, str)
-        assert glob_pat  # non-empty
-        assert cmd  # non-empty
-
-
-# ---------------------------------------------------------------------------
-# NodeappPreset config completeness
-# ---------------------------------------------------------------------------
-
-
-def test_nodeapp_config_model_set():
-    cfg = NodeappPreset().config
-    assert cfg.model != ""
-
-
-def test_nodeapp_config_fix_model_set():
-    cfg = NodeappPreset().config
-    assert cfg.fix_model != ""
+def test_every_config_field_accepted_from_toml(presets_dir):
+    defaults = PresetConfig()
+    lines = ["[config]"]
+    for f in fields(PresetConfig):
+        lines.append(f"{f.name} = {_toml_value(getattr(defaults, f.name))}")
+    (presets_dir / "full.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    cfg = load_preset("full").config
+    assert cfg == defaults
 
 
 # ---------------------------------------------------------------------------
@@ -153,22 +132,29 @@ def test_base_config_sync_disabled():
 
 
 # ---------------------------------------------------------------------------
-# All presets instantiate without error
+# All presets expose the same interface
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["base", "acme", "nodeapp"])
-def test_all_presets_load(name):
-    preset = load_preset(name)
-    assert preset is not None
-    assert hasattr(preset, "config")
-    assert isinstance(preset.config, PresetConfig)
+@pytest.fixture
+def preset_names(presets_dir):
+    (presets_dir / "custom.toml").write_text("[config]\nfixer_enabled = true\n", encoding="utf-8")
+    return ["base", "custom"]
 
 
-@pytest.mark.parametrize("name", ["base", "acme", "nodeapp"])
-def test_all_presets_have_required_methods(name):
-    preset = load_preset(name)
-    assert callable(getattr(preset, "quality_gate", None))
-    assert callable(getattr(preset, "preflight", None))
-    assert callable(getattr(preset, "build_prompt_extra", None))
-    assert callable(getattr(preset, "stage_teardown", None))
+def test_all_presets_load(preset_names):
+    for name in preset_names:
+        preset = load_preset(name)
+        assert preset is not None
+        assert hasattr(preset, "config")
+        assert isinstance(preset.config, PresetConfig)
+
+
+def test_all_presets_have_required_methods(preset_names):
+    for name in preset_names:
+        preset = load_preset(name)
+        assert callable(getattr(preset, "quality_gate", None))
+        assert callable(getattr(preset, "preflight", None))
+        assert callable(getattr(preset, "build_prompt_extra", None))
+        assert callable(getattr(preset, "stage_teardown", None))
+        assert callable(getattr(preset, "run_teardown", None))

@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from conductor.core.claude import resolve_model
 from conductor.core.logging import live_log
 from conductor.core.models import atomic_save
-from conductor.core.presets import load_preset
+from conductor.core.presets import ManualTestPolicy, load_preset
 from conductor.core.storage import StorageResolver
 
 
@@ -786,11 +786,11 @@ _POLICY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-def _fatal_policy_reason(value: str) -> str:
-    if re.search(r"\b(showNewDispatch|useNewDispatch)\b", value, re.I):
-        return "rollout flags must be toggled through the admin airport edit UI"
-    if re.search(r"/_test/dispatch-send\b", value, re.I):
-        return "/_test/dispatch-send cannot prove basket delivery-note UI behavior"
+def _fatal_policy_reason(value: str, policy: ManualTestPolicy | None = None) -> str:
+    """Return the preset's reason when *value* matches a fatal policy pattern."""
+    for fatal in (policy or ManualTestPolicy()).fatal_patterns:
+        if re.search(fatal.pattern, value, re.I):
+            return fatal.reason
     return ""
 
 
@@ -802,10 +802,10 @@ _MUTATING_SQL = re.compile(
 def _is_auto_approved(flag: "PolicyFlag") -> bool:
     """Auto-approve all non-fatal policy flags.
 
-    Only fatal flags (rollout flag toggling via SQL, /_test/dispatch-send)
-    remain enforced. Everything else — DB commands, test routes, mutating
-    HTTP, fixture commands, browser storage — is auto-approved because the
-    tester operates entirely within the dev environment.
+    Only fatal flags (the preset's ``[[manual_test.fatal_patterns]]``) remain
+    enforced. Everything else — DB commands, test routes, mutating HTTP,
+    fixture commands, browser storage — is auto-approved because the tester
+    operates entirely within the dev environment.
     """
     return not flag.fatal_reason
 
@@ -836,7 +836,9 @@ def _iter_tool_inputs(output: str) -> list[str]:
     return values
 
 
-def scan_policy_shortcuts(output: str) -> list[PolicyFlag]:
+def scan_policy_shortcuts(
+    output: str, policy: ManualTestPolicy | None = None
+) -> list[PolicyFlag]:
     flags: list[PolicyFlag] = []
     seen: set[tuple[str, str]] = set()
     candidates = [("tool", value) for value in _iter_tool_inputs(output)]
@@ -858,7 +860,7 @@ def scan_policy_shortcuts(output: str) -> list[PolicyFlag]:
                         pattern=label,
                         value=flagged_value,
                         source=source,
-                        fatal_reason=_fatal_policy_reason(flagged_value),
+                        fatal_reason=_fatal_policy_reason(flagged_value, policy),
                     )
                 )
     return flags
@@ -902,7 +904,24 @@ def _shortcut_covers_flag(shortcut: DataShortcut, flag: PolicyFlag) -> bool:
     return command == flag.value or flag.value in command or command in flag.value
 
 
-def parse_manual_signal(output: str, policy_flags: list[PolicyFlag] | None = None) -> ManualSignal:
+def _is_missing_data_reason(reason: str, policy: ManualTestPolicy | None) -> bool:
+    """True when a blocked reason only complains about missing data/fixtures."""
+    words = (policy or ManualTestPolicy()).blocked_reason_words
+    if not words:
+        return False
+    alternatives = "|".join(re.escape(w) for w in words)
+    pattern = (
+        rf"\b(no|missing|unavailable|lacking|without)\b.*\b({alternatives})s?\b"
+        rf"|\b({alternatives})s?\b.*\b(missing|unavailable)\b"
+    )
+    return re.search(pattern, reason.strip(), re.I) is not None
+
+
+def parse_manual_signal(
+    output: str,
+    policy_flags: list[PolicyFlag] | None = None,
+    policy: ManualTestPolicy | None = None,
+) -> ManualSignal:
     """Parse and validate a manual-test result from raw or stream-json output."""
     text = _extract_text_from_stream_json(output)
     signal = ManualSignal(raw_text=text, policy_flags=policy_flags or [])
@@ -983,12 +1002,7 @@ def parse_manual_signal(output: str, policy_flags: list[PolicyFlag] | None = Non
             signal.errors.append("blocked result requires why_not_fixable_now")
         if not _has_required_evidence(signal.evidence):
             signal.errors.append("blocked result requires evidence")
-        if re.search(
-            r"\b(no|missing|unavailable|lacking|without)\b.*\b(data|fixture|customer|basket|recipient|mailer|template)s?\b"
-            r"|\b(data|fixture)s?\b.*\b(missing|unavailable)\b",
-            signal.blocked_reason.strip(),
-            re.I,
-        ):
+        if _is_missing_data_reason(signal.blocked_reason, policy):
             signal.errors.append("blocked reason cannot be only missing data")
 
     fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
@@ -1020,8 +1034,11 @@ def build_coverage_prompt(
     state: ManualTestState,
     plan_content: str,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
     scenarios_path = manual_scenarios_path(conductor_dir)
+    policy = policy or ManualTestPolicy()
+    focus_section = f"## Project Focus\n\n{policy.coverage_focus}\n\n" if policy.coverage_focus else ""
     return f"""\
 You are the coverage discovery generation for Conductor manual-test mode.
 
@@ -1032,8 +1049,8 @@ Artifacts directory: {conductor_dir / 'artifacts'}
 
 ## Job
 
-Discover the complete user-facing Dispatch surface before execution. Read routes,
-controllers, components, templates, tests, notes, and relevant configuration. Extend
+Discover the complete user-facing surface of the feature under test before execution.
+Read routes, controllers, components, templates, tests, notes, and relevant configuration. Extend
 the scenario matrix in {scenarios_path} when the plan misses user-facing behavior.
 
 Do not execute browser scenarios in this generation. This generation is for coverage
@@ -1043,12 +1060,12 @@ only. Preserve existing scenario rows unless they are obvious duplicates.
 
 1. Read code before claiming behavior.
 2. Prefer real UI surfaces over test helpers when identifying scenarios.
-3. Include rollout/admin setup, capability gates, mailer/template/document flows,
-   dispatch list behavior, processor/retry behavior, edge cases, and UX audit areas.
+3. Include setup/admin flows, permission and capability gates, notification/document
+   flows, list and detail behavior, retry/error handling, edge cases, and UX audit areas.
 4. Keep scenarios atomic enough that one later generation can execute one scenario.
 5. End with exactly <manual-handoff/> after updating the scenario matrix.
 
-## Original Plan
+{focus_section}## Original Plan
 
 {plan_content}
 """
@@ -1059,9 +1076,12 @@ def build_scenario_prompt(
     plan_content: str,
     scenario: ManualScenario,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
     artifacts_dir = conductor_dir / "artifacts"
     handoff_section = _scenario_handoff_section(scenario)
+    policy = policy or ManualTestPolicy()
+    project_rules = f"\n{policy.policy_text}" if policy.policy_text else ""
     return f"""\
 You are a senior manual QA engineer running Conductor manual-test mode.
 
@@ -1081,23 +1101,20 @@ Artifacts directory: {artifacts_dir}
 2. Read relevant code before claiming behavior or declaring blocked.
 3. Create missing data when practical. "No test data" is not a valid block by itself.
 4. Record evidence for every pass, finding, or blocked result. Save screenshots, traces,
-   MailHog exports, console logs, or DB/API readbacks under the artifacts directory.
+   mail-catcher exports, console logs, or DB/API readbacks under the artifacts directory.
 5. Distinguish app bugs, UX issues, flaky tests, data issues, and environment issues.
 6. If you find a bug or UX issue, produce a structured finding instead of silently fixing it.
 
 ## Data Setup Policy
 
 - UI behavior under test must be executed through the UI.
-- CRITICAL: Rollout flags showNewDispatch/useNewDispatch must ALWAYS be toggled through the
-  admin airport edit UI at /airports/edit/{{airport_id}} → Konfiguration tab. NEVER use SQL
-  UPDATE, artisan tinker, or any other method to change these flags — this is a fatal policy
-  violation that causes immediate validation failure with no override possible.
-- Mailer/template setup must be performed through the UI at least once.
+- Configuration that users normally change through the UI must be changed through the UI
+  at least once.
 - SQL/test routes may be used only for non-user-facing preconditions, bulk fixture creation,
   cleanup, or impossible setup.
 - Every SQL/test-route/mutating HTTP shortcut must include a <shortcut> entry in the result:
   <shortcut><reason>...</reason><command_or_route>...</command_or_route><user_flow_supported>...</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
-- If a UI setup step fails, record a finding. Do not silently bypass it with SQL.
+- If a UI setup step fails, record a finding. Do not silently bypass it with SQL.{project_rules}
 
 ## Required Final Tags
 
@@ -1297,30 +1314,30 @@ def _finding_from_signal(
     )
 
 
-def detect_relevant_check_commands(changed_files: list[str]) -> list[list[str]]:
-    """Return focused verification commands for changed target-project files."""
+def detect_relevant_check_commands(
+    changed_files: list[str], policy: ManualTestPolicy | None = None
+) -> list[list[str]]:
+    """Return focused verification commands for changed target-project files.
+
+    Rules come from the preset's ``[[manual_test.check_commands]]``; ``{path}``
+    in a command is replaced with the matching changed file.
+    """
+    rules = (policy or ManualTestPolicy()).check_commands
     commands: list[list[str]] = []
     seen: set[tuple[str, ...]] = set()
-
-    def add(command: list[str]) -> None:
-        key = tuple(command)
-        if key not in seen:
-            seen.add(key)
-            commands.append(command)
 
     for file_name in changed_files:
         path = file_name.strip()
         if not path:
             continue
-        suffix = Path(path).suffix.lower()
-        if path.startswith("partner/") and suffix == ".php":
-            add(["./scripts/worktree-env.sh", "phpstan", "partner"])
-        if path.startswith("app/") and suffix == ".php":
-            add(["./scripts/worktree-env.sh", "phpstan", "app"])
-        if path.startswith("app/") and suffix in {".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".vue"}:
-            add(["./scripts/worktree-env.sh", "npm", "app", "run", "prod"])
-        if path.endswith(".spec.ts") or path.endswith(".spec.js"):
-            add(["./scripts/worktree-env.sh", "playwright", path])
+        for rule in rules:
+            if not rule.matches(path):
+                continue
+            command = [part.replace("{path}", path) for part in rule.argv]
+            key = tuple(command)
+            if key not in seen:
+                seen.add(key)
+                commands.append(command)
 
     return commands
 
@@ -1372,8 +1389,10 @@ def _format_files_for_log(files: list[str], limit: int = 12) -> str:
     return ", ".join(files[:limit]) + f", ... ({len(files)} total)"
 
 
-def _run_relevant_checks(cwd: Path, changed_files: list[str]) -> tuple[bool, list[str]]:
-    commands = detect_relevant_check_commands(changed_files)
+def _run_relevant_checks(
+    cwd: Path, changed_files: list[str], policy: ManualTestPolicy | None = None
+) -> tuple[bool, list[str]]:
+    commands = detect_relevant_check_commands(changed_files, policy)
     if not commands:
         return True, ["No focused check commands detected for changed files"]
 
@@ -1522,6 +1541,7 @@ async def _run_generation(
     log_path: Path,
     audit_path: Path,
     write_markdown_on_finish: bool = True,
+    policy: ManualTestPolicy | None = None,
 ) -> tuple[ManualSignal, str]:
     from conductor.core.loop import _wait_for_exit
 
@@ -1583,8 +1603,8 @@ async def _run_generation(
     if output_file.exists():
         output_text = output_file.read_text(encoding="utf-8", errors="replace")
 
-    policy_flags = scan_policy_shortcuts(output_text)
-    signal = parse_manual_signal(output_text, policy_flags=policy_flags)
+    policy_flags = scan_policy_shortcuts(output_text, policy)
+    signal = parse_manual_signal(output_text, policy_flags=policy_flags, policy=policy)
     generation.completed_at = datetime.now(timezone.utc)
     generation.summary = signal.kind or "no-signal"
 
@@ -1685,6 +1705,7 @@ async def _fix_and_verify_finding(
     log_path: Path,
     audit_path: Path,
     model: str,
+    policy: ManualTestPolicy | None = None,
 ) -> None:
     if not _should_fix_finding(finding):
         return
@@ -1705,6 +1726,7 @@ async def _fix_and_verify_finding(
         scenario=_scenario_for_finding(state, finding),
         log_path=log_path,
         audit_path=audit_path,
+        policy=policy,
     )
     generation = state.generations[-1]
     if not signal.valid:
@@ -1729,7 +1751,7 @@ async def _fix_and_verify_finding(
         save_manual_state(state, conductor_dir)
         return
 
-    checks_passed, check_summaries = _run_relevant_checks(project_dir, fixer_files)
+    checks_passed, check_summaries = _run_relevant_checks(project_dir, fixer_files, policy=policy)
     finding.verification.extend(check_summaries)
     if not checks_passed:
         finding.status = "open"
@@ -1750,6 +1772,7 @@ async def _fix_and_verify_finding(
         scenario=_scenario_for_finding(state, finding),
         log_path=log_path,
         audit_path=audit_path,
+        policy=policy,
     )
     verifier_generation = state.generations[-1]
     scenario = _scenario_for_finding(state, finding)
@@ -1820,7 +1843,8 @@ async def _manual_main(
         plan_path = project_dir / plan_path
     plan_content = plan_path.read_text(encoding="utf-8")
 
-    preset = load_preset(state.preset)
+    preset = load_preset(state.preset, project_dir)
+    policy = preset.manual_test
     model = resolve_model(state.model or preset.config.model or "opus")
     tmux = TmuxManager(session_name=f"conductor-manual-test-{state.name}")
     await tmux.ensure_session()
@@ -1840,13 +1864,14 @@ async def _manual_main(
             project_dir=project_dir,
             conductor_dir=conductor_dir,
             tmux=tmux,
-            prompt=build_coverage_prompt(state, plan_content, conductor_dir),
+            prompt=build_coverage_prompt(state, plan_content, conductor_dir, policy=policy),
             label="coverage",
             model=model,
             scenario=None,
             log_path=log_path,
             audit_path=audit_path,
             write_markdown_on_finish=False,
+            policy=policy,
         )
         generation = state.generations[-1]
         if not signal.valid:
@@ -1887,6 +1912,7 @@ async def _manual_main(
                 log_path=log_path,
                 audit_path=audit_path,
                 model=model,
+                policy=policy,
             )
 
     while True:
@@ -1905,12 +1931,13 @@ async def _manual_main(
             project_dir=project_dir,
             conductor_dir=conductor_dir,
             tmux=tmux,
-            prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir),
+            prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir, policy=policy),
             label=f"scenario-{scenario.index}",
             model=model,
             scenario=scenario,
             log_path=log_path,
             audit_path=audit_path,
+            policy=policy,
         )
         generation = state.generations[-1]
         _apply_signal_to_scenario(
@@ -1937,6 +1964,7 @@ async def _manual_main(
                 log_path=log_path,
                 audit_path=audit_path,
                 model=model,
+                policy=policy,
             )
 
     failed = sum(1 for s in state.scenarios if s.status == "failed")

@@ -204,7 +204,7 @@ async def _run_phase(
     activity_log = feature_dir / "activity.log"
     untracked_snapshot = log_dir / f".pre-untracked-phase-{phase_num}"
 
-    preset = load_preset(cfg.preset)
+    preset = load_preset(cfg.preset, project_dir)
 
     header(f"PHASE {phase_num} — {phase_name}")
     log(f"Prompt: {prompt_file}")
@@ -404,7 +404,7 @@ async def run_phase_loop(
         log(f"Model: {cfg.model}")
 
     # Preflight check
-    preset = load_preset(cfg.preset)
+    preset = load_preset(cfg.preset, project_dir)
     if not preset.preflight(project_dir):
         error("Preflight check failed — aborting")
         _write_exit_code(feature_dir, 1)
