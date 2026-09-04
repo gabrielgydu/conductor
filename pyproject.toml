@@ -1,12 +1,25 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "conductor"
 version = "0.1.0"
 description = "Multi-run orchestrator for parallel feature builds"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Gabriel" }]
+keywords = ["claude", "orchestration", "agents", "code-generation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Development Status :: 3 - Alpha",
+]
 dependencies = [
     "pydantic>=2.0",
 ]
@@ -17,6 +30,11 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-timeout>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gabrielgydu/conductor"
+Repository = "https://github.com/gabrielgydu/conductor"
+Issues = "https://github.com/gabrielgydu/conductor/issues"
 
 [project.scripts]
 conductor = "conductor.cli:main"

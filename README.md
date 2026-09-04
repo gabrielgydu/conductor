@@ -6,7 +6,7 @@ Multi-run orchestrator for parallel AI-driven feature builds. Plans work, manage
 
 ```bash
 # Clone and run — venv is auto-created on first invocation
-git clone git@github.com:gabrielgydu/conductor.git
+git clone https://github.com/gabrielgydu/conductor.git
 cd conductor
 
 # Initialize a project (from your target repo)
@@ -122,7 +122,7 @@ INIT → EXPLORING → NEEDS_INPUT ⇄ SPECCING → COMPLETE → GENERATED
 - `TECHNICAL-DESIGN.md` — architecture and design
 - `API-CONTRACTS.md` — interface definitions
 - `IMPLEMENTATION-PLAN.md` — phased implementation plan
-- `run.sh` — runner entry point
+- `run.sh` — phase manifest (parsed by conductor for its `PHASES`/`PHASE_TOKENS`/`PHASE_NAMES` arrays; the Python runner is launched directly, not by executing this file)
 - `prompts/` — per-phase prompt files
 
 ### Runner
@@ -181,7 +181,7 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
 │   └── <feature-name>/
 │       ├── spec/                     # Speccer output (domains, progress)
 │       ├── prompts/                  # Per-phase prompt files
-│       ├── run.sh                    # Runner entry point
+│       ├── run.sh                    # Phase manifest (parsed, not executed)
 │       ├── activity.log              # Runner activity log (read by orchestrator)
 │       ├── steer_inbox/              # Steering message queue (.msg files)
 │       ├── LEARNINGS.md              # Phase learnings
@@ -190,7 +190,7 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
     └── <feature>-build/              # Build logs per phase
 ```
 
-The project key is derived from the repo root path: `/home/user/dev/repo` → `-home-user-dev-repo`. Worktrees resolve to the main repo's key via `git rev-parse --git-common-dir`.
+The project key is derived from the repo root path: `/srv/dev/repo` → `-srv-dev-repo`. Worktrees resolve to the main repo's key via `git rev-parse --git-common-dir`.
 
 ## Presets
 
@@ -269,4 +269,14 @@ python -m venv .venv
 .venv/bin/python -m pytest tests/test_models.py -v
 ```
 
-Tests: 238 passing across unit, integration, and E2E suites.
+Tests are split into three suites: unit tests directly under `tests/`, integration tests under `tests/integration/`, and end-to-end tests under `tests/e2e/`.
+
+## Contributing
+
+Fork the repo, make your change on a branch, and open a pull request.
+
+Run the test suite (see [Development](#development) above) before submitting, and keep new code covered by tests.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

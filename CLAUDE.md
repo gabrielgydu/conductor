@@ -14,7 +14,7 @@ tmux new-session -d -s conductor-<project> -n conductor
 
 # 2. Send command with --inside-tmux flag
 tmux send-keys -t conductor-<project>:conductor \
-  "/home/user/development/conductor/conductor run --inside-tmux --name <project> --project-dir <path> --overnight" Enter
+  "conductor run --inside-tmux --name <project> --project-dir <path> --overnight" Enter
 
 # 3. Monitor
 tmux capture-pane -t conductor-<project>:conductor -p 2>&1 | tail -20
@@ -51,7 +51,7 @@ conductor go \
 tmux new-session -d -s conductor-go-<name> -n conductor
 
 tmux send-keys -t conductor-go-<name>:conductor \
-  "/home/user/development/conductor/conductor go --inside-tmux --name <name> --project-dir <path> --plan <brief.md>" Enter
+  "conductor go --inside-tmux --name <name> --project-dir <path> --plan <brief.md>" Enter
 
 # Monitor
 tmux capture-pane -t conductor-go-<name>:conductor -p 2>&1 | tail -20
@@ -86,20 +86,20 @@ conductor status --name <name> --project-dir <path>
 ```bash
 # Start a new loop
 conductor loop \
-  --name app-tests-fix \
-  --project-dir ~/acme-worktrees/app-tests-integration \
+  --name my-fix \
+  --project-dir ~/my-project \
   --plan ./fix-plan.md \
-  --preset acme
+  --preset myproject
 
 # Check progress
 conductor loop-status \
-  --name app-tests-fix \
-  --project-dir ~/acme-worktrees/app-tests-integration
+  --name my-fix \
+  --project-dir ~/my-project
 
 # Resume after interruption (no --plan needed)
 conductor loop \
-  --name app-tests-fix \
-  --project-dir ~/acme-worktrees/app-tests-integration
+  --name my-fix \
+  --project-dir ~/my-project
 ```
 
 ### Running from Claude Code (no TTY)
@@ -108,7 +108,7 @@ conductor loop \
 tmux new-session -d -s conductor-loop-<name> -n loop
 
 tmux send-keys -t conductor-loop-<name>:loop \
-  "/home/user/development/conductor/conductor loop --inside-tmux --name <name> --project-dir <path> --plan <plan.md>" Enter
+  "conductor loop --inside-tmux --name <name> --project-dir <path> --plan <plan.md>" Enter
 
 # Monitor
 tmux capture-pane -t conductor-loop-<name>:loop -p 2>&1 | tail -20
@@ -166,4 +166,4 @@ Templates generate `run.sh` files that reference:
 
 ## Symlinks
 
-`~/.local/bin/conductor`, `speccer`, `runner` all symlink to the wrapper scripts in this repo.
+Symlink `conductor`, `speccer`, and `runner` from this repo into a directory on your PATH (for example `~/.local/bin`) so the commands above work without a leading path.
