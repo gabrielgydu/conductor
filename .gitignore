@@ -10,3 +10,7 @@ docs/
 bugs/
 IMPLEMENTATION-PLAN.md
 PLAN-integration-validation.md
+.claude/
+plans/
+.coverage
+.ruff_cache/
