@@ -8,17 +8,23 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from conductor.core.claude import ClaudeResult, resolve_model, run_claude
+from conductor.core.claude import resolve_model, run_claude
+from conductor.core.launch import claude_session_script
 from conductor.core.logging import live_log
-from conductor.core.models import atomic_save, load_state
+from conductor.core.models import atomic_save
 from conductor.core.presets import load_preset
 from conductor.core.storage import StorageResolver
+
+if TYPE_CHECKING:
+    from conductor.core.tmux import TmuxManager
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +43,8 @@ class LoopTask(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     attempts: int = 0
+    # Output of the last rejected commit (pre-commit hook), shown to the next session
+    commit_error: Optional[str] = None
 
 
 class LoopState(BaseModel):
@@ -87,19 +95,21 @@ Output ONLY a markdown checklist. No preamble, no explanation. Each line:
 """
 
 
-def _extract_text_from_result(output: str) -> str:
-    """Extract assistant text content from stream-json output."""
-    text_parts = []
+def _stream_events(output: str) -> Iterator[dict]:
+    """Yield the JSON objects in stream-json *output*, skipping anything else."""
     for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
-            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def _extract_text_from_result(output: str) -> str:
+    """Extract assistant text content from stream-json output."""
+    text_parts = []
+    for event in _stream_events(output):
         if event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -156,6 +166,8 @@ def decompose_plan(plan_content: str, model: str = "sonnet") -> list[LoopTask]:
 # ---------------------------------------------------------------------------
 
 _TASK_COMPLETED_TAG = "<task-completed/>"
+# How much of a rejected commit's output the next prompt quotes
+_COMMIT_ERROR_PROMPT_CHARS = 4000
 
 
 def build_prompt(state: LoopState, plan_content: str) -> str:
@@ -188,6 +200,14 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
             f"**{current_task.name}**\n\n"
             f"{current_task.description}\n"
         )
+        if current_task.commit_error:
+            current_section += (
+                f"\n## Commit Rejected\n\n"
+                f"The orchestrator's last attempt to commit this task's changes was "
+                f"rejected (usually a pre-commit hook):\n\n"
+                f"```\n{current_task.commit_error.strip()[-_COMMIT_ERROR_PROMPT_CHARS:]}\n```\n\n"
+                f"Fix the cause before you signal completion. Do not bypass or disable the hook.\n"
+            )
 
     return (
         f"You are working through a fix/improvement plan. "
@@ -196,9 +216,10 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
         f"{current_section}\n"
         f"## Instructions\n\n"
         f"1. Work on the current task (marked with <-- YOU ARE HERE)\n"
-        f"2. When you have FULLY completed the current task, output exactly: {_TASK_COMPLETED_TAG}\n"
+        f"2. When you have FULLY completed the current task, output exactly this, on a line by itself: "
+        f"{_TASK_COMPLETED_TAG}\n"
         f"3. After outputting the tag, stop and wait. The orchestrator will handle committing and advancing.\n"
-        f"4. If you cannot complete the task, explain why and output: <task-failed/>\n\n"
+        f"4. If you cannot complete the task, explain why and then output, on a line by itself: <task-failed/>\n\n"
         f"## Original Plan (full context)\n\n{plan_content}\n"
     )
 
@@ -208,15 +229,40 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def session_reached_model(output: str) -> bool:
+    """True if the session got at least one real assistant message.
+
+    False means Claude never got to work: empty output (claude or
+    stream_filter did not start) or only the synthetic message the CLI
+    emits for an API error such as an unknown model, an expired login or a
+    usage limit (flagged ``is_api_error_message``).
+    """
+    return any(
+        e.get("type") == "assistant" and not e.get("is_api_error_message")
+        for e in _stream_events(output)
+    )
+
+
+def session_error(output: str) -> str:
+    """The error the CLI reported in the session's result event, if any."""
+    for event in _stream_events(output):
+        if event.get("type") == "result" and event.get("is_error"):
+            return str(event.get("result") or event.get("subtype") or "")
+    return ""
+
+
+# A signal tag counts only on a line of its own, so prose that mentions it
+# ("I will not output <task-completed/> yet") is not mistaken for it.
+_SIGNAL_RE = re.compile(r"^[ \t]*<task-(completed|failed)\s*/>[ \t]*$", re.MULTILINE)
+
+
 def check_output_for_signal(output: str) -> str | None:
     """Check Claude's output for task-completed or task-failed signal.
-    Returns 'completed', 'failed', or None."""
-    text = _extract_text_from_result(output)
-    if "<task-completed/>" in text or "<task-completed />" in text:
-        return "completed"
-    if "<task-failed/>" in text or "<task-failed />" in text:
-        return "failed"
-    return None
+
+    Returns 'completed', 'failed', or None. If both appear, the last wins.
+    """
+    signals = _SIGNAL_RE.findall(_extract_text_from_result(output))
+    return signals[-1] if signals else None
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +292,23 @@ def create_loop_worktree(
 
 
 # ---------------------------------------------------------------------------
-# Quality gate + commit
+# Commit
 # ---------------------------------------------------------------------------
 
 
+class CommitRejected(Exception):
+    """git refused to stage or commit, usually a pre-commit hook; ``output`` says why."""
+
+    def __init__(self, output: str) -> None:
+        super().__init__(output.strip() or "git commit failed")
+        self.output = output
+
+
 def commit_task(cwd: Path, task: LoopTask) -> str | None:
-    """Stage all changes and commit. Returns commit hash or None."""
+    """Stage all changes and commit. Returns commit hash, or None if nothing changed.
+
+    Raises CommitRejected (with git's output) when git refuses the commit.
+    """
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=str(cwd), capture_output=True, text=True,
@@ -259,31 +316,17 @@ def commit_task(cwd: Path, task: LoopTask) -> str | None:
     if not status.stdout.strip():
         return None
 
-    subprocess.run(
-        ["git", "add", "-A"],
-        cwd=str(cwd), check=True, capture_output=True,
-    )
-
     msg = f"{task.name}\n\nTask {task.index}: {task.description[:200]}"
-    subprocess.run(
-        ["git", "commit", "-m", msg],
-        cwd=str(cwd), check=True, capture_output=True,
-    )
+    for args in (["git", "add", "-A"], ["git", "commit", "-m", msg]):
+        r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
+        if r.returncode != 0:
+            raise CommitRejected(r.stdout + r.stderr)
 
     result = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
         cwd=str(cwd), capture_output=True, text=True,
     )
     return result.stdout.strip()
-
-
-def push_branch(cwd: Path, branch: str) -> bool:
-    """Push the branch to origin. Returns success."""
-    result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
-        cwd=str(cwd), capture_output=True, text=True,
-    )
-    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +346,8 @@ def _log(event: str, message: str, log_path: Path | None, audit_path: Path | Non
 _ZOMBIE_SHALLOW_THRESHOLD = 3
 # Seconds with no new output before declaring stall (Claude stuck)
 _STALL_TIMEOUT_SECS = 1800  # 30 minutes
+# Seconds between checks while waiting for a session's exit file
+_EXIT_POLL_SECS = 15
 
 
 async def _wait_for_exit(
@@ -328,7 +373,7 @@ async def _wait_for_exit(
     last_output_size = 0
 
     while not exit_file.exists():
-        await asyncio.sleep(15)
+        await asyncio.sleep(_EXIT_POLL_SECS)
 
         # ---- window disappeared (crash, user killed it) ----
         if not await tmux.is_window_alive(window_name):
@@ -376,13 +421,101 @@ async def _wait_for_exit(
 
 
 # ---------------------------------------------------------------------------
+# Task bookkeeping
+# ---------------------------------------------------------------------------
+
+# Sessions a task gets before it is marked failed and the loop moves on
+_MAX_ATTEMPTS_PER_TASK = 3
+# Sessions in a row in which Claude produced nothing before the loop stops
+_MAX_EMPTY_SESSIONS = 2
+
+
+def _fail_task(
+    state: LoopState, task: LoopTask, why: str,
+    log_path: Path | None, audit_path: Path | None,
+) -> None:
+    """Mark *task* failed and move the loop on to the next one."""
+    task.status = "failed"
+    state.current_task_index += 1
+    _log(
+        "TASK_FAILED",
+        f"Task {task.index} '{task.name}' failed after {task.attempts} attempts: {why}",
+        log_path, audit_path, task_index=task.index,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session files
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SessionFiles:
+    """Files one Claude session reads and writes, in the loop's conductor dir.
+
+    They used to live in /tmp keyed by loop name only, so two projects
+    running a loop with the same name overwrote each other's files.
+    """
+
+    prompt: Path
+    output: Path
+    exit: Path
+    stderr: Path
+
+    @classmethod
+    def create(cls, session_dir: Path, task_index: int, prompt: str) -> _SessionFiles:
+        """Clear leftovers from an earlier session and write *prompt*."""
+        session_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"task-{task_index}"
+        files = cls(
+            prompt=session_dir / f"{stem}-prompt.md",
+            output=session_dir / f"{stem}-output.jsonl",
+            exit=session_dir / f"{stem}-exit",
+            stderr=session_dir / f"{stem}-stderr.log",
+        )
+        files.remove()
+        files.prompt.write_text(prompt, encoding="utf-8")
+        return files
+
+    def exit_code(self) -> int:
+        try:
+            return int(self.exit.read_text().strip())
+        except (ValueError, OSError):
+            return 1
+
+    def output_text(self) -> str:
+        try:
+            return self.output.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def stderr_tail(self, lines: int = 20) -> str:
+        try:
+            text = self.stderr.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return "\n".join(text.strip().splitlines()[-lines:])
+
+    def remove(self) -> None:
+        for f in (self.prompt, self.output, self.exit, self.stderr):
+            f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Loop runner (tmux-based)
 # ---------------------------------------------------------------------------
 
 
 def run_loop_in_tmux(state: LoopState, project_dir: Path, storage: StorageResolver) -> None:
     """Main loop — runs inside tmux. Invokes Claude CLI sessions sequentially."""
-    asyncio.run(_loop_main(state, project_dir, storage))
+    try:
+        asyncio.run(_loop_main(state, project_dir, storage))
+    except Exception:
+        # Don't leave LOOP-STATE.json saying "running" for a loop that died
+        state.status = "failed"
+        state.updated_at = datetime.now(timezone.utc)
+        atomic_save(state, storage.conductor_dir(state.name) / "LOOP-STATE.json")
+        raise
 
 
 async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolver) -> None:
@@ -392,6 +525,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
     state_path = storage.conductor_dir(state.name) / "LOOP-STATE.json"
     log_path = storage.conductor_dir(state.name) / "LOOP-LOG.md"
     audit_path = storage.conductor_dir(state.name) / "LOOP-AUDIT.jsonl"
+    session_dir = storage.conductor_dir(state.name) / "session"
 
     preset = load_preset(state.preset, project_dir)
     tmux = TmuxManager(session_name=f"conductor-loop-{state.name}")
@@ -412,11 +546,14 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
 
     _log("LOOP_START", f"Starting loop: {state.name}, {len(state.tasks)} tasks", log_path, audit_path)
 
-    max_sessions = len(state.tasks) * 3  # Safety cap: 3 sessions per task max
-    session_num = 0
+    # Every session either finishes its task or uses one of its
+    # _MAX_ATTEMPTS_PER_TASK attempts; sessions in which Claude never ran
+    # don't count against the task, but _MAX_EMPTY_SESSIONS of them in a
+    # row stop the loop.
+    empty_sessions = 0
+    stop_reason = ""
 
-    while state.current_task_index < len(state.tasks) and session_num < max_sessions:
-        session_num += 1
+    while state.current_task_index < len(state.tasks):
         task = state.tasks[state.current_task_index]
 
         if task.status == "completed":
@@ -442,125 +579,151 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         # Run Claude via tmux
         model = resolve_model(state.model or preset.config.model or "opus")
         window_name = f"task-{task.index}"
-        exit_file = Path(f"/tmp/conductor-loop-exit-{state.name}-{task.index}")
-        output_file = Path(f"/tmp/conductor-loop-output-{state.name}-{task.index}")
-        exit_file.unlink(missing_ok=True)
-        output_file.unlink(missing_ok=True)
+        files = _SessionFiles.create(session_dir, task.index, prompt)
 
-        # Write prompt to temp file
-        prompt_file = Path(f"/tmp/conductor-loop-prompt-{state.name}-{task.index}")
-        prompt_file.write_text(prompt, encoding="utf-8")
-
-        # Build claude command
-        claude_cmd = (
-            f"claude -p - "
-            f"--dangerously-skip-permissions "
-            f"--max-turns {state.max_turns} "
-            f"--model {model} "
-            f"--output-format stream-json "
-            f"--verbose "
-            f"< {prompt_file}"
-        )
-
-        # Pipe through stream_filter: pretty-prints to terminal + saves raw json to file
-        filter_mod = "conductor.core.stream_filter"
-        wrapped_cmd = (
-            f"cd {cwd} && {claude_cmd} 2>/dev/null "
-            f"| python3 -m {filter_mod} {output_file}; "
-            f"echo ${{PIPESTATUS[0]}} > {exit_file}"
+        # Claude piped through stream_filter: pretty-prints to the pane + saves raw json to file
+        script = claude_session_script(
+            cwd=cwd, prompt_file=files.prompt, output_file=files.output,
+            exit_file=files.exit, stderr_file=files.stderr,
+            model=model, max_turns=state.max_turns,
         )
 
         log_file = storage.tmux_log(state.name, f"task-{task.index}_session-{state.session_count}")
-        await tmux.spawn_in_window(window_name, wrapped_cmd, cwd=str(cwd), detached=True, log_file=log_file)
+        await tmux.spawn_in_window(window_name, script, cwd=str(cwd), detached=True, log_file=log_file)
 
         # Wait for completion (with zombie/stall detection)
         _log("CLAUDE_RUNNING", f"Claude running in window '{window_name}'", log_path, audit_path)
 
-        await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
+        await _wait_for_exit(files.exit, files.output, tmux, window_name, log_path, audit_path)
 
         # Read results
-        try:
-            exit_code = int(exit_file.read_text().strip())
-        except (ValueError, OSError):
-            exit_code = 1
-
-        output_text = ""
-        if output_file.exists():
-            output_text = output_file.read_text(encoding="utf-8", errors="replace")
+        exit_code = files.exit_code()
+        output_text = files.output_text()
 
         _log(
             "SESSION_END",
             f"Session {state.session_count} exit {exit_code}",
             log_path, audit_path,
-            exit_code=exit_code, task_index=task.index,
+            exit_code=exit_code, task_index=task.index, stderr_tail=files.stderr_tail(),
         )
 
         # Check for task signal
         signal = check_output_for_signal(output_text)
+        reached_model = session_reached_model(output_text)
+        empty_sessions = 0 if reached_model else empty_sessions + 1
 
-        if signal == "completed":
+        if not reached_model:
+            # Login, model, usage limit or launch problem: not the task's fault
+            task.attempts -= 1
+            why = session_error(output_text) or files.stderr_tail() or f"no output, see {log_file}"
+            _log(
+                "NO_SIGNAL",
+                f"Session {state.session_count}: Claude produced no output (exit {exit_code}): {why}",
+                log_path, audit_path, task_index=task.index,
+            )
+            if empty_sessions >= _MAX_EMPTY_SESSIONS:
+                stop_reason = f"{empty_sessions} sessions in a row without Claude output: {why}"
+                _log("FAILURE", f"Stopping loop: {stop_reason}", log_path, audit_path)
+
+        elif signal == "completed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled completed", log_path, audit_path)
 
-            commit_hash = commit_task(cwd, task)
-            task.status = "completed"
-            task.commit = commit_hash
-            task.completed_at = datetime.now(timezone.utc)
+            try:
+                commit_hash = commit_task(cwd, task)
+            except CommitRejected as rejected:
+                # Keep the task open; the next session sees the hook's output
+                task.commit_error = rejected.output
+                _log(
+                    "GATE_FAILED",
+                    f"Task {task.index}: commit rejected, task stays open\n{rejected}",
+                    log_path, audit_path, task_index=task.index,
+                )
+                if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                    _fail_task(state, task, "its commit kept being rejected", log_path, audit_path)
+            else:
+                task.status = "completed"
+                task.commit = commit_hash
+                task.commit_error = None
+                task.completed_at = datetime.now(timezone.utc)
 
-            _log(
-                "TASK_COMPLETED",
-                f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
-                log_path, audit_path,
-                task_index=task.index, commit=commit_hash,
-            )
+                _log(
+                    "TASK_COMPLETED",
+                    f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
+                    log_path, audit_path,
+                    task_index=task.index, commit=commit_hash,
+                )
 
-            state.current_task_index += 1
+                state.current_task_index += 1
 
         elif signal == "failed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled failed", log_path, audit_path)
-            if task.attempts >= 3:
-                task.status = "failed"
-                state.current_task_index += 1
+            if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                _fail_task(state, task, "it signaled failure", log_path, audit_path)
 
         else:
             # No signal — context exhaustion or crash
             _log(
                 "NO_SIGNAL",
-                f"Session ended without signal (exit {exit_code}). Will restart.",
+                f"Session ended without signal (exit {exit_code}).",
                 log_path, audit_path,
             )
-            partial_hash = commit_task(cwd, LoopTask(
-                index=task.index, name=f"WIP: {task.name}",
-                description=f"Partial progress on task {task.index}",
-            ))
-            if partial_hash:
-                _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
+            try:
+                partial_hash = commit_task(cwd, LoopTask(
+                    index=task.index, name=f"WIP: {task.name}",
+                    description=f"Partial progress on task {task.index}",
+                ))
+            except CommitRejected as rejected:
+                # Leave the work uncommitted for the next session, which sees why
+                task.commit_error = rejected.output
+                _log(
+                    "GATE_FAILED",
+                    f"Task {task.index}: WIP commit rejected, changes left uncommitted\n{rejected}",
+                    log_path, audit_path, task_index=task.index,
+                )
+            else:
+                # Nothing is left uncommitted, so an earlier rejection no longer applies
+                task.commit_error = None
+                if partial_hash:
+                    _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
+            if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                _fail_task(state, task, "no completion signal", log_path, audit_path)
 
         # Save state after each session
         state.updated_at = datetime.now(timezone.utc)
         atomic_save(state, state_path)
 
-        # Cleanup temp files
-        for f in [prompt_file, exit_file, output_file]:
-            f.unlink(missing_ok=True)
+        files.remove()
+
+        if stop_reason:
+            break
 
     # Done
     completed = sum(1 for t in state.tasks if t.status == "completed")
     failed = sum(1 for t in state.tasks if t.status == "failed")
-    state.status = "completed" if failed == 0 else "failed"
+    # Anything short of every task done is a failed loop, not a completed one
+    state.status = "completed" if completed == len(state.tasks) else "failed"
     state.updated_at = datetime.now(timezone.utc)
     atomic_save(state, state_path)
 
     _log(
         "LOOP_DONE",
-        f"Loop finished: {completed}/{len(state.tasks)} completed, {failed} failed",
+        f"Loop finished: {completed}/{len(state.tasks)} completed, {failed} failed"
+        + (f" (stopped: {stop_reason})" if stop_reason else ""),
         log_path, audit_path,
     )
 
     # Print clear completion banner
     sep = "═" * 50
+    title = "LOOP COMPLETE" if state.status == "completed" else "LOOP FAILED"
     print(f"\n{sep}", file=sys.stderr)
-    print(f"  LOOP COMPLETE: {state.name}", file=sys.stderr)
+    print(f"  {title}: {state.name}", file=sys.stderr)
     print(f"  {completed}/{len(state.tasks)} tasks done, {failed} failed", file=sys.stderr)
+    if stop_reason:
+        print(f"  Stopped: {stop_reason}", file=sys.stderr)
+        print(
+            f"  Fix the cause, then resume: conductor loop --name {state.name} --project-dir {project_dir}",
+            file=sys.stderr,
+        )
     if state.branch:
         print(f"  Branch: {state.branch}", file=sys.stderr)
     print(f"{sep}\n", file=sys.stderr)

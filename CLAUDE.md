@@ -127,19 +127,26 @@ Each loop session receives **both** the original plan (full context) and the tas
 
 1. On init: Claude decomposes the plan into atomic tasks (or uses existing checklist)
 2. Builds prompt = task progress checklist + current task details + original plan
-2. Runs Claude in a tmux window
-3. Claude works until it outputs `<task-completed/>`, `<task-failed/>`, or context exhausts
-4. On `<task-completed/>` → quality gate → commit → push → advance to next task
-5. On context exhaustion → commit partial WIP → restart same task with fresh context
-6. On `<task-failed/>` (3 attempts) → skip task, move on
-7. State is persisted in `LOOP-STATE.json` so loops survive interruptions
+3. Runs one headless Claude session (`claude -p`, 200 turns max) in a window of the `conductor-loop-<name>` tmux session
+4. Claude works until it outputs `<task-completed/>` or `<task-failed/>` on a line of its own, or the session ends without either (turn limit, crash)
+5. On `<task-completed/>` → commit all changes in the worktree → advance to the next task
+6. On a session without a signal → commit partial work as `WIP: <task>` → restart the same task with fresh context
+7. If a pre-commit hook rejects a commit, the changes stay uncommitted and the next session's prompt quotes the hook output
+8. Each task gets 3 sessions; if it is still not committed after the third (`<task-failed/>`, no signal or rejected commits), it is marked failed and the loop moves on
+9. Sessions in which Claude never answered (expired login, unknown model, usage limit) don't count against the task; two in a row stop the loop, with the CLI's error in `LOOP-LOG.md`
+10. The loop ends `completed` only when every task is completed, otherwise `failed`
+11. State is persisted in `LOOP-STATE.json`, so resuming continues with the current task
+
+The loop runs no quality gate and pushes nothing: review the `loop-<name>` branch (or the project dir's branch with `--no-worktree`) and push it yourself.
+
+Pane logs are in the conductor dir's `logs/`; the per-session prompt and output files in `session/` are removed after each session.
 
 ### Key flags
 
 - `--no-worktree`: work directly in the project dir instead of creating a worktree
 - `--model`: override the Claude model (default: from preset or opus)
 - `--reset`: discard previous loop state and start fresh
-- `--preset`: quality gate preset (auto-detected if omitted)
+- `--preset`: preset supplying the default `model` and `worktrees_base` (auto-detected if omitted)
 
 ## Project Structure
 
