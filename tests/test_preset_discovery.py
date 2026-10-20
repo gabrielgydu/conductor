@@ -103,3 +103,37 @@ def test_loop_checks_the_preset_before_paying_for_plan_decomposition(repo, prese
 
     assert code == 1
     assert "local_ci_comand" in out
+
+
+def test_explicit_base_preset_is_not_overridden_by_detection(repo, presets_dir):
+    (repo / "backend").mkdir()
+    (repo / "frontend").mkdir()
+    (presets_dir / "myapp.toml").write_text(MATCHING)
+
+    out, _, code = run_main(["init", "--name", NAME, "--project-dir", str(repo), "--preset", "base"])
+
+    assert code == 0
+    assert "Preset:  base" in out
+    assert _saved_preset(repo) == "base"
+
+
+def test_init_on_an_existing_project_reports_and_switches_the_saved_preset(repo, presets_dir):
+    run_main(["init", "--name", NAME, "--project-dir", str(repo)])  # nothing to detect: base
+    (repo / "backend").mkdir()
+    (repo / "frontend").mkdir()
+    (presets_dir / "myapp.toml").write_text(MATCHING)
+
+    out, err, _ = run_main(["init", "--name", NAME, "--project-dir", str(repo)])
+    assert "Preset:  base" in out and "--preset myapp" in err
+    assert _saved_preset(repo) == "base"
+
+    out, _, code = run_main(["init", "--name", NAME, "--project-dir", str(repo), "--preset", "myapp"])
+    assert code == 0
+    assert _saved_preset(repo) == "myapp"
+
+
+def _saved_preset(repo) -> str | None:
+    from conductor.core.models import ConductorState
+
+    path = StorageResolver(repo).conductor_state(NAME)
+    return ConductorState.model_validate_json(path.read_text()).preset

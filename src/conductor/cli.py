@@ -343,12 +343,10 @@ def _cmd_init(args, *, next_steps: bool = True):
         args.base_branch = _detect_git_branch(args.project_dir)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    explicit_preset = getattr(args, "preset", None)
+    preset_name = _resolve_preset(explicit_preset, repo_path)
     conductor_dir = storage.conductor_dir(args.name)
     conductor_dir.mkdir(parents=True, exist_ok=True)
-
-    # Detect or validate preset ("base" is the parser default, so it also means "detect")
-    preset_name = getattr(args, "preset", None)
-    preset_name = _resolve_preset(None if preset_name == "base" else preset_name, repo_path)
 
     brief_path = storage.conductor_brief(args.name)
     if not brief_path.exists():
@@ -370,6 +368,20 @@ def _cmd_init(args, *, next_steps: bool = True):
             preset=preset_name,
         )
         atomic_save(state, state_path)
+    else:
+        state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        if explicit_preset is not None and state.preset != preset_name:
+            _lock_project(storage, args.name, "init")
+            print(f"Switching preset: {state.preset} -> {preset_name}", file=sys.stderr)
+            state.preset = preset_name
+            atomic_save(state, state_path)
+        elif state.preset != preset_name:
+            print(
+                f"Note: detected preset '{preset_name}', but this project keeps '{state.preset}'. "
+                f"Pass --preset {preset_name} to switch.",
+                file=sys.stderr,
+            )
+            preset_name = state.preset
 
     print(f"Initialized conductor project: {args.name}")
     print(f"  Storage: {conductor_dir}")
@@ -1543,7 +1555,7 @@ def main():
     p_init = subparsers.add_parser("init", help="Initialize a new conductor project")
     _add_common(p_init)
     p_init.add_argument("--base-branch", default=None)
-    p_init.add_argument("--preset", default="base")
+    p_init.add_argument("--preset", default=None, help="Preset name or .toml path (default: auto-detected, else base)")
 
     p_plan = subparsers.add_parser("plan", help="Generate a plan via Claude")
     _add_common(p_plan)
@@ -1556,7 +1568,7 @@ def main():
     p_go = subparsers.add_parser("go", help="One-shot resumable: init → plan → run")
     _add_common(p_go)
     p_go.add_argument("--plan", default=None, help="Path to brief/plan file (required on first run)")
-    p_go.add_argument("--preset", default="base", help="Preset name (default: base, auto-detected)")
+    p_go.add_argument("--preset", default=None, help="Preset name or .toml path (default: auto-detected, else base)")
     p_go.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_go.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
     p_go.add_argument("--overnight", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op

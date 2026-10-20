@@ -70,7 +70,7 @@ conductor status --name <name> --project-dir <path>
 ### Key flags
 
 - `--plan`: path to brief file (required on first run when brief is empty)
-- `--preset`: preset name (default: base, auto-detected)
+- `--preset`: preset name (auto-detected if omitted; `--preset base` opts out of a detected preset)
 - `--base-branch`: base branch (auto-detected if omitted)
 - `--quick` / `--no-quick`: quick mode is turned on when `go` plans the project; on resume the saved setting is kept unless one of these flags is given
 - `--max-parallel`: the saved setting, 1 (sequential runs) for a new project
