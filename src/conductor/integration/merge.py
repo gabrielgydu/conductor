@@ -17,7 +17,11 @@ from conductor.core.models import (
     IntegrationState,
     RunState,
 )
-from conductor.core.validation import ValidationContext, validate_and_fix
+from conductor.core.validation import (
+    ValidationContext,
+    commit_validation_fixes,
+    validate_and_fix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -357,9 +361,7 @@ async def run_integration_merge(
             has_partial = True
             merged_runs.append(run)
 
-    # --- Push ---
-    _print(f"Merged {len(merged_runs)} runs, pushing {branch_name}")
-    await _run_git(["push", "origin", branch_name], wt)
+    _print(f"Merged {len(merged_runs)} runs")
 
     # --- Post-merge validation with self-healing ---
     # The smoke check writes tests/Playwright/tests/conductor-smoke.spec.ts itself
@@ -378,19 +380,30 @@ async def run_integration_merge(
         logger.info("Post-merge validation passed: %s", validation_msg)
     else:
         logger.error("Post-merge validation FAILED: %s", validation_msg)
+    # The fix sessions only edit the worktree; the branch and PR get what is committed.
+    if vresult.fix_attempts and await commit_validation_fixes(
+        wt,
+        f"Apply post-merge validation fixes\n\n{validation_msg}",
+        keep_untracked=vresult.untracked_before_fix,
+    ):
+        _print("Committed post-merge validation fixes")
 
     # --- Integration tests ---
     from conductor.integration.e2e import run_integration_testing
 
     e2e_result = await run_integration_testing(state, storage, wt)
 
-    # Commit and push any generated test files
+    # Commit any generated test files
     await _run_git(["add", "tests/Playwright/tests/conductor-*.spec.ts"], wt)
-    rc_commit, _, _ = await _run_git(
+    await _run_git(
         ["commit", "-m", "Add conductor integration & smoke tests", "--no-verify"], wt
     )
-    if rc_commit == 0:
-        await _run_git(["push", "origin", branch_name], wt)
+
+    # --- Push (once, after every commit above) ---
+    _print(f"Pushing {branch_name}")
+    rc, _, err = await _run_git(["push", "origin", branch_name], wt)
+    if rc != 0:
+        logger.error("Pushing %s failed: %s", branch_name, err.strip())
 
     # --- PR ---
     pr_url: str | None = None

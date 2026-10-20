@@ -10,8 +10,9 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from conductor.core.claude import run_claude
@@ -48,6 +49,10 @@ class ValidationResult:
     passed: bool
     checks: list[CheckResult] = field(default_factory=list)
     summary: str = ""
+    # Set by validate_and_fix: Claude fix sessions run, and the untracked files
+    # that existed before the first one (commit_validation_fixes leaves them out).
+    fix_attempts: int = 0
+    untracked_before_fix: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +77,84 @@ async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]
         "utf-8", errors="replace"
     )
     return proc.returncode or 0, combined[-2000:]
+
+
+async def _git(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run git, return (exit_code, stdout + stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd),
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, (stdout + stderr).decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Committing fixes
+# ---------------------------------------------------------------------------
+
+# Untracked paths that are output of the checks themselves (reports, builds,
+# caches) or may hold secrets. commit_validation_fixes never stages them.
+_CHECK_OUTPUT_DIRS = frozenset({
+    "node_modules", "test-results", "playwright-report", "blob-report", "coverage",
+    "dist", "build", "__pycache__", ".pytest_cache", ".phpunit.cache", ".cache",
+})
+
+
+def _is_check_output(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    name = parts[-1]
+    return (
+        any(part in _CHECK_OUTPUT_DIRS for part in parts[:-1])
+        or name.startswith(".env")
+        or name.endswith((".log", ".result.cache"))
+    )
+
+
+async def untracked_files(project_dir: Path) -> set[str]:
+    """Untracked, non-ignored files in *project_dir*, relative to it."""
+    rc, out = await _git(["ls-files", "--others", "--exclude-standard", "-z"], project_dir)
+    if rc != 0:
+        return set()
+    return {p for p in out.split("\0") if p}
+
+
+async def commit_validation_fixes(
+    project_dir: Path,
+    message: str,
+    *,
+    keep_untracked: Collection[str] = (),
+) -> bool:
+    """Commit what validate_and_fix's Claude sessions changed in *project_dir*.
+
+    Stages tracked modifications plus the untracked files that are new, i.e.
+    not in *keep_untracked* (pass ValidationResult.untracked_before_fix) and
+    not check output (_is_check_output). Hooks are bypassed (--no-verify), as
+    for every commit conductor makes outside the runner: validation has just
+    run the project's checks on this tree, and a hook that needs tooling the
+    worktree lacks (husky without node_modules) must not strand the fix.
+
+    Returns True when a commit was made.
+    """
+    await _git(["add", "-u"], project_dir)
+    new_files = sorted(
+        p
+        for p in await untracked_files(project_dir)
+        if p not in keep_untracked and not _is_check_output(p)
+    )
+    if new_files:
+        await _git(["add", "--", *new_files], project_dir)
+    rc, _ = await _git(["diff", "--cached", "--quiet"], project_dir)
+    if rc == 0:
+        return False  # the fix sessions changed nothing committable
+    rc, out = await _git(["commit", "--no-verify", "-m", message], project_dir)
+    if rc != 0:
+        logger.error("Committing validation fixes in %s failed: %s", project_dir, out.strip())
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +454,13 @@ async def validate_and_fix(
 ) -> ValidationResult:
     """Run validation, and if it fails, ask Claude to fix the code, then retry.
 
-    Loops up to *max_attempts* times. Returns the final ValidationResult.
+    Loops up to *max_attempts* times. Returns the final ValidationResult. The
+    fixes are left uncommitted; callers commit them with
+    commit_validation_fixes when result.fix_attempts > 0.
     """
     result = await run_validation(ctx)
+    fix_attempts = 0
+    untracked_before: frozenset[str] = frozenset()
 
     for attempt in range(1, max_attempts + 1):
         if result.passed:
@@ -383,7 +470,7 @@ async def validate_and_fix(
                 max_attempts,
                 result.summary,
             )
-            return result
+            break
 
         logger.warning(
             "Validation failed on attempt %d/%d: %s",
@@ -410,6 +497,8 @@ async def validate_and_fix(
             f"Attempt: {attempt}/{max_attempts}\n"
         )
 
+        if fix_attempts == 0:
+            untracked_before = frozenset(await untracked_files(ctx.project_dir))
         logger.info(
             "Asking Claude to fix failures (attempt %d/%d)…", attempt, max_attempts
         )
@@ -419,7 +508,10 @@ async def validate_and_fix(
             max_turns=30,
             cwd=str(ctx.project_dir),
         )
+        fix_attempts += 1
 
         result = await run_validation(ctx)
 
+    result.fix_attempts = fix_attempts
+    result.untracked_before_fix = untracked_before
     return result

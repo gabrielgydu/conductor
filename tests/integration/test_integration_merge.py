@@ -386,3 +386,51 @@ async def test_validation_failure_marks_needs_fix(
 
     assert result.status == IntegrationStatus.NEEDS_FIX
     assert result.merged_runs == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Fixes made by post-merge validation reach the integration branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermetic_merge):
+    """Claude's fix sessions edit the worktree; the branch must carry the fix."""
+    from conductor.core.validation import ValidationResult
+
+    real_merge_repo.create_branch("fx-a", {"app.txt": "broken\n"})
+    real_merge_repo.create_branch("fx-b", {"other.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "fx-a"),
+        _done_run_with_branch(1, "feat-b", "fx-b"),
+    )
+
+    async def validate_with_fix(vctx, max_attempts):
+        (vctx.project_dir / "app.txt").write_text("fixed\n")
+        (vctx.project_dir / "helper.txt").write_text("added by the fix\n")
+        return ValidationResult(passed=True, summary="1/1 checks passed", fix_attempts=1)
+
+    hermetic_merge.validate.side_effect = validate_with_fix
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    branch_name = f"integration/{project_name}"
+
+    def show(path: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(real_merge_repo.path), "show", f"{branch_name}:{path}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    assert show("app.txt") == "fixed\n"
+    assert show("helper.txt") == "added by the fix\n"
