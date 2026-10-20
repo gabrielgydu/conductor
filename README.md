@@ -78,7 +78,7 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 | Command | Description |
 |---------|-------------|
 | `conductor init --name <name>` | Create a project with feature brief template |
-| `conductor plan --name <name>` | Generate run plan via Claude Opus |
+| `conductor plan --name <name> [--force]` | Generate run plan via Claude Opus (`--force` re-plans a project whose runs have started) |
 | `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N]` | Execute the orchestration loop |
 | `conductor status --name <name>` | Show run/stage status table |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |

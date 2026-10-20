@@ -561,11 +561,34 @@ def _run_completeness_review(
 
 def _cmd_plan(args, *, next_steps: bool = True):
     """Generate a plan using Claude."""
-    if args.base_branch is None:
-        args.base_branch = _detect_git_branch(args.project_dir)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
     _lock_project(storage, args.name, "plan")
+
+    state_path = storage.conductor_state(args.name)
+    existing = (
+        ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        if state_path.exists()
+        else None
+    )
+    # Re-planning replaces the runs, and with them the only record of their
+    # worktrees, branches and integration PR. Refuse before spending a Claude call.
+    if existing is not None and not getattr(args, "force", False):
+        started = [
+            r.name for r in existing.runs
+            if r.status != RunStatus.PENDING or any(s.worktree or s.branch for s in r.stages)
+        ]
+        if started or existing.integration is not None:
+            print(
+                f"Error: '{args.name}' already has started runs "
+                f"({', '.join(started) or 'integration'}); re-planning would drop their "
+                "worktrees, branches and integration from state."
+            )
+            print(f"  Run `conductor cleanup --name {args.name}` first, then re-plan with --force.")
+            sys.exit(1)
+    if args.base_branch is None:
+        # The base chosen at init stands; only a new project uses the checked-out branch.
+        args.base_branch = existing.base_branch if existing else _detect_git_branch(args.project_dir)
 
     brief_path = storage.conductor_brief(args.name)
     if not brief_path.exists():
@@ -587,15 +610,7 @@ def _cmd_plan(args, *, next_steps: bool = True):
     # Build context with file listing and brief
     file_listing = _generate_file_listing(repo_path)
 
-    # Load existing state to get preset info
-    state_path = storage.conductor_state(args.name)
-    preset_info = ""
-    if state_path.exists():
-        existing_state = ConductorState.model_validate_json(
-            state_path.read_text(encoding="utf-8")
-        )
-        if hasattr(existing_state, "preset") and existing_state.preset:
-            preset_info = f"\n## Preset: {existing_state.preset}\n"
+    preset_info = f"\n## Preset: {existing.preset}\n" if existing and existing.preset else ""
 
     context = (
         f"## Feature Brief\n{brief_content}\n\n"
@@ -686,22 +701,14 @@ def _cmd_plan(args, *, next_steps: bool = True):
                 desc_file = conductor_dir / f"description-{desc_key}.md"
                 desc_file.write_text(desc_content, encoding="utf-8")
 
-    # Build and save state
-    state = ConductorState(
-        project_name=args.name,
-        base_branch=args.base_branch,
-        runs=runs,
-    )
-    # Preserve preset from existing state
-    if state_path.exists():
-        existing = ConductorState.model_validate_json(
-            state_path.read_text(encoding="utf-8")
+    # Build and save state. Project settings (preset, overnight, quick, ...)
+    # carry over; the integration belonged to the old runs.
+    if existing is not None:
+        state = existing.model_copy(
+            update={"base_branch": args.base_branch, "runs": runs, "integration": None}
         )
-        if hasattr(existing, "preset"):
-            state.preset = existing.preset
-        if hasattr(existing, "overnight"):
-            state.overnight = existing.overnight
-
+    else:
+        state = ConductorState(project_name=args.name, base_branch=args.base_branch, runs=runs)
     atomic_save(state, state_path)
 
     # Print summary table
@@ -769,7 +776,7 @@ def _cmd_go(args):
         if plan_text is not None and plan_text != brief_text:
             print(
                 f"Warning: --plan ignored: '{args.name}' is already planned ({len(existing.runs)} runs). "
-                f"To re-plan, run `conductor plan --name {args.name}`.",
+                f"To re-plan, run `conductor plan --name {args.name} --force`.",
                 file=sys.stderr,
             )
     elif plan_text is not None:
@@ -1447,7 +1454,11 @@ def main():
 
     p_plan = subparsers.add_parser("plan", help="Generate a plan via Claude")
     _add_common(p_plan)
-    p_plan.add_argument("--base-branch", default=None)
+    p_plan.add_argument("--base-branch", default=None, help="Base branch (default: the project's, else the checked-out branch)")
+    p_plan.add_argument(
+        "--force", action="store_true",
+        help="Re-plan even though runs have started (their worktrees and branches drop out of state)",
+    )
 
     p_go = subparsers.add_parser("go", help="One-shot resumable: init → plan → run")
     _add_common(p_go)
