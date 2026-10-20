@@ -450,11 +450,43 @@ def presets_dir() -> Path:
     return conductor_home() / "presets"
 
 
+def _main_worktree(project_dir: Path) -> Path | None:
+    """The main checkout of the repository, when *project_dir* is a linked worktree."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 2:
+        return None
+    git_dir, common_dir = Path(lines[0]), Path(lines[1])
+    if git_dir == common_dir or common_dir.name != ".git":
+        return None  # the main checkout itself, or a bare repository (which has none)
+    return common_dir.parent
+
+
 def _project_preset_file(project_dir: Path | str | None) -> Path | None:
+    """``.conductor/preset.toml`` of *project_dir*, else of its main checkout.
+
+    Stage and integration worktrees only contain tracked files, so an
+    uncommitted project preset exists only in the main checkout, which is
+    where ``init`` detected it. A copy inside the worktree itself still wins.
+    """
     if project_dir is None:
         return None
     candidate = Path(project_dir) / PROJECT_PRESET_FILE
-    return candidate if candidate.is_file() else None
+    if candidate.is_file():
+        return candidate
+    main = _main_worktree(Path(project_dir))
+    if main is not None and (main / PROJECT_PRESET_FILE).is_file():
+        return main / PROJECT_PRESET_FILE
+    return None
 
 
 def _user_presets() -> list[Path]:
