@@ -359,3 +359,63 @@ def test_exit_file_poll_targets_tmux_windows_exactly(tmp_path, monkeypatch):
 
     targets = [cmd[cmd.index("-t") + 1] for cmd in calls]
     assert targets == ["=conductor-proj", "=conductor-proj:=run0:stage-0-exec"]
+
+
+# ---------------------------------------------------------------------------
+# Single-run push and PR
+# ---------------------------------------------------------------------------
+
+
+class _Proc:
+    def __init__(self, rc: int, out: str = "", err: str = "") -> None:
+        self.returncode = rc
+        self._out, self._err = out.encode(), err.encode()
+
+    async def communicate(self):
+        return self._out, self._err
+
+
+def _fake_exec(monkeypatch, results: dict[str, list[_Proc]]):
+    calls: list[tuple] = []
+
+    async def exec_(*cmd, **kwargs):
+        calls.append(cmd)
+        return results[cmd[0]].pop(0)
+
+    monkeypatch.setattr(orch.asyncio, "create_subprocess_exec", exec_)
+    monkeypatch.setattr(orch.asyncio, "sleep", AsyncMock())
+    return calls
+
+
+def _single_run():
+    return RunState(index=0, name="feat", description="d", stages=[])
+
+
+@pytest.mark.asyncio
+async def test_pr_creation_failure_is_an_error_not_a_pr(monkeypatch, tmp_path):
+    _fake_exec(monkeypatch, {"git": [_Proc(0)], "gh": [_Proc(1, err="HTTP 502")] * 3})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="gh pr create failed"):
+        await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+
+
+@pytest.mark.asyncio
+async def test_failed_push_is_an_error(monkeypatch, tmp_path):
+    calls = _fake_exec(monkeypatch, {"git": [_Proc(1, err="no such remote 'origin'")]})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="no such remote"):
+        await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+    assert [c[0] for c in calls] == ["git"]
+
+
+@pytest.mark.asyncio
+async def test_existing_pr_for_the_branch_counts_as_created(monkeypatch, tmp_path):
+    err = 'a pull request for branch "b" into branch "main" already exists:\nhttps://github.com/o/r/pull/7'
+    _fake_exec(monkeypatch, {"git": [_Proc(0)], "gh": [_Proc(1, err=err)]})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    url = await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+
+    assert url == "https://github.com/o/r/pull/7"

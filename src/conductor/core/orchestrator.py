@@ -76,25 +76,30 @@ async def _push_and_pr_for_branch(
     project_name: str,
     run: "RunState",
     storage: "StorageResolver",
-) -> str | None:
-    """Push a branch to origin and create a non-draft PR. Returns PR URL or None."""
-    import logging
+) -> str:
+    """Push a branch to origin and open a non-draft PR; return the PR URL.
 
-    logger = logging.getLogger(__name__)
+    Raises RuntimeError when the push or the PR creation fails, so the
+    caller never reports a PR that does not exist. A PR that already exists
+    for the branch (a resumed run) counts as success.
+    """
     project_dir = Path(storage.repo_root)
 
-    # Push
     proc = await asyncio.create_subprocess_exec(
         "git", "push", "-u", "origin", branch,
         cwd=str(project_dir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
+    _, push_err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git push -u origin {branch} failed: {push_err.decode(errors='replace').strip()[-500:]}"
+        )
 
     # Create PR with retry
-    pr_url: str | None = None
     title = f"{run.name}: {run.description[:60]}" if run.description else run.name
+    error = ""
     for attempt in range(3):
         proc = await asyncio.create_subprocess_exec(
             "gh", "pr", "create",
@@ -108,17 +113,14 @@ async def _push_and_pr_for_branch(
         )
         stdout_bytes, stderr_bytes = await proc.communicate()
         if proc.returncode == 0:
-            pr_url = stdout_bytes.decode().strip()
-            break
-        logger.warning(
-            "gh pr create attempt %d failed: %s",
-            attempt + 1,
-            stderr_bytes.decode().strip(),
-        )
+            return stdout_bytes.decode().strip()
+        error = stderr_bytes.decode(errors="replace").strip()
+        existing = re.search(r"already exists:?\s*(https?://\S+)", error)
+        if existing:
+            return existing.group(1)
         if attempt < 2:
             await asyncio.sleep(5)
-
-    return pr_url
+    raise RuntimeError(f"gh pr create failed after 3 attempts: {error[-500:]}")
 
 
 # ---------------------------------------------------------------------------
@@ -3359,7 +3361,7 @@ async def conductor_run_loop(
                     atomic_save(state, storage.conductor_state(state.project_name))
                     _log(
                         "CONDUCTOR_EXIT",
-                        f"Single-run PR created: {pr_url or 'no URL'}",
+                        f"Single-run PR: {pr_url}",
                         log_path,
                         audit_path,
                     )
