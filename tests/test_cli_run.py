@@ -103,7 +103,7 @@ def fake_plan(monkeypatch):
     """Replace _cmd_plan with one that saves a single-run plan without Claude."""
     import conductor.cli as cli
 
-    def plan(args):
+    def plan(args, **kwargs):
         path = StorageResolver(Path(args.project_dir)).conductor_state(args.name)
         state = ConductorState.model_validate_json(path.read_text(encoding="utf-8"))
         state.runs = [make_run_state(0, "r0")]

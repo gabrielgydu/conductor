@@ -310,7 +310,14 @@ def _unlock_project(storage: StorageResolver, name: str) -> None:
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 
-def _cmd_init(args):
+def _brief_has_content(text: str) -> bool:
+    """True when a brief says more than the init template's headings and comments."""
+    stripped = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    stripped = re.sub(r"^#+\s.*$", "", stripped, flags=re.MULTILINE)
+    return len(stripped.strip()) >= 20
+
+
+def _cmd_init(args, *, next_steps: bool = True):
     """Initialize a new conductor project."""
     _validate_name(args.name)
     if args.base_branch is None:
@@ -362,8 +369,9 @@ def _cmd_init(args):
     print(f"Initialized conductor project: {args.name}")
     print(f"  Storage: {conductor_dir}")
     print(f"  Preset:  {preset_name}")
-    print(f"  Fill in: {brief_path}")
-    print(f"  Then run: conductor plan --name {args.name}")
+    if next_steps:
+        print(f"  Fill in: {brief_path}")
+        print(f"  Then run: conductor plan --name {args.name}")
 
 
 def _parse_plan_output(output_text: str) -> tuple[list, dict[str, str]]:
@@ -551,7 +559,7 @@ def _run_completeness_review(
     return feedback
 
 
-def _cmd_plan(args):
+def _cmd_plan(args, *, next_steps: bool = True):
     """Generate a plan using Claude."""
     if args.base_branch is None:
         args.base_branch = _detect_git_branch(args.project_dir)
@@ -567,8 +575,11 @@ def _cmd_plan(args):
         sys.exit(1)
 
     brief_content = brief_path.read_text(encoding="utf-8")
-    if len(brief_content.strip()) < 20:
-        print("Error: FEATURE-BRIEF.md is too short. Fill it in before planning.")
+    if not _brief_has_content(brief_content):
+        print(
+            "Error: FEATURE-BRIEF.md has no content beyond the template headings "
+            f"(or under 20 characters). Fill it in before planning: {brief_path}"
+        )
         sys.exit(1)
 
     from conductor.core.claude import run_claude
@@ -707,7 +718,8 @@ def _cmd_plan(args):
                 print(f"     • {c}")
     print(f"{'─' * 60}")
     print(f"\nState saved to: {state_path}")
-    print(f"Review, then run: conductor run --name {args.name}")
+    if next_steps:
+        print(f"Review, then run: conductor run --name {args.name}")
 
 
 def _cmd_go(args):
@@ -728,48 +740,54 @@ def _cmd_go(args):
         print(msg, file=sys.stderr)
 
     has_state = state_path.exists()
-    def _brief_has_content(path: Path) -> bool:
-        if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8")
-        # Strip HTML comments, markdown headings, and whitespace to detect placeholder-only briefs
-        stripped = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-        stripped = re.sub(r"^#+\s.*$", "", stripped, flags=re.MULTILINE)
-        return len(stripped.strip()) > 20
+    existing = (
+        ConductorState.model_validate_json(state_path.read_text(encoding="utf-8")) if has_state else None
+    )
+    has_runs = bool(existing and existing.runs)
 
-    brief_populated = _brief_has_content(brief_path)
-    has_runs = False
-    if has_state:
-        existing = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
-        has_runs = bool(existing.runs)
-
-    # Phase 1: Init
-    if not has_state:
-        _phase(1, 3, "Initializing...")
-        _cmd_init(args)
-    else:
-        _phase(1, 3, "Initializing", skip=True)
-
-    # Copy brief from --plan if needed
-    if not brief_populated:
-        plan_file = getattr(args, "plan", None)
-        if not plan_file:
-            print("Error: Brief is empty and no --plan file provided.")
-            print(f"Either fill in {brief_path} or pass --plan <file>.")
-            sys.exit(1)
+    plan_text = None
+    plan_file = getattr(args, "plan", None)
+    if plan_file:
         plan_path = Path(plan_file)
         if not plan_path.is_absolute():
             plan_path = Path.cwd() / plan_path
         if not plan_path.exists():
             print(f"Error: Plan file not found: {plan_path}")
             sys.exit(1)
-        brief_path.write_text(plan_path.read_text(encoding="utf-8"), encoding="utf-8")
-        print(f"  Copied brief from {plan_path}", file=sys.stderr)
+        plan_text = plan_path.read_text(encoding="utf-8")
+
+    # Phase 1: Init
+    if not has_state:
+        _phase(1, 3, "Initializing...")
+        _cmd_init(args, next_steps=False)
+    else:
+        _phase(1, 3, "Initializing", skip=True)
+
+    brief_text = brief_path.read_text(encoding="utf-8") if brief_path.exists() else ""
+    if has_runs:
+        # A planned project resumes straight into the run; the brief has done its job.
+        if plan_text is not None and plan_text != brief_text:
+            print(
+                f"Warning: --plan ignored: '{args.name}' is already planned ({len(existing.runs)} runs). "
+                f"To re-plan, run `conductor plan --name {args.name}`.",
+                file=sys.stderr,
+            )
+    elif plan_text is not None:
+        # Nothing has been planned from the brief yet, so --plan replaces it.
+        if plan_text != brief_text:
+            if _brief_has_content(brief_text):
+                print(f"  Replacing the existing brief with {plan_path}", file=sys.stderr)
+            brief_path.write_text(plan_text, encoding="utf-8")
+            print(f"  Copied brief from {plan_path}", file=sys.stderr)
+    elif not _brief_has_content(brief_text):
+        print("Error: Brief is empty and no --plan file provided.")
+        print(f"Either fill in {brief_path} or pass --plan <file>.")
+        sys.exit(1)
 
     # Phase 2: Plan
     if not has_runs:
         _phase(2, 3, "Planning...")
-        _cmd_plan(args)
+        _cmd_plan(args, next_steps=False)
         # go turns quick mode on for a project it plans; on resume the saved
         # setting stands unless --quick/--no-quick is given.
         if args.quick is None:

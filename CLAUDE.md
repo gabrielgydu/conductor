@@ -63,9 +63,9 @@ conductor status --name <name> --project-dir <path>
 | Condition | Phases executed |
 |---|---|
 | No state | init → copy brief → plan → run |
-| State exists, brief is placeholder | copy brief → plan → run |
-| State exists, brief populated, no runs | plan → run |
-| State exists, runs populated | run only |
+| State exists, no runs, `--plan` given | copy brief (replacing the old one) → plan → run |
+| State exists, no runs, brief populated | plan → run |
+| State exists, runs populated | run only (a different `--plan` is ignored with a warning) |
 
 ### Key flags
 
