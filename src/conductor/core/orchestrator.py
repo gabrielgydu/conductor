@@ -2878,18 +2878,103 @@ async def conductor_post_run(
     _log("POST_RUN_END", "Post-run processing complete", log_path, audit_path)
 
 
+_LEARNINGS_HEADER = "## Conductor Learnings"
+_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "vendor", "__pycache__", "dist", "build"}
+LEARNINGS_TIMEOUT_S = 600.0
+
+
+def _claude_md_files(root: Path) -> list[Path]:
+    """Every CLAUDE.md in the tree (root, .claude/, subdirectories), once each."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        if "CLAUDE.md" in filenames:
+            found.append(Path(dirpath) / "CLAUDE.md")
+    return sorted(found)
+
+
+def _parse_learning_blocks(text: str) -> dict[str, str]:
+    """``<<<FILE: path>>> ... <<<END>>>`` blocks, merged per path, in order."""
+    blocks: dict[str, list[str]] = {}
+    for path, body in re.findall(r"<<<FILE:\s*(.+?)>>>(.*?)<<<END>>>", text, re.DOTALL):
+        body = body.strip()
+        if body:
+            blocks.setdefault(path.strip(), []).append(body)
+    return {path: "\n".join(bodies) for path, bodies in blocks.items()}
+
+
+def _with_learnings(existing: str, addition: str) -> str:
+    """*existing* CLAUDE.md text with *addition* in its Conductor Learnings section.
+
+    Lines already in the file are dropped, and an existing section is
+    extended instead of a second section being appended.
+    """
+    present = {line.strip() for line in existing.splitlines() if line.strip()}
+    present.add(_LEARNINGS_HEADER)
+    new_lines = [ln for ln in addition.splitlines() if ln.strip() and ln.strip() not in present]
+    if not new_lines:
+        return existing
+    lines = existing.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == _LEARNINGS_HEADER)
+    except StopIteration:
+        body = existing.rstrip("\n")
+        prefix = f"{body}\n\n" if body else ""
+        return f"{prefix}{_LEARNINGS_HEADER}\n\n" + "\n".join(new_lines) + "\n"
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines)
+    )
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    lines[end:end] = new_lines
+    return "\n".join(lines) + "\n"
+
+
+def _commit_paths(root: Path, rels: list[str], message: str) -> bool:
+    """Commit just *rels* in the git checkout at *root*; False if git refused."""
+    for cmd in (["git", "add", "--", *rels], ["git", "commit", "-q", "-m", message, "--", *rels]):
+        if subprocess.run(cmd, cwd=root, capture_output=True, text=True).returncode != 0:
+            return False
+    return True
+
+
+def _learnings_target(state: ConductorState) -> tuple[RunState, Path] | None:
+    """Worktree of the most recently finished run: its branch carries the edits."""
+    done = [
+        r for r in state.runs
+        if r.status == RunStatus.DONE and r.stages and r.stages[-1].worktree
+        and Path(r.stages[-1].worktree).is_dir()
+    ]
+    if not done:
+        return None
+    min_ts = datetime.min.replace(tzinfo=timezone.utc)
+    run = max(done, key=lambda r: r.stages[-1].completed_at or min_ts)
+    return run, Path(run.stages[-1].worktree)
+
+
 async def _review_learnings(
     state: ConductorState,
     storage: StorageResolver,
     log_path: Path | None = None,
     audit_path: Path | None = None,
+    *,
+    force: bool = False,
 ) -> None:
-    """Collect LEARNINGS.md files from worktrees and review for CLAUDE.md updates."""
+    """Fold the runs' LEARNINGS.md into the project's CLAUDE.md files.
+
+    The edits are made in the worktree of the most recently finished run and
+    committed on its branch, never in the user's own checkout. Only existing
+    CLAUDE.md files inside that worktree can be edited (or a root CLAUDE.md
+    created when there is none). An unchanged set of learnings is reviewed
+    once, unless *force*.
+    """
+    import hashlib as _hashlib
+
     _log("POST_RUN", "Reviewing learnings for CLAUDE.md updates", log_path, audit_path)
 
     learnings_parts: list[str] = []
     for run in state.runs:
-        for i, stage in enumerate(run.stages):
+        for stage in run.stages:
             wt = stage.worktree
             if not wt or not Path(wt).is_dir():
                 continue
@@ -2903,129 +2988,82 @@ async def _review_learnings(
     if not learnings_parts:
         _log("POST_RUN", "No learnings found — skipping review", log_path, audit_path)
         return
+    digest = _hashlib.sha256("\n\n".join(learnings_parts).encode()).hexdigest()
+    if state.learnings_reviewed == digest and not force:
+        _log("POST_RUN", "Learnings unchanged since the last review — skipping", log_path, audit_path)
+        return
+    target = _learnings_target(state)
+    if target is None:
+        _log("POST_RUN", "No finished run worktree to record learnings in — skipping",
+             log_path, audit_path)
+        return
+    target_run, root = target
+    root = root.resolve()
 
-    # Collect CLAUDE.md files
-    import glob as _glob
-
-    project_dir = str(storage.repo_root)
-    claude_md_files = _glob.glob(f"{project_dir}/**/.claude/CLAUDE.md", recursive=True)
-    claude_md_files += _glob.glob(f"{project_dir}/.claude/CLAUDE.md")
-    claude_md_files = [
-        f for f in claude_md_files if "node_modules" not in f and "/.git/" not in f
-    ]
-
-    if claude_md_files:
-        claudemd_parts: list[str] = []
-        for f in claude_md_files:
-            rel = f.replace(project_dir + "/", "")
-            claudemd_parts.append(
-                f"### FILE: {rel}\n{Path(f).read_text(encoding='utf-8')}"
-            )
-        claudemd_section = "\n\n".join(claudemd_parts)
+    existing = _claude_md_files(root)
+    if existing:
+        claudemd_section = "\n\n".join(
+            f"### FILE: {p.relative_to(root)}\n{p.read_text(encoding='utf-8')}" for p in existing
+        )
     else:
-        claudemd_section = "(No CLAUDE.md files exist yet — create .claude/CLAUDE.md if learnings warrant it)"
-
-    prompt = (
-        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
-        "Tool calls will be REJECTED and will waste your only turn.\n\n"
-        "Review the learnings below from completed conductor runs. "
-        "Extract project-specific conventions, patterns, and gotchas that would help "
-        "future Claude sessions working on this codebase. "
-        "Output CLAUDE.md updates using this format:\n\n"
-        "<<<FILE: .claude/CLAUDE.md>>>\n"
-        "content to append or create\n"
-        "<<<END>>>\n\n"
-        "If no learnings are worth persisting, respond with <<<NO_CHANGES>>>.\n"
-        "Only include actionable, project-specific insights — not generic advice.\n\n"
-        + "## Learnings from Completed Run(s)\n\n"
+        claudemd_section = (
+            "(No CLAUDE.md files exist yet. You may create one at the repository "
+            "root: use the path CLAUDE.md.)"
+        )
+    prompt = brain.render_prompt(
+        "review-learnings",
+        "## Learnings from Completed Run(s)\n\n"
         + "\n\n".join(learnings_parts)
         + "\n\n## Existing CLAUDE.md Files\n\n"
-        + claudemd_section
+        + claudemd_section,
     )
-
-    result = await run_claude(prompt, model=resolve_model("sonnet"), max_turns=1)
-
-    import json as _json
-
-    response_text = ""
-    for line in result.output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = _json.loads(line)
-        except _json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "assistant":
-            content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        response_text = block.get("text", "")
-                        break
-            elif isinstance(content, str):
-                response_text = content
-            if response_text:
-                break
-
-    if not response_text:
-        _log(
-            "POST_RUN",
-            "Learnings review: empty response from Claude",
-            log_path,
-            audit_path,
-        )
+    reply = await brain.ask(prompt, model=resolve_model("sonnet"), timeout_s=LEARNINGS_TIMEOUT_S)
+    if not reply.ok:
+        _log("POST_RUN", f"Learnings review failed: {reply.detail}", log_path, audit_path)
         return
 
-    if "<<<NO_CHANGES>>>" in response_text:
+    allowed = set(existing) or {root / "CLAUDE.md"}
+    changed: list[Path] = []
+    for rel, addition in _parse_learning_blocks(reply.text).items():
+        candidate = Path(rel)
+        target_file = (candidate if candidate.is_absolute() else root / candidate).resolve()
+        if target_file not in allowed:
+            _log(
+                "POST_RUN",
+                f"Learnings review: ignoring {rel} (not an existing CLAUDE.md in the project)",
+                log_path,
+                audit_path,
+                file=rel,
+            )
+            continue
+        before = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
+        after = _with_learnings(before, addition)
+        if after != before:
+            target_file.write_text(after, encoding="utf-8")
+            changed.append(target_file)
+
+    state.learnings_reviewed = digest
+    atomic_save(state, storage.conductor_state(state.project_name))
+    if not changed:
         _log("POST_RUN", "Learnings review: no changes needed", log_path, audit_path)
         return
 
-    # Parse and apply <<<FILE: path>>> ... <<<END>>> blocks
-    updates_applied = 0
-    for file_path in re.findall(r"<<<FILE:\s*([^>]+)>>>", response_text):
-        file_path = file_path.strip()
-        full_path = Path(project_dir) / file_path
-        content_match = re.search(
-            rf"<<<FILE:\s*{re.escape(file_path)}\s*>>>(.*?)<<<END>>>",
-            response_text,
-            re.DOTALL,
-        )
-        if content_match:
-            addition = content_match.group(1).strip()
-            if addition:
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                if full_path.exists():
-                    with open(str(full_path), "a", encoding="utf-8") as fh:
-                        fh.write(f"\n## Conductor Learnings\n\n{addition}\n")
-                    _log(
-                        "POST_RUN",
-                        f"Updated {file_path} with learnings",
-                        log_path,
-                        audit_path,
-                        file=file_path,
-                    )
-                else:
-                    full_path.write_text(
-                        f"## Conductor Learnings\n\n{addition}\n", encoding="utf-8"
-                    )
-                    _log(
-                        "POST_RUN",
-                        f"Created {file_path} with learnings",
-                        log_path,
-                        audit_path,
-                        file=file_path,
-                    )
-                updates_applied += 1
-
+    rels = [str(p.relative_to(root)) for p in changed]
+    branch = target_run.stages[-1].branch or "(detached)"
+    committed = _commit_paths(root, rels, "Record conductor learnings in CLAUDE.md")
     _log(
         "POST_RUN",
-        f"Learnings review complete — {updates_applied} file(s) updated",
+        (
+            f"Learnings committed on {branch} ({', '.join(rels)}) in {root}; "
+            "push the branch to add them to its PR"
+            if committed
+            else f"Learnings written to {', '.join(rels)} in {root} but not committed"
+        ),
         log_path,
         audit_path,
-        updates_applied=updates_applied,
+        files=rels,
+        branch=branch,
+        committed=committed,
     )
 
 

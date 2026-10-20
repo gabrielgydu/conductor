@@ -10,7 +10,6 @@ Covers:
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -300,95 +299,43 @@ def test_runner_fail_log_matches_tmux_wrapper_naming(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _parse_learnings_blocks(response_text: str, project_dir: Path) -> dict[str, str]:
-    """Replicate the regex logic from _review_learnings for testing."""
-    updates: dict[str, str] = {}
-    for file_path in re.findall(r"<<<FILE:\s*([^>]+)>>>", response_text):
-        file_path = file_path.strip()
-        full_path = project_dir / file_path
-        if not full_path.exists():
-            continue
-        content_match = re.search(
-            rf"<<<FILE:\s*{re.escape(file_path)}\s*>>>(.*?)<<<END>>>",
-            response_text,
-            re.DOTALL,
-        )
-        if content_match:
-            addition = content_match.group(1).strip()
-            if addition:
-                updates[file_path] = addition
-    return updates
-
-
-def test_learnings_parsing_single_file(tmp_path):
-    claude_md = tmp_path / ".claude" / "CLAUDE.md"
-    claude_md.parent.mkdir(parents=True)
-    claude_md.write_text("# Existing content\n", encoding="utf-8")
-
+def test_learnings_parsing_single_file():
     response = "<<<FILE: .claude/CLAUDE.md>>>\nNew learning content here\n<<<END>>>\n"
 
-    updates = _parse_learnings_blocks(response, tmp_path)
+    assert orch._parse_learning_blocks(response) == {
+        ".claude/CLAUDE.md": "New learning content here"
+    }
 
-    assert ".claude/CLAUDE.md" in updates
-    assert "New learning content here" in updates[".claude/CLAUDE.md"]
 
-
-def test_learnings_parsing_multiple_files(tmp_path):
-    f1 = tmp_path / "a.md"
-    f2 = tmp_path / "b.md"
-    f1.write_text("existing a\n")
-    f2.write_text("existing b\n")
-
+def test_learnings_parsing_multiple_files():
     response = (
         "<<<FILE: a.md>>>\nLearning A\n<<<END>>>\n"
         "Some other text\n"
         "<<<FILE: b.md>>>\nLearning B\n<<<END>>>\n"
     )
 
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert "a.md" in updates
-    assert "b.md" in updates
-    assert updates["a.md"] == "Learning A"
-    assert updates["b.md"] == "Learning B"
+    assert orch._parse_learning_blocks(response) == {"a.md": "Learning A", "b.md": "Learning B"}
 
 
-def test_learnings_parsing_file_not_on_disk_skipped(tmp_path):
-    response = "<<<FILE: nonexistent.md>>>\nsome content\n<<<END>>>\n"
+def test_learnings_parsing_merges_repeated_blocks():
+    response = (
+        "<<<FILE: CLAUDE.md>>>\n- first\n<<<END>>>\n"
+        "<<<FILE: CLAUDE.md>>>\n- second\n<<<END>>>\n"
+    )
 
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert len(updates) == 0
-
-
-def test_learnings_parsing_no_changes_marker(tmp_path):
-    response = "<<<NO_CHANGES>>>"
-
-    assert "<<<NO_CHANGES>>>" in response
-    updates = _parse_learnings_blocks(response, tmp_path)
-    assert len(updates) == 0
+    assert orch._parse_learning_blocks(response) == {"CLAUDE.md": "- first\n- second"}
 
 
-def test_learnings_parsing_empty_block_skipped(tmp_path):
-    f = tmp_path / "empty.md"
-    f.write_text("existing\n")
-
-    response = "<<<FILE: empty.md>>>\n\n<<<END>>>\n"
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert "empty.md" not in updates
+def test_learnings_parsing_no_changes_and_empty_blocks():
+    assert orch._parse_learning_blocks("<<<NO_CHANGES>>>") == {}
+    assert orch._parse_learning_blocks("<<<FILE: empty.md>>>\n\n<<<END>>>\n") == {}
 
 
-def test_learnings_parsing_multiline_content(tmp_path):
-    f = tmp_path / "multi.md"
-    f.write_text("existing\n")
+def test_learnings_extend_the_existing_section_without_repeating_lines():
+    existing = "# Project\n\n## Conductor Learnings\n\n- rule A\n\n## Other\n\ntext\n"
 
-    response = "<<<FILE: multi.md>>>\nLine 1\nLine 2\nLine 3\n<<<END>>>\n"
+    updated = orch._with_learnings(existing, "## Conductor Learnings\n- rule A\n- rule B")
 
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert "multi.md" in updates
-    content = updates["multi.md"]
-    assert "Line 1" in content
-    assert "Line 2" in content
-    assert "Line 3" in content
+    assert updated.count("## Conductor Learnings") == 1
+    assert updated.count("- rule A") == 1
+    assert updated.index("- rule B") < updated.index("## Other")
