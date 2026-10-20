@@ -1046,11 +1046,11 @@ def _is_read_only_command(command: str) -> bool:
     """True for a shell command that only searches or reads.
 
     Covers grep/rg/cat-style programs (also behind xargs) and read-only git
-    subcommands. Anything it cannot parse, any output redirection to a file
-    and any other program counts as not read-only.
+    subcommands. Anything it cannot parse, any output redirection to a file,
+    backtick substitution and any other program counts as not read-only.
     """
     tokens = _shell_tokens(command)
-    if tokens is None:
+    if tokens is None or any("`" in token for token in tokens):
         return False
 
     for index, token in enumerate(tokens):
@@ -1064,7 +1064,8 @@ def _is_read_only_command(command: str) -> bool:
 def _pipelines(tokens: list[str]) -> list[list[list[str]]]:
     """The pipelines in *tokens*, each a list of simple commands' words.
 
-    A redirection's target stays with its command.
+    A redirection's target stays with its command; a process substitution
+    (`<(...)`) is a command of its own.
     """
     pipelines: list[list[list[str]]] = [[[]]]
     for token in tokens:
@@ -1072,7 +1073,7 @@ def _pipelines(tokens: list[str]) -> list[list[list[str]]]:
             pipelines[-1][-1].append(token)
         elif token in ("|", "|&"):
             pipelines[-1].append([])
-        elif "<" not in token and ">" not in token:
+        elif "(" in token or ")" in token or ("<" not in token and ">" not in token):
             pipelines.append([[]])
     return [[words for words in pipeline if words] for pipeline in pipelines if any(pipeline)]
 

@@ -1348,6 +1348,9 @@ def test_read_only_command_detection():
         "sed -i s/a/b/ f",
         "echo 'unbalanced",
         "grep x\nmysql -e 'select 1'; php artisan tinker",
+        "cat <(mysql -e 'update t set f=1')",
+        "diff <(ls) <(mysql -e 'select 1')",
+        "cat `mysql -e 'update t set f=1'`",
     ]
 
     assert [cmd for cmd in read_only if not manual_test._is_read_only_command(cmd)] == []
