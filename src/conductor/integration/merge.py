@@ -104,6 +104,11 @@ def _get_conflicting_files(cwd: Path) -> list[str]:
     return [f for f in result.stdout.splitlines() if f.strip()]
 
 
+# Where the integration worktree went before integration_worktree_path, when
+# state.worktrees_base was unset.
+_LEGACY_WORKTREE_BASE = Path("/tmp")
+
+
 def integration_worktree_path(state: ConductorState, repo_root: Path) -> Path:
     """Integration worktree location, next to the run worktrees.
 
@@ -367,6 +372,11 @@ async def run_integration_merge(
 
     # --- Cleanup phase (ignore errors) ---
     await _run_git(["worktree", "remove", "--force", str(worktree_path)], repo_root)
+    if not state.worktrees_base:
+        # A worktree left at the old location, even one whose directory is
+        # gone, keeps the branch checked out: `branch -D` and the add would fail.
+        legacy = _LEGACY_WORKTREE_BASE / f"conductor-integration-{state.project_name}"
+        await _run_git(["worktree", "remove", "--force", str(legacy)], repo_root)
     await _run_git(["branch", "-D", branch_name], repo_root)
     await _run_git(["push", "origin", "--delete", branch_name], repo_root)
 

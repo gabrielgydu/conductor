@@ -989,3 +989,56 @@ async def test_node_modules_is_not_linked_where_git_would_commit_it(
     assert "fix.txt" in files
     assert not any(f.startswith("node_modules") for f in files)
     claude.assert_not_awaited()  # still no @playwright/test: generation skipped
+
+
+# ---------------------------------------------------------------------------
+# Test 16: A worktree at the pre-upgrade default location does not block
+# ---------------------------------------------------------------------------
+
+
+def _add_worktree(repo: Path, path: Path, new_branch: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(path), "-b", new_branch],
+        check=True,
+    )
+
+
+@pytest.mark.parametrize("vanished", [False, True], ids=["present", "dir-vanished"])
+@pytest.mark.asyncio
+async def test_worktree_at_the_old_default_location_is_removed(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch, vanished
+):
+    """Older versions put the worktree in /tmp/conductor-integration-<name>; one
+    left there kept integration/<name> checked out, so the re-run FAILED."""
+    import shutil
+
+    import conductor.integration.merge as merge_module
+
+    monkeypatch.setattr(merge_module, "_LEGACY_WORKTREE_BASE", tmp_path / "old-tmp")
+    real_merge_repo.create_branch("lg-a", {"lg_a.txt": "a\n"})
+    real_merge_repo.create_branch("lg-b", {"lg_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    legacy = tmp_path / "old-tmp" / f"conductor-integration-{project_name}"
+    _add_worktree(real_merge_repo.path, legacy, f"integration/{project_name}")
+    (legacy / "leftover.txt").write_text("check output\n")
+    if vanished:
+        shutil.rmtree(legacy)
+    state = ConductorState(
+        project_name=project_name,
+        base_branch="main",
+        runs=[
+            _done_run_with_branch(0, "feat-a", "lg-a"),
+            _done_run_with_branch(1, "feat-b", "lg-b"),
+        ],
+    )
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert result.merged_runs == [0, 1]
+    assert str(legacy) not in _worktree_list(real_merge_repo.path)
