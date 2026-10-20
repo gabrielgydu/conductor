@@ -84,7 +84,11 @@ def _run_window(script: str, cwd: str | None, log_file: Path | None) -> None:
 
 
 class BashTmux:
-    """Stands in for TmuxManager: runs each window's script to completion with bash."""
+    """Stands in for TmuxManager: runs each window's script to completion with bash.
+
+    A window is gone once its script has run, so a script that never writes
+    its exit file makes the loop record a crash instead of waiting forever.
+    """
 
     def __init__(self, session_name: str = "conductor") -> None:
         self.session_name = session_name
@@ -98,7 +102,7 @@ class BashTmux:
         _run_window(cmd, cwd, log_file)
 
     async def is_window_alive(self, name: str) -> bool:
-        return True
+        return False
 
     async def get_pane_pid(self, name: str) -> int | None:
         return None
@@ -148,6 +152,7 @@ def tmux(monkeypatch) -> list[BashTmux]:
         return created[-1]
 
     monkeypatch.setattr("conductor.core.tmux.TmuxManager", factory)
+    monkeypatch.setattr("conductor.core.loop._EXIT_POLL_SECS", 0)
     return created
 
 

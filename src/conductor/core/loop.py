@@ -346,6 +346,8 @@ def _log(event: str, message: str, log_path: Path | None, audit_path: Path | Non
 _ZOMBIE_SHALLOW_THRESHOLD = 3
 # Seconds with no new output before declaring stall (Claude stuck)
 _STALL_TIMEOUT_SECS = 1800  # 30 minutes
+# Seconds between checks while waiting for a session's exit file
+_EXIT_POLL_SECS = 15
 
 
 async def _wait_for_exit(
@@ -371,7 +373,7 @@ async def _wait_for_exit(
     last_output_size = 0
 
     while not exit_file.exists():
-        await asyncio.sleep(15)
+        await asyncio.sleep(_EXIT_POLL_SECS)
 
         # ---- window disappeared (crash, user killed it) ----
         if not await tmux.is_window_alive(window_name):
