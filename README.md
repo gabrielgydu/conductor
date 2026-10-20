@@ -82,7 +82,7 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 | `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N]` | Execute the orchestration loop |
 | `conductor status --name <name>` | Show run/stage status table |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |
-| `conductor cleanup --name <name>` | Remove worktrees and branches |
+| `conductor cleanup --name <name> [--force]` | Remove worktrees and branches; keeps uncommitted, unpushed or unmerged work unless `--force` |
 
 **Stage State Machine:**
 

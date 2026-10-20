@@ -1120,32 +1120,79 @@ def _cmd_cleanup(args):
     if _kill_stale_tmux_session(session_name):
         print(f"Killed stale tmux session: {session_name}")
 
-    wt_count = 0
-    branch_count = 0
+    repo = str(storage.repo_root)
+    force = getattr(args, "force", False)
 
+    def git(*cmd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *cmd], cwd=repo, capture_output=True, text=True)
+
+    def branch_exists(name: str) -> bool:
+        return git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}").returncode == 0
+
+    registered = {
+        line.split(" ", 1)[1]
+        for line in git("worktree", "list", "--porcelain").stdout.splitlines()
+        if line.startswith("worktree ")
+    }
+    stage_branches = {s.branch for r in state.runs for s in r.stages if s.branch}
+    # Commits reachable from a remote, the base branch or the integration
+    # branch survive deleting a stage branch; anything else would be lost.
+    safe_refs = [
+        f"refs/heads/{b}"
+        for b in (state.base_branch, state.integration.branch if state.integration else None)
+        if b and b not in stage_branches and branch_exists(b)
+    ]
+
+    removed: list[str] = []
+    deleted: list[str] = []
+    kept: list[str] = []  # unsaved work, left in place on purpose
+    failed: list[str] = []
     for run in state.runs:
         for stage in run.stages:
-            if stage.worktree and Path(stage.worktree).exists():
-                subprocess.run(
-                    ["git", "worktree", "remove", stage.worktree],
-                    cwd=str(repo_path),
-                    capture_output=True,
-                )
-                wt_count += 1
+            if stage.worktree:
+                wt = stage.worktree
+                if wt in registered or str(Path(wt).resolve()) in registered:
+                    r = git("worktree", "remove", *(["--force"] if force else []), wt)
+                    if r.returncode != 0:
+                        failed.append(f"worktree {wt}: {r.stderr.strip()}")
+                        continue  # its branch is still checked out there
+                    removed.append(wt)
+                    stage.worktree = None
+                elif Path(wt).exists():
+                    failed.append(f"worktree {wt}: not a registered git worktree; left in place")
+                else:
+                    stage.worktree = None  # already gone
             if stage.branch:
-                result = subprocess.run(
-                    ["git", "branch", "-D", stage.branch],
-                    cwd=str(repo_path),
-                    capture_output=True,
-                )
-                if result.returncode == 0:
-                    branch_count += 1
+                if not branch_exists(stage.branch):
+                    stage.branch = None
+                    continue
+                if not force:
+                    r = git("rev-list", "--count", stage.branch, "--not", "--remotes", *safe_refs, "--")
+                    unsaved = int(r.stdout.strip()) if r.returncode == 0 else None
+                    if unsaved != 0:
+                        why = f"{unsaved} commit(s)" if unsaved else "could not check its commits"
+                        kept.append(f"{stage.branch} ({why} on no remote, base or integration branch)")
+                        continue
+                r = git("branch", "-D", stage.branch)
+                if r.returncode != 0:
+                    failed.append(f"branch {stage.branch}: {r.stderr.strip()}")
+                    continue
+                deleted.append(stage.branch)
+                stage.branch = None
 
-    subprocess.run(
-        ["git", "worktree", "prune"], cwd=str(repo_path), capture_output=True
-    )
+    # Forget what is gone, so status/run/go don't trust stale paths.
+    atomic_save(state, state_path)
 
-    print(f"Cleaned up: {wt_count} worktrees, {branch_count} branches")
+    print(f"Removed {len(removed)} worktree(s), deleted {len(deleted)} branch(es).")
+    if kept:
+        print("Kept (use --force to delete unpushed/unmerged work):")
+        for item in kept:
+            print(f"  {item}")
+    if failed:
+        print("Failed:")
+        for item in failed:
+            print(f"  {item}")
+        sys.exit(1)
 
 
 def _cmd_learnings(args):
@@ -1602,7 +1649,11 @@ def main():
 
     p_cleanup = subparsers.add_parser("cleanup", help="Clean up worktrees and branches")
     _add_common(p_cleanup)
-    p_cleanup.add_argument("--force", action="store_true")
+    p_cleanup.add_argument(
+        "--force", action="store_true",
+        help="Also delete worktrees with uncommitted changes and branches whose commits "
+        "are on no remote, the base branch or the integration branch",
+    )
 
     p_learnings = subparsers.add_parser(
         "learnings", help="Review learnings and update CLAUDE.md"
