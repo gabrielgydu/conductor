@@ -15,6 +15,7 @@ import asyncio
 import datetime
 import json
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -569,7 +570,12 @@ async def run_phase_loop(
         log(f"Model: {cfg.model}")
 
     # Preflight check
-    preset = load_preset(cfg.preset, project_dir)
+    try:
+        preset = load_preset(cfg.preset, project_dir)
+    except (ValueError, OSError) as exc:
+        error(f"Cannot load preset {cfg.preset or 'base'!r}: {exc}")
+        _write_exit_code(feature_dir, 1)
+        return 1
     if not preset.preflight(project_dir):
         error("Preflight check failed — aborting")
         _write_exit_code(feature_dir, 1)
@@ -608,15 +614,22 @@ async def run_phase_loop(
             continue
 
         phase_start = time.monotonic()
-        phase_ok, phase_committed = await _run_phase(
-            phase=phase,
-            cfg=cfg,
-            project_dir=project_dir,
-            feature_dir=feature_dir,
-            log_dir=log_dir,
-            stats_path=stats_path,
-            preset=preset,
-        )
+        try:
+            phase_ok, phase_committed = await _run_phase(
+                phase=phase,
+                cfg=cfg,
+                project_dir=project_dir,
+                feature_dir=feature_dir,
+                log_dir=log_dir,
+                stats_path=stats_path,
+                preset=preset,
+            )
+        except Exception as exc:
+            # e.g. `git add` on a stale index.lock. Fail the phase instead of
+            # dying here, so teardown, the summary and exit_code still happen.
+            error(f"PHASE {phase.number} CRASHED — {type(exc).__name__}: {exc}")
+            log(dim(traceback.format_exc().rstrip()))
+            phase_ok, phase_committed = False, False
         phase_duration = time.monotonic() - phase_start
         if phase_committed:
             any_committed = True
@@ -649,21 +662,26 @@ async def run_phase_loop(
         from runner.local_checks import run_local_checks  # noqa: PLC0415
 
         header("END-OF-RUN LOCAL CHECKS (full)")
-        checks_ok = await run_local_checks(
-            project_dir,
-            cfg.feature_name,
-            ci_enabled=cfg.local_ci_enabled,
-            ci_command=cfg.local_ci_command,
-            ci_full_command=cfg.local_ci_full_command,
-            ci_max_retries=cfg.local_ci_max_retries,
-            review_enabled=cfg.local_review_enabled,
-            review_command=cfg.local_review_command,
-            review_full_command=cfg.local_review_full_command,
-            review_max_retries=cfg.local_review_max_retries,
-            fix_model=cfg.fix_model,
-            full_mode=True,
-            runner_owned=_runner_owned_paths(project_dir, feature_dir, cfg.feature_name),
-        )
+        try:
+            checks_ok = await run_local_checks(
+                project_dir,
+                cfg.feature_name,
+                ci_enabled=cfg.local_ci_enabled,
+                ci_command=cfg.local_ci_command,
+                ci_full_command=cfg.local_ci_full_command,
+                ci_max_retries=cfg.local_ci_max_retries,
+                review_enabled=cfg.local_review_enabled,
+                review_command=cfg.local_review_command,
+                review_full_command=cfg.local_review_full_command,
+                review_max_retries=cfg.local_review_max_retries,
+                fix_model=cfg.fix_model,
+                full_mode=True,
+                runner_owned=_runner_owned_paths(project_dir, feature_dir, cfg.feature_name),
+            )
+        except Exception as exc:
+            error(f"End-of-run local checks crashed — {type(exc).__name__}: {exc}")
+            log(dim(traceback.format_exc().rstrip()))
+            checks_ok = False
         if not checks_ok:
             exit_code = 1
 

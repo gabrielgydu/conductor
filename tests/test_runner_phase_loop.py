@@ -313,3 +313,37 @@ async def test_runner_start_clears_stale_steering(project, monkeypatch):
     assert await _run(_config(repo, feature_dir, phases=1), feature_dir, fake, monkeypatch) == 0
 
     assert not (inbox / "1.msg").exists()
+
+
+# ─── Crashes still end the run cleanly ──────────────────────────────────────
+
+
+async def test_crash_inside_a_phase_still_tears_down_and_writes_exit_code(project, tmp_path, monkeypatch):
+    repo, feature_dir = project
+    marker = tmp_path / "torn-down"
+    preset = tmp_path / "teardown.toml"
+    preset.write_text(f'name = "td"\n\n[teardown]\nstage = "touch {marker}"\n')
+
+    def locked_index(_cwd):
+        raise subprocess.CalledProcessError(128, ["git", "add", "-A"], stderr="index.lock exists")
+
+    monkeypatch.setattr(phase_loop, "git_stage_all", locked_index)
+    fake = FakeClaude(repo, [write_code_and_finish, write_code_and_finish])
+
+    assert await _run(_config(repo, feature_dir, preset=str(preset)), feature_dir, fake, monkeypatch) == 1
+
+    assert fake.calls == [1]
+    assert marker.exists()
+    assert (feature_dir / "exit_code").read_text() == "1"
+    assert not (feature_dir / "PHASES-DONE.jsonl").exists()
+
+
+async def test_unloadable_preset_writes_exit_code(project, monkeypatch):
+    repo, feature_dir = project
+    fake = FakeClaude(repo, [])
+
+    cfg = _config(repo, feature_dir, preset="no-such-preset-anywhere")
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 1
+
+    assert fake.calls == []
+    assert (feature_dir / "exit_code").read_text() == "1"
