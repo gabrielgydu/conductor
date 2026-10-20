@@ -503,7 +503,7 @@ async def _run_phase(
         if not cfg.quick and (cfg.local_ci_enabled or cfg.local_review_enabled):
             from runner.local_checks import run_local_checks  # noqa: PLC0415
 
-            await run_local_checks(
+            checks_ok = await run_local_checks(
                 project_dir,
                 cfg.feature_name,
                 ci_enabled=cfg.local_ci_enabled,
@@ -516,6 +516,9 @@ async def _run_phase(
                 review_max_retries=cfg.local_review_max_retries,
                 fix_model=cfg.fix_model,
             )
+            if not checks_ok:
+                error(f"PHASE {phase_num} FAILED — local checks failed")
+                return False, phase_committed
 
         phase_complete = True
         break

@@ -281,3 +281,23 @@ async def test_resumed_run_still_runs_end_of_run_checks(project, monkeypatch):
 
     assert fake.calls == [2]
     assert checks == [True]
+
+
+# ─── Per-phase local checks (F72) ───────────────────────────────────────────
+
+
+async def test_failing_per_phase_local_checks_fail_the_phase(project, monkeypatch):
+    repo, feature_dir = project
+    import runner.local_checks as local_checks
+
+    async def failing_checks(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(local_checks, "run_local_checks", failing_checks)
+    cfg = _config(repo, feature_dir, quick=False, local_ci_enabled=True, local_ci_command="make ci")
+    fake = FakeClaude(repo, [write_code_and_finish, write_code_and_finish])
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 1
+
+    assert fake.calls == [1]  # phase 2 never starts
+    assert not (feature_dir / "PHASES-DONE.jsonl").exists()
