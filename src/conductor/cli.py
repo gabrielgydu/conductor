@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -175,6 +176,97 @@ def _load_prompt_template(name: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Prompt template not found: {path}")
     return path.read_text(encoding="utf-8")
+
+
+# ─── tmux ────────────────────────────────────────────────────────────────────
+
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh"}
+
+
+def _tmux(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
+
+
+def _tmux_target(session: str, window: str | None = None) -> str:
+    """Exact-match tmux target for *session* (and *window*).
+
+    A bare ``-t conductor-foo`` falls back to prefix matching, so it resolves
+    to ``conductor-foobar`` when that is the only candidate, and a '.' in the
+    name is read as a pane index. ``=name:`` and ``=name:=window`` match
+    exactly.
+    """
+    target = f"={session}:"
+    return f"{target}={window}" if window else target
+
+
+def _has_children(pid: str) -> bool:
+    try:
+        return subprocess.run(["pgrep", "-P", pid], capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return True  # cannot tell: assume busy
+
+
+def _busy_tmux_panes(session: str) -> list[str]:
+    """Describe the panes of *session* that are still running something.
+
+    A pane is idle when it is dead (remain-on-exit keeps finished windows
+    around) or sits at a shell prompt with no child processes.
+    """
+    r = _tmux(
+        "list-panes", "-s", "-t", _tmux_target(session),
+        "-F", "#{pane_dead}\t#{pane_pid}\t#{window_name}\t#{pane_current_command}",
+    )
+    busy = []
+    for line in r.stdout.splitlines():
+        dead, pid, window, command = (line.split("\t") + ["", "", "", ""])[:4]
+        if dead == "1" or (command in _SHELLS and not _has_children(pid)):
+            continue
+        busy.append(f"{window} ({command}, pid {pid})")
+    return busy
+
+
+def _kill_stale_tmux_session(session: str) -> bool:
+    """Kill *session* if it only holds finished or idle panes. True if it was killed.
+
+    Exits with an error instead while anything in it is still running: that is
+    a live orchestrator, loop or Claude session, not a leftover.
+    """
+    if _tmux("has-session", "-t", _tmux_target(session)).returncode != 0:
+        return False
+    busy = _busy_tmux_panes(session)
+    if busy:
+        print(f"Error: tmux session '{session}' is still running: {', '.join(busy)}")
+        print(f"  Watch it:  tmux attach -t '={session}:'")
+        print(f"  Stop it:   tmux kill-session -t '={session}:'")
+        sys.exit(1)
+    _tmux("kill-session", "-t", _tmux_target(session))
+    return True
+
+
+def _launch_in_tmux(
+    session: str, window: str, argv: list[str], log_file: Path, *, login_shell: bool = False
+) -> None:
+    """Run *argv* in a new detached tmux session, then attach or switch to it."""
+    _kill_stale_tmux_session(session)
+    shell = "bash -lc" if login_shell else "bash -c"
+    target = _tmux_target(session, window)
+    # One tmux invocation, so remain-on-exit and the log pipe are in place even
+    # when the command exits immediately.
+    r = _tmux(
+        "new-session", "-d", "-s", session, "-n", window,
+        f"{shell} {shlex.quote(shlex.join(argv))}",
+        ";", "set-option", "-t", target, "remain-on-exit", "on",
+        ";", "pipe-pane", "-t", target, f"cat >> {shlex.quote(str(log_file))}",
+    )
+    if r.returncode != 0:
+        print(f"Error: could not start tmux session '{session}': {r.stderr.strip()}")
+        sys.exit(1)
+
+    if not os.environ.get("TMUX"):
+        os.execvp("tmux", ["tmux", "attach-session", "-t", _tmux_target(session)])
+    # Already in tmux — switch client
+    subprocess.run(["tmux", "switch-client", "-t", _tmux_target(session)], check=False)
+    sys.exit(0)
 
 
 # ─── Commands ────────────────────────────────────────────────────────────────
@@ -681,64 +773,23 @@ def _cmd_run(args):
 
     if not inside_tmux:
         # Re-exec inside tmux session
-        from conductor.core.tmux import TmuxManager
-
-        tmux = TmuxManager(session_name=f"conductor-{state.project_name}")
-
-        if tmux.session_exists():
-            # Kill stale session
-            tmux._run_tmux(
-                "kill-session", "-t", f"conductor-{state.project_name}", check=False
-            )
-
-        # Build re-exec command — resolve to the wrapper script so it works inside tmux
         conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
-        reexec_args = f"run --inside-tmux --name {args.name} --project-dir {repo_path}"
+        reexec = [conductor_bin, "run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path)]
         if getattr(args, "no_overnight", False):
-            reexec_args += " --no-overnight"
+            reexec.append("--no-overnight")
         if getattr(args, "quick", False):
-            reexec_args += " --quick"
+            reexec.append("--quick")
         if cli_max_parallel is not None:
-            reexec_args += f" --max-parallel {state.max_parallel}"
+            reexec.extend(["--max-parallel", str(state.max_parallel)])
         if cli_wt_base:
-            reexec_args += f" --worktrees-base {state.worktrees_base}"
+            reexec.extend(["--worktrees-base", state.worktrees_base])
 
-        # Create detached session
-        session_name = f"conductor-{state.project_name}"
-        tmux._run_tmux(
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-n",
+        _launch_in_tmux(
+            f"conductor-{state.project_name}",
             "conductor",
-            f"bash -c '{conductor_bin} {reexec_args}'",
+            reexec,
+            storage.tmux_log(state.project_name, "conductor-main"),
         )
-        # Keep window open after exit + log all output
-        tmux._run_tmux(
-            "set-option", "-t", f"{session_name}:conductor",
-            "remain-on-exit", "on", check=False,
-        )
-        log_file = storage.tmux_log(state.project_name, "conductor-main")
-        tmux._run_tmux(
-            "pipe-pane", "-t", f"{session_name}:conductor",
-            f"cat >> {log_file}", check=False,
-        )
-
-        tmux_env = os.environ.get("TMUX", "")
-        if not tmux_env:
-            # Not in tmux — attach
-            os.execvp(
-                "tmux",
-                ["tmux", "attach-session", "-t", session_name],
-            )
-        else:
-            # Already in tmux — switch client
-            subprocess.run(
-                ["tmux", "switch-client", "-t", session_name],
-                check=False,
-            )
-            sys.exit(0)
     else:
         # Inside tmux — run the loop directly
         from conductor.core.orchestrator import ConductorConfig, conductor_run_loop
@@ -875,21 +926,10 @@ def _cmd_cleanup(args):
 
     state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
 
-    # Check for running tmux session
+    # A leftover session is killed; a live one makes this exit with an error.
     session_name = f"conductor-{state.project_name}"
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", session_name],
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        if not getattr(args, "force", False):
-            print(f"Warning: tmux session '{session_name}' is still running.")
-            print("Use --force to kill it, or stop the run first.")
-            sys.exit(1)
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session_name], capture_output=True
-        )
-        print(f"Killed tmux session: {session_name}")
+    if _kill_stale_tmux_session(session_name):
+        print(f"Killed stale tmux session: {session_name}")
 
     wt_count = 0
     branch_count = 0
@@ -1036,43 +1076,24 @@ def _cmd_loop(args):
 
     if not inside_tmux:
         # Re-exec inside tmux
-        from conductor.core.tmux import TmuxManager
-        session_name = f"conductor-loop-{state.name}"
-        tmux = TmuxManager(session_name=session_name)
-
-        if tmux.session_exists():
-            tmux._run_tmux("kill-session", "-t", session_name, check=False)
-
         conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
-        reexec_args = f"loop --inside-tmux --name {args.name} --project-dir {repo_path} --plan {state.plan_file}"
+        reexec = [
+            conductor_bin, "loop", "--inside-tmux", "--name", args.name,
+            "--project-dir", str(repo_path), "--plan", state.plan_file,
+        ]
         if state.preset:
-            reexec_args += f" --preset {state.preset}"
+            reexec.extend(["--preset", state.preset])
         if getattr(args, "no_worktree", False):
-            reexec_args += " --no-worktree"
+            reexec.append("--no-worktree")
         if state.model:
-            reexec_args += f" --model {state.model}"
+            reexec.extend(["--model", state.model])
 
-        tmux._run_tmux(
-            "new-session", "-d", "-s", session_name, "-n", "loop",
-            f"bash -c '{conductor_bin} {reexec_args}'",
+        _launch_in_tmux(
+            f"conductor-loop-{state.name}",
+            "loop",
+            reexec,
+            storage.tmux_log(state.name, "loop-main"),
         )
-        # Keep window open after exit + log all output
-        tmux._run_tmux(
-            "set-option", "-t", f"{session_name}:loop",
-            "remain-on-exit", "on", check=False,
-        )
-        log_file = storage.tmux_log(state.name, "loop-main")
-        tmux._run_tmux(
-            "pipe-pane", "-t", f"{session_name}:loop",
-            f"cat >> {log_file}", check=False,
-        )
-
-        tmux_env = os.environ.get("TMUX", "")
-        if not tmux_env:
-            os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
-        else:
-            subprocess.run(["tmux", "switch-client", "-t", session_name], check=False)
-            sys.exit(0)
     else:
         # Inside tmux — run the loop directly
         from conductor.core.loop import run_loop_in_tmux
@@ -1130,8 +1151,6 @@ def _cmd_loop_status(args):
 
 def _cmd_manual_test(args):
     """Start, resume, or initialize a manual-test run."""
-    import shlex
-
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
     conductor_dir = storage.conductor_dir(args.name)
@@ -1190,13 +1209,6 @@ def _cmd_manual_test(args):
         return
 
     if not inside_tmux:
-        from conductor.core.tmux import TmuxManager
-
-        session_name = f"conductor-manual-test-{state.name}"
-        tmux = TmuxManager(session_name=session_name)
-        if tmux.session_exists():
-            tmux._run_tmux("kill-session", "-t", session_name, check=False)
-
         conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
         reexec = [
             conductor_bin,
@@ -1215,27 +1227,13 @@ def _cmd_manual_test(args):
             reexec.extend(["--model", state.model])
         reexec.extend(["--max-turns", str(state.max_turns)])
 
-        cmd = " ".join(shlex.quote(part) for part in reexec)
-        tmux._run_tmux(
-            "new-session", "-d", "-s", session_name, "-n", "manual-test",
-            f"bash -lc {shlex.quote(cmd)}",
+        _launch_in_tmux(
+            f"conductor-manual-test-{state.name}",
+            "manual-test",
+            reexec,
+            storage.tmux_log(state.name, "manual-test-main"),
+            login_shell=True,
         )
-        tmux._run_tmux(
-            "set-option", "-t", f"{session_name}:manual-test",
-            "remain-on-exit", "on", check=False,
-        )
-        log_file = storage.tmux_log(state.name, "manual-test-main")
-        tmux._run_tmux(
-            "pipe-pane", "-t", f"{session_name}:manual-test",
-            f"cat >> {log_file}", check=False,
-        )
-
-        tmux_env = os.environ.get("TMUX", "")
-        if not tmux_env:
-            os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
-        else:
-            subprocess.run(["tmux", "switch-client", "-t", session_name], check=False)
-            sys.exit(0)
     else:
         run_manual_test_in_tmux(state, repo_path, storage)
 
