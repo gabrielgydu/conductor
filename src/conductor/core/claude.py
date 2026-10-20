@@ -13,6 +13,7 @@ from typing import AsyncIterator, Callable
 # Re-exported: callers resolve aliases through conductor.core.claude.
 from conductor.core.model_catalog import resolve_model as resolve_model
 from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
+from conductor.core.stream_filter import describe_result
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -24,6 +25,7 @@ _YELLOW = "\033[33m"
 _MAGENTA = "\033[35m"
 _GRAY = "\033[90m"
 _GREEN_BOLD = "\033[1;32m"
+_RED_BOLD = "\033[1;31m"
 _RESET = "\033[0m"
 
 
@@ -149,14 +151,17 @@ def progress_on_event(event: dict) -> None:
         sys.stderr.flush()
         return
 
-    # Result event — show bold green subtype
+    # Result event — subtype in bold green, or bold red with the CLI's message on an error
     if t == "result":
         ts = _ts()
-        subtype = event.get("subtype", "")
+        label, summary, error_text = describe_result(event)
         if color:
-            sys.stderr.write(f"{ts}{_GREEN_BOLD}{subtype}{_RESET}\n")
+            c = _RED_BOLD if event.get("is_error") else _GREEN_BOLD
+            sys.stderr.write(f"{ts}{c}{label}{_RESET}{_DIM}{summary}{_RESET}\n")
         else:
-            sys.stderr.write(f"{ts}{subtype}\n")
+            sys.stderr.write(f"{ts}{label}{summary}\n")
+        if error_text:
+            sys.stderr.write(f"{ts}  {error_text}\n")
         sys.stderr.flush()
 
 
