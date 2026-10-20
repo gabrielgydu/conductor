@@ -234,8 +234,11 @@ async def test_conductor_steers_stalled_runner(
     mock_tmux.set_window_children(WINDOW, False)
 
     steer_message = "Focus on the database migration"
-    # The diagnose-stall prompt carries a "## Stall Duration" section
-    mock_claude_cli.set_response("## Stall Duration", f"ACTION: STEER\n{steer_message}")
+    # Matches the diagnose-stall-prompt.md template the orchestrator renders
+    mock_claude_cli.set_response(
+        "diagnosing a stalled automation pipeline stage",
+        f"ACTION: STEER\n{steer_message}",
+    )
 
     result = await conductor_run_loop(state, config)
 

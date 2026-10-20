@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import conductor.core.tmux as _tmux_module
-from conductor.core.brain import brain_answer_questions, brain_diagnose_runner
+from conductor.core import brain
 from conductor.core.claude import resolve_model, run_claude
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.logging import live_log
@@ -1313,6 +1313,12 @@ async def check_stall(
                 context_parts.append(
                     "## Activity Log (last 100 lines)\n" + "\n".join(lines[-100:])
                 )
+            window_log = _latest_window_log(storage, state.project_name, fname)
+            if window_log is not None:
+                context_parts.append(
+                    f"## Runner Window Output ({window_log.name}, last 60 lines)\n"
+                    + _tail(window_log, 60)
+                )
         else:
             progress_file = _progress_file_path(state, run_idx, stage_idx)
             if progress_file is not None and progress_file.exists():
@@ -1329,11 +1335,7 @@ async def check_stall(
         context_parts.append(
             f"## Stall Duration\nStalled for {stall_seconds}s ({stall_count} consecutive checks)"
         )
-        no_tools = (
-            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
-            "Tool calls will be REJECTED and will waste your only turn.\n\n"
-        )
-        context = no_tools + "\n\n".join(context_parts)
+        prompt = brain.render_prompt("diagnose-stall", "\n\n".join(context_parts))
 
         _log(
             "BRAIN_CALL",
@@ -1345,39 +1347,23 @@ async def check_stall(
             stage=stage_idx,
         )
 
-        result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
-
-        # Parse ACTION: STEER/RESET/IGNORE from response
-        response_text = ""
-        for line in result.output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = _json.loads(line)
-            except _json.JSONDecodeError:
-                continue
-            if event.get("type") == "assistant":
-                content = event.get("message", {}).get("content", [])
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            response_text = block.get("text", "")
-                            break
-                elif isinstance(content, str):
-                    response_text = content
-                if response_text:
-                    break
-
-        action_match = re.search(r"ACTION:\s*(\w+)", response_text)
-        action = action_match.group(1).upper() if action_match else "IGNORE"
+        reply = await brain.ask(
+            prompt, model=resolve_model("sonnet"), timeout_s=BRAIN_DIAGNOSE_TIMEOUT_S
+        )
+        brain.log_brain_call(
+            storage.brain_calls_dir(state.project_name),
+            "diagnose-stall", run_idx, stage_idx, prompt, reply,
+        )
+        action, message = (
+            brain.parse_action(reply.text, ("STEER", "RESET", "IGNORE"))
+            if reply.ok
+            else (None, "")
+        )
+        if action is None:
+            action = "IGNORE"  # least disruptive when there is no usable verdict
 
         if action == "STEER":
-            # Extract message lines after ACTION: STEER
-            lines_after = (
-                response_text.split("ACTION: STEER", 1)[-1].strip().splitlines()[:5]
-            )
-            message = "\n".join(lines_after)
+            message = "\n".join(message.splitlines()[:5])
             if message and stage.status == StageStatus.EXECUTING:
                 # Write steering message to runner's steer_inbox (file-based IPC)
                 try:
@@ -1635,6 +1621,132 @@ def classify_failure(
     return "logic"
 
 
+# Wall-clock limit for one-turn diagnosis calls (normally ~20 s).
+BRAIN_DIAGNOSE_TIMEOUT_S = 300.0
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\r")
+
+
+def _tail(path: Path, lines: int) -> str:
+    """Last *lines* lines of a log, with terminal escape codes removed."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(_ANSI_RE.sub("", text).splitlines()[-lines:])
+
+
+def _latest_window_log(
+    storage: StorageResolver, project_name: str, fname: str
+) -> Path | None:
+    """Newest tmux pane log of this stage's speccer or runner windows."""
+    logs_dir = storage.conductor_dir(project_name) / "logs"
+    if not logs_dir.is_dir():
+        return None
+    pattern = re.compile(
+        rf"^(?:speccer-(?:init|run|continue|generate)|runner)_{re.escape(fname)}"
+        r"_\d{8}_\d{6}\.log$"
+    )
+    logs = [p for p in logs_dir.iterdir() if pattern.match(p.name)]
+    return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+
+
+def _failure_context(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    storage: StorageResolver,
+    retries: int,
+    max_retries: int,
+) -> str:
+    """The evidence a failure diagnosis needs: what ran, how it ended, its output."""
+    import json as _json
+
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    fname = run.name + stage.feature_suffix
+    parts: list[str] = [
+        f"## Stage\nRun `{run.name}` ({run.description}), stage `{stage.name}`, "
+        f"feature `{fname}`, status {stage.status}, "
+        f"exit code {stage.last_exit_code if stage.last_exit_code is not None else 'unknown'}"
+    ]
+    if stage.last_error:
+        parts.append(
+            "## Orchestrator Error\nConductor itself raised while advancing this "
+            f"stage:\n{stage.last_error}"
+        )
+
+    fail_log = _runner_fail_log(storage, state.project_name, fname)
+    window_log = _latest_window_log(storage, state.project_name, fname)
+    if fail_log.exists():
+        parts.append("## Failure Output (last lines of the runner pane)\n" + _tail(fail_log, 50))
+    elif window_log is not None:
+        parts.append(f"## Window Output ({window_log.name}, last 80 lines)\n" + _tail(window_log, 80))
+
+    progress = _progress_file_path(state, run_idx, stage_idx)
+    if progress is not None and progress.exists():
+        parts.append("## Speccer PROGRESS.md\n" + _tail(progress, 60))
+    activity_log = _activity_log_path(state, run_idx, stage_idx)
+    if activity_log is not None and activity_log.exists():
+        parts.append("## Runner Activity Log (last 100 lines)\n" + _tail(activity_log, 100))
+
+    parts.append(
+        "## Stage Config\n" + _json.dumps(stage.model_dump(), indent=2, default=str)
+    )
+    parts.append(f"## Retries\n{retries} of {max_retries} used")
+    return "\n\n".join(parts)
+
+
+async def _back_off_and_restart(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    storage: StorageResolver,
+    reason: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    """Restart the stage after an exponential backoff; block after 8 hours of it."""
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    now = datetime.now(timezone.utc)
+    if stage.first_transient_failure_ts is None:
+        stage.first_transient_failure_ts = now
+    elapsed_hours = (now - stage.first_transient_failure_ts).total_seconds() / 3600
+    if elapsed_hours > 8:
+        stage.status = StageStatus.BLOCKED
+        _log(
+            "BLOCKED",
+            f"Run {run.name} stage {stage.name}: {reason} for 8+ hours",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+            reason="transient_timeout",
+            exit_code=stage.last_exit_code,
+        )
+        return
+    # Exponential backoff: 30s, 60s, 2m, 4m, 8m, 16m, 32m, 60m cap
+    backoff_s = min(3600, 30 * (2 ** stage.transient_retries))
+    stage.transient_retries += 1
+    stage.backoff_until = now + timedelta(seconds=backoff_s)
+    _log(
+        "TRANSIENT_FAILURE",
+        f"Run {run.name} stage {stage.name}: {reason}, backing off {backoff_s}s "
+        f"(attempt {stage.transient_retries})",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+        backoff_s=backoff_s,
+        transient_retries=stage.transient_retries,
+        exit_code=stage.last_exit_code,
+    )
+    await restart_stage(
+        state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+    )
+
+
 async def handle_failure(
     state: ConductorState,
     run_idx: int,
@@ -1690,47 +1802,14 @@ async def handle_failure(
 
     # Transient API failures: exponential backoff with 8-hour window
     if failure_type == "transient":
-        now = datetime.now(timezone.utc)
-        if stage.first_transient_failure_ts is None:
-            stage.first_transient_failure_ts = now
-        elapsed_hours = (now - stage.first_transient_failure_ts).total_seconds() / 3600
-        if elapsed_hours > 8:
-            stage.status = StageStatus.BLOCKED
-            _log(
-                "BLOCKED",
-                f"Run {run.name} stage {stage.name}: API unavailable for 8+ hours",
-                log_path,
-                audit_path,
-                run=run_idx,
-                stage=stage_idx,
-                reason="transient_timeout",
-                exit_code=stage.last_exit_code,
-            )
-            return
-        # Exponential backoff: 30s, 60s, 2m, 4m, 8m, 16m, 32m, 60m cap
-        backoff_s = min(3600, 30 * (2 ** stage.transient_retries))
-        stage.transient_retries += 1
-        stage.backoff_until = now + timedelta(seconds=backoff_s)
-        _log(
-            "TRANSIENT_FAILURE",
-            f"Run {run.name} stage {stage.name}: API error, backing off {backoff_s}s "
-            f"(attempt {stage.transient_retries})",
-            log_path,
-            audit_path,
-            run=run_idx,
-            stage=stage_idx,
-            backoff_s=backoff_s,
-            transient_retries=stage.transient_retries,
-            exit_code=stage.last_exit_code,
-        )
-        await restart_stage(
-            state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+        await _back_off_and_restart(
+            state, run_idx, stage_idx, storage, "API error", log_path, audit_path
         )
         return
 
-    # Logic failures: existing brain call flow, cap at 2
+    # Logic failures: brain diagnosis decides RETRY or BLOCK, cap at max_retries
     retries = stage.retries
-    if retries >= 2:
+    if retries >= config.max_retries:
         stage.status = StageStatus.BLOCKED
         _log(
             "BLOCKED",
@@ -1743,33 +1822,10 @@ async def handle_failure(
         )
         return
 
-    # Build failure context for brain call
-    context_parts: list[str] = []
-
-    import json as _json
-
-    activity_log = _activity_log_path(state, run_idx, stage_idx)
-    if activity_log is not None and activity_log.exists():
-        lines = activity_log.read_text(encoding="utf-8", errors="replace").splitlines()
-        context_parts.append(
-            "## Activity Log (last 100 lines)\n" + "\n".join(lines[-100:])
-        )
-
-    if stage.last_error:
-        context_parts.append(
-            "## Orchestrator Error\nConductor itself raised while advancing this "
-            f"stage:\n{stage.last_error}"
-        )
-    context_parts.append(
-        "## Stage Config\n" + _json.dumps(stage.model_dump(), indent=2, default=str)
+    prompt = brain.render_prompt(
+        "diagnose-failure",
+        _failure_context(state, run_idx, stage_idx, storage, retries, config.max_retries),
     )
-    context_parts.append(f"## Retries\n{retries} of 2")
-    no_tools = (
-        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
-        "Tool calls will be REJECTED and will waste your only turn.\n\n"
-    )
-    context = no_tools + "\n\n".join(context_parts)
-
     _log(
         "BRAIN_CALL",
         f"diagnose-failure for {fname}",
@@ -1779,44 +1835,40 @@ async def handle_failure(
         run=run_idx,
         stage=stage_idx,
     )
+    reply = await brain.ask(
+        prompt, model=resolve_model("sonnet"), timeout_s=BRAIN_DIAGNOSE_TIMEOUT_S
+    )
+    brain.log_brain_call(
+        storage.brain_calls_dir(state.project_name),
+        "diagnose-failure", run_idx, stage_idx, prompt, reply,
+    )
 
-    result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
+    if not reply.ok:
+        # The diagnosis itself failed (API down, CLI error, timeout): that says
+        # nothing about the stage, so wait like for an API error instead of
+        # spending a retry or blocking.
+        await _back_off_and_restart(
+            state, run_idx, stage_idx, storage,
+            f"failure diagnosis unavailable ({reply.detail})", log_path, audit_path,
+        )
+        return
 
-    response_text = ""
-    for line in result.output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = _json.loads(line)
-        except _json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "assistant":
-            content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        response_text = block.get("text", "")
-                        break
-            elif isinstance(content, str):
-                response_text = content
-            if response_text:
-                break
-
-    action_match = re.search(r"ACTION:\s*(\w+)", response_text)
-    action = action_match.group(1).upper() if action_match else "BLOCK"
+    action, explanation = brain.parse_action(reply.text, ("RETRY", "BLOCK"))
+    if action is None:
+        # No verdict in the reply. Retries are capped, so default to trying again.
+        action = "RETRY"
+        explanation = reply.text
 
     _log(
         "FAILURE",
-        f"Run {run.name} stage {stage.name}: {action}",
+        f"Run {run.name} stage {stage.name}: {action}"
+        + (f" — {explanation[:500]}" if explanation else ""),
         log_path,
         audit_path,
         run=run_idx,
         stage=stage_idx,
         retries=retries,
-        max_retries=2,
+        max_retries=config.max_retries,
         action=action,
     )
 
