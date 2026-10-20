@@ -279,6 +279,13 @@ async def test_prose_mention_of_marker_does_not_block_completion(spec_dir, fake_
     assert len(fake_claude.prompts) == 2, "generate should have run"
 
 
+def test_unclosed_marker_still_counts(spec_dir):
+    _domain(spec_dir, "Auth: [NEEDS CLARIFICATION: which auth scheme?\n\n## Next section")
+    assert sc._find_clarification_markers(spec_dir) == [
+        "domains/01-core.md:2: [NEEDS CLARIFICATION: which auth scheme?",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_rejection_reason_reaches_next_iteration_prompt(spec_dir, fake_claude):
     _answered(spec_dir)

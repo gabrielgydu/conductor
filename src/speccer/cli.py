@@ -469,8 +469,9 @@ def _detect_promise(text: str) -> str | None:
 
 # A clarification marker in the form the spec prompts define. Prose that only
 # names the marker ("resolved the former [NEEDS CLARIFICATION] markers") does
-# not match, so it cannot block completion.
-_CLARIFICATION_MARKER = re.compile(r"\[NEEDS CLARIFICATION:[^\]]*\]")
+# not match, so it cannot block completion. A marker the agent never closed
+# still counts, up to the end of its line.
+_CLARIFICATION_MARKER = re.compile(r"\[NEEDS CLARIFICATION:(?:[^\]]*\]|.*)")
 
 # SPEC_COMPLETE claims in a row the gate may reject before speccer stops
 # starting spec sessions (each one a long Opus run) and waits for a human.
