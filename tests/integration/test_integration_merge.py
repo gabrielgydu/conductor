@@ -533,3 +533,78 @@ async def test_default_worktree_next_to_repo_is_removed_when_dirty(
     assert validated_in == [expected]
     assert not expected.exists()
     assert str(expected) not in _worktree_list(real_merge_repo.path)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Runs whose branch cannot be merged are not reported as merged
+# ---------------------------------------------------------------------------
+
+
+def _unrelated_branch(repo: Path, name: str) -> None:
+    """A branch with its own root commit: git refuses to merge it."""
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "checkout", "-q", "--orphan", name], check=True)
+    subprocess.run([*git, "rm", "-rq", "--cached", "."], check=True)
+    (repo / "README.md").unlink()
+    (repo / "orphan.txt").write_text("orphan\n")
+    subprocess.run([*git, "add", "orphan.txt"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "orphan root"], check=True)
+    subprocess.run([*git, "checkout", "-q", "-f", "main"], check=True)
+
+
+@pytest.mark.asyncio
+async def test_unmergeable_runs_are_not_reported_as_merged(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    real_merge_repo.create_branch("nm-a", {"nm_a.txt": "a\n"})
+    real_merge_repo.create_branch("nm-d", {"nm_d.txt": "d\n"})
+    _unrelated_branch(real_merge_repo.path, "nm-orphan")
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "nm-a"),
+        _done_run_with_branch(1, "feat-b", "feat/does-not-exist"),
+        _done_run_with_branch(2, "feat-c", "nm-orphan"),
+        _done_run_with_branch(3, "feat-d", "nm-d"),
+    )
+    async def gh_without_remote(args, cwd):
+        return (0, "[]", "") if "list" in args else (1, "", "no remote")
+
+    gh = AsyncMock(side_effect=gh_without_remote)
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.merged_runs == [0, 3]
+    assert result.status == IntegrationStatus.PARTIAL
+    files = _show(real_merge_repo, f"integration/{project_name}:").split()
+    assert "nm_a.txt" in files and "nm_d.txt" in files and "orphan.txt" not in files
+
+    [create] = {tuple(c.args[0]) for c in gh.await_args_list if "create" in c.args[0]}
+    body = create[create.index("--body") + 1]
+    assert "- Run 1: feat-b (branch feat/does-not-exist does not exist)" in body
+    assert (
+        "- Run 2: feat-c (git merge failed: fatal: refusing to merge unrelated histories)"
+        in body
+    )
+    assert "--draft" in create
+
+
+@pytest.mark.asyncio
+async def test_no_mergeable_run_fails_without_publishing(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "gone-a"),
+        _done_run_with_branch(1, "feat-b", "gone-b"),
+    )
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.FAILED
+    assert result.merged_runs == []
+    hermetic_merge.validate.assert_not_awaited()
+    gh.assert_not_awaited()

@@ -129,6 +129,18 @@ def test_build_pr_body_with_unresolved():
     assert "`src/bar.py`" in body
 
 
+def test_build_pr_body_lists_runs_not_merged():
+    run = RunState(
+        index=1,
+        name="feature-b",
+        description="B",
+        stages=[StageState(name="s", spec_mode="full")],
+    )
+    body = _build_pr_body([], [], [], [(run, "branch feat/b does not exist")])
+    assert "## Not Merged" in body
+    assert "- Run 1: feature-b (branch feat/b does not exist)" in body
+
+
 # ---------------------------------------------------------------------------
 # Integration pipeline tests (Step 5)
 # ---------------------------------------------------------------------------

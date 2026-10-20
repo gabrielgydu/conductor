@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 
 from conductor.core.claude import run_claude
@@ -50,10 +51,17 @@ def _build_pr_body(
     merged_runs: list[RunState],
     conflicts_resolved: list[ConflictRecord],
     conflicts_unresolved: list[ConflictRecord],
+    not_merged: Sequence[tuple[RunState, str]] = (),
 ) -> str:
     lines = ["## Merged Runs"]
     for run in merged_runs:
         lines.append(f"- Run {run.index}: {run.name}")
+
+    if not_merged:
+        lines.append("")
+        lines.append("## Not Merged")
+        for run, reason in not_merged:
+            lines.append(f"- Run {run.index}: {run.name} ({reason})")
 
     if conflicts_resolved:
         lines.append("")
@@ -329,27 +337,33 @@ async def _integrate(
 ) -> IntegrationState:
     """Merge, validate, commit, push and open the PR inside worktree *wt*."""
     merged_runs: list[RunState] = []
+    not_merged: list[tuple[RunState, str]] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     has_partial = False
+
+    def skip(run: RunState, reason: str) -> None:
+        _print(f"  ✗ Run {run.index} ({run.name}) not merged: {reason}")
+        not_merged.append((run, reason))
 
     # --- Merge loop ---
     _print(f"Worktree created at {wt}")
     _, start, _ = await _run_git(["rev-parse", "HEAD"], wt)
     start = start.strip()
     for run in eligible_runs:
-        if not run.stages:
-            logger.warning("Run %s has no stages, skipping", run.index)
+        branch = run.stages[-1].branch if run.stages else None
+        if branch is None:
+            skip(run, "no branch recorded for its last stage")
             continue
 
-        branch = run.stages[-1].branch
-        if branch is None:
-            logger.warning("Run %s has no branch on last stage, skipping", run.index)
+        _print(f"Merging run {run.index}: {run.name} ({branch})")
+        rc, _, _ = await _run_git(["rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], wt)
+        if rc != 0:
+            skip(run, f"branch {branch} does not exist")
             continue
 
         # Try clean merge
-        _print(f"Merging run {run.index}: {run.name} ({branch})")
-        rc, _, _ = await _run_git(["merge", branch, "--no-edit"], wt)
+        rc, out, err = await _run_git(["merge", branch, "--no-edit"], wt)
         if rc == 0:
             _print(f"  ✓ Clean merge")
             merged_runs.append(run)
@@ -358,6 +372,12 @@ async def _integrate(
         # Conflicts: record the files while the markers are in the tree (after a
         # merge completes, --diff-filter=U is empty) and let Claude combine both sides.
         conflicting = _get_conflicting_files(wt)
+        if not conflicting:
+            # Not a conflict (unrelated histories, untracked files in the way, ...)
+            await _run_git(["merge", "--abort"], wt)
+            reason = next((ln.strip() for ln in (err + out).splitlines() if ln.strip()), "")
+            skip(run, f"git merge failed: {reason or f'exit {rc}'}")
+            continue
         _print(f"  Conflicts in {len(conflicting)} file(s): {', '.join(conflicting)}")
         earlier = {f: await _runs_touching(f, merged_runs, start, wt) for f in conflicting}
 
@@ -434,7 +454,14 @@ async def _integrate(
         has_partial = True
         merged_runs.append(run)
 
-    _print(f"Merged {len(merged_runs)} runs")
+    has_partial = has_partial or bool(not_merged)
+    _print(f"Merged {len(merged_runs)} of {len(eligible_runs)} runs")
+    if not merged_runs:
+        return IntegrationState(
+            status=IntegrationStatus.FAILED,
+            branch=branch_name,
+            conflicts_unresolved=conflicts_unresolved,
+        )
 
     # --- Post-merge validation with self-healing ---
     # The smoke check writes tests/Playwright/tests/conductor-smoke.spec.ts itself
@@ -505,9 +532,11 @@ async def _integrate(
         if existing_prs:
             pr_url = existing_prs[0].get("url")
         else:
-            body = _build_pr_body(merged_runs, conflicts_resolved, conflicts_unresolved)
+            body = _build_pr_body(
+                merged_runs, conflicts_resolved, conflicts_unresolved, not_merged
+            )
             title = f"Integration: {state.project_name}"
-            # Unresolved conflicts need a human before this can be merged.
+            # Unresolved conflicts or missing runs need a human before this can be merged.
             draft = ["--draft"] if has_partial else []
             for attempt in range(3):
                 rc, stdout, stderr = await _run_git_gh(
