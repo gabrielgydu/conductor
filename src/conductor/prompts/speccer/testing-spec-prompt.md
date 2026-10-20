@@ -371,7 +371,7 @@ The inline marker serves as a traceable anchor — it marks exactly where the sp
 
 **On `--continue` iterations:** When user answers resolve a question, find and replace the corresponding `[NEEDS CLARIFICATION: ...]` marker with the actual spec content.
 
-**Before emitting SPEC_COMPLETE:** Verify that **zero** `[NEEDS CLARIFICATION` markers remain in any domain spec. The CLI enforces this as a hard gate — SPEC_COMPLETE will be rejected if any markers remain.
+**Before emitting SPEC_COMPLETE:** Verify that **zero** `[NEEDS CLARIFICATION` markers remain in any domain spec. The CLI enforces this as a hard gate: it rejects SPEC_COMPLETE while any `[NEEDS CLARIFICATION: ...]` marker remains and lists the markers it found in HANDOFF.md.
 
 ---
 
@@ -441,10 +441,12 @@ Mark each node with: `[PENDING]`, `[IN_PROGRESS]`, `[COMPLETE]`
 
 ## PROGRESS.md Domain Table
 
-Update the domain table in `{SPEC_DIR}/PROGRESS.md` as you work. Keep the STATUS and ITERATION lines at the top, then the table:
+Update the domain table in `{SPEC_DIR}/PROGRESS.md` as you work. Keep the header lines (STATUS, MODE, PRESET, ITERATION) at the top exactly as they are, then the table:
 
 ```
 STATUS: SPECCING
+MODE: testing
+PRESET: myproject
 ITERATION: 3
 
 ## Domain Progress
@@ -457,7 +459,7 @@ ITERATION: 3
 | 04 | Cross-Feature E2E | PENDING | — |
 ```
 
-Do NOT modify the STATUS line — the runner script manages it. Only update ITERATION if instructed.
+Do NOT modify or remove the header lines — speccer manages them.
 
 ---
 
@@ -542,5 +544,7 @@ When you have **questions for the user**, write them to `{SPEC_DIR}/QUESTIONS.md
 When **all domains are fully spec'd** and pass the self-audit checklist, output:
 
 <promise>SPEC_COMPLETE</promise>
+
+Output exactly one promise token, as the last line of your final message. The CLI reads only that final message, so do not write either token anywhere else: not in earlier messages, not in files, and not in anything you send to a subagent.
 
 **CRITICAL:** Only output SPEC_COMPLETE when EVERY domain has ALL applicable sections filled out at production-ready depth. If even one domain is shallow, keep speccing.

@@ -28,13 +28,24 @@ Use the Agent tool with `subagent_type="codex:codex-rescue"` and ask it to revie
 draft output. Incorporate its feedback where it makes good points, then finalize.
 
 This is non-blocking: if the agent call fails, errors, or times out, proceed with your
-own judgment. Do not let Codex failures delay or block your output.
+own judgment. Do not let Codex failures delay or block your output. So:
+
+- Make one Agent call, in the foreground (not `run_in_background`), and do not
+  schedule wakeups or poll while it runs.
+- Tell the subagent to make a single Codex attempt and to report any error straight
+  back, without retrying or switching models.
 
 **Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.
 If Codex responded, summarize what it said and what you incorporated or disagreed with.
 If the call failed or timed out, note that explicitly (e.g. "Codex was unavailable: <error>").
 This section is important for auditability — always include it.
 """
+
+# Spec and generate sessions are headless one-shots, so a tool that schedules a
+# later re-invocation can only make them wait. In a live run the generate agent
+# armed a 20-minute "fallback heartbeat" wakeup while a background Codex review
+# ran.
+_SESSION_ARGS = ["--disallowedTools", "ScheduleWakeup,CronCreate"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANSI helpers
@@ -88,13 +99,15 @@ def _read_field(progress_file: Path, field: str, default: str = "") -> str:
 
 def _write_field(progress_file: Path, field: str, value: str) -> None:
     """Replace `FIELD: ...` line in PROGRESS.md, or insert after first line if missing."""
-    text = progress_file.read_text(encoding="utf-8")
+    text = progress_file.read_text(encoding="utf-8") if progress_file.exists() else ""
     pattern = rf"^{re.escape(field)}:.*$"
     replacement = f"{field}: {value}"
     new_text, n = re.subn(pattern, replacement, text, flags=re.MULTILINE)
     if n == 0:
         # Insert after the first line
         lines = text.splitlines(keepends=True)
+        if lines and not lines[0].endswith("\n"):
+            lines[0] += "\n"
         lines.insert(1, f"{replacement}\n")
         new_text = "".join(lines)
     progress_file.write_text(new_text, encoding="utf-8")
@@ -126,6 +139,36 @@ def update_status(spec_dir: Path, status: str) -> None:
 
 def update_iteration(spec_dir: Path, iteration: int) -> None:
     _write_field(spec_dir / "PROGRESS.md", "ITERATION", str(iteration))
+
+
+def read_rejected_completions(spec_dir: Path) -> int:
+    val = _read_field(spec_dir / "PROGRESS.md", "REJECTED_COMPLETIONS", "0")
+    try:
+        return int(val)
+    except ValueError:
+        return 0
+
+
+def update_rejected_completions(spec_dir: Path, count: int) -> None:
+    _write_field(spec_dir / "PROGRESS.md", "REJECTED_COMPLETIONS", str(count))
+
+
+def _restore_header(
+    spec_dir: Path, mode: str, preset: str, iteration: int, rejected: int,
+) -> None:
+    """Put back the PROGRESS.md header lines speccer owns after a spec session.
+
+    The agent rewrites PROGRESS.md to keep its domain table current. If it
+    drops MODE, read_mode falls back to 'fullstack' and generate uses the
+    generic templates, so a backend stage silently ships no API-CONTRACTS.md.
+    STATUS needs no restoring: every exit path of a run writes it.
+    """
+    progress = spec_dir / "PROGRESS.md"
+    _write_field(progress, "MODE", mode)
+    _write_field(progress, "PRESET", preset)
+    _write_field(progress, "ITERATION", str(iteration))
+    if rejected:
+        update_rejected_completions(spec_dir, rejected)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -238,11 +281,13 @@ def build_spec_prompt(
     if not template_file.exists():
         _die(f"Prompt template not found: {template_file}")
 
-    # Conditions
-    is_init        = status == "INIT"
+    # Conditions. A first iteration that died after writing domain specs
+    # (crash, Claude error, no verdict) leaves STATUS at INIT; its "no specs
+    # exist yet" instructions would contradict the injected specs, so resume.
+    has_domains    = _has_domains(spec_dir)
+    is_init        = status == "INIT" and not has_domains
     is_needs_input = status == "NEEDS_INPUT"
     is_resume      = not is_init and not is_needs_input
-    has_domains    = _has_domains(spec_dir)
     has_constitution    = (spec_dir / "CONSTITUTION.md").exists()
     has_backend_context = (spec_dir / "BACKEND-CONTEXT.md").exists() and (spec_dir / "BACKEND-CONTEXT.md").stat().st_size > 0
     has_spec_context    = (spec_dir / "SPEC-CONTEXT.md").exists() and (spec_dir / "SPEC-CONTEXT.md").stat().st_size > 0
@@ -349,10 +394,22 @@ def build_generate_prompt(
 # Text extraction from Claude stream-json output
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _extract_text_from_output(output: str) -> str:
-    """Extract assistant text content from stream-json output."""
+def _final_message_text(output: str) -> str:
+    """Return the text of the session's final top-level assistant message.
+
+    The CLI reports it as the ``result`` of the last ``result`` event. A
+    session that waits for a background subagent ends more than one turn and
+    the CLI emits one result per turn, in order, so the last one wins. If the
+    stream has no result event, fall back to the last top-level assistant
+    event that carries text.
+
+    Events with a ``parent_tool_use_id`` come from subagents and are skipped,
+    and tool inputs and results are never read: a promise token quoted in a
+    file the agent wrote, or in a reviewer's reply, is not the agent's verdict.
+    """
     import json
-    parts: list[str] = []
+    result_text: str | None = None
+    last_text = ""
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -361,19 +418,27 @@ def _extract_text_from_output(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or event.get("parent_tool_use_id"):
             continue
-        if event.get("type") == "assistant":
+        if event.get("type") == "result":
+            result = event.get("result")
+            result_text = result if isinstance(result, str) else ""
+        elif event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            parts.append(text)
-            elif isinstance(content, str):
-                parts.append(content)
-    return "\n".join(parts)
+            if isinstance(content, str):
+                texts = [content]
+            elif isinstance(content, list):
+                texts = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+            else:
+                texts = []
+            text = "\n".join(t for t in texts if t)
+            if text:
+                last_text = text
+    return result_text if result_text is not None else last_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -385,12 +450,92 @@ _TOKEN_NEEDS_INPUT = "<promise>SPEC_NEEDS_INPUT</promise>"
 
 
 def _detect_promise(text: str) -> str | None:
-    """Return 'COMPLETE', 'NEEDS_INPUT', or None."""
-    if _TOKEN_COMPLETE in text:
-        return "COMPLETE"
-    if _TOKEN_NEEDS_INPUT in text:
-        return "NEEDS_INPUT"
-    return None
+    """Return 'COMPLETE', 'NEEDS_INPUT', or None.
+
+    When both tokens appear, the last one is the verdict: an agent that
+    writes "I can't emit SPEC_COMPLETE yet" and then ends with NEEDS_INPUT
+    has questions.
+    """
+    complete = text.rfind(_TOKEN_COMPLETE)
+    needs_input = text.rfind(_TOKEN_NEEDS_INPUT)
+    if complete == -1 and needs_input == -1:
+        return None
+    return "COMPLETE" if complete > needs_input else "NEEDS_INPUT"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPEC_COMPLETE gate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# A clarification marker in the form the spec prompts define. Prose that only
+# names the marker ("resolved the former [NEEDS CLARIFICATION] markers") does
+# not match, so it cannot block completion. A marker the agent never closed
+# still counts, up to the end of its line.
+_CLARIFICATION_MARKER = re.compile(r"\[NEEDS CLARIFICATION:(?:[^\]]*\]|.*)")
+
+# SPEC_COMPLETE claims in a row the gate may reject before speccer stops
+# starting spec sessions (each one a long Opus run) and waits for a human.
+MAX_REJECTED_COMPLETIONS = 3
+
+# Exit status when speccer will not go on without a human.
+EXIT_NEEDS_HUMAN = 3
+
+
+def _find_clarification_markers(spec_dir: Path) -> list[str]:
+    """Return 'domains/<file>:<line>: <marker>' for each marker left in the domain specs."""
+    found: list[str] = []
+    domains_dir = spec_dir / "domains"
+    if not domains_dir.is_dir():
+        return found
+    for f in sorted(domains_dir.glob("*.md")):
+        text = f.read_text(encoding="utf-8")
+        for m in _CLARIFICATION_MARKER.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            marker = " ".join(m.group(0).split())  # a reason may span lines
+            found.append(f"domains/{f.name}:{line}: {marker}")
+    return found
+
+
+def _record_rejection(spec_dir: Path, iteration: int, markers: list[str], rejected: int) -> None:
+    """Append why SPEC_COMPLETE was rejected to HANDOFF.md.
+
+    HANDOFF.md is injected into the next iteration's prompt, which otherwise
+    only says that the user answered the questions.
+    """
+    note = [
+        "",
+        (
+            f"## SPEC_COMPLETE rejected (iteration {iteration}; "
+            f"{rejected} of {MAX_REJECTED_COMPLETIONS} rejections in a row)"
+        ),
+        "",
+        (
+            "The CLI rejected this iteration's SPEC_COMPLETE because these clarification "
+            "markers are still in the domain specs:"
+        ),
+        "",
+        *(f"- {m}" for m in markers),
+        "",
+        (
+            "Replace each marker with the resolved spec content, or move its question to "
+            "QUESTIONS.md and emit SPEC_NEEDS_INPUT. Emit SPEC_COMPLETE only when none remain. "
+            f"After {MAX_REJECTED_COMPLETIONS} rejections in a row the spec loop stops for a human."
+        ),
+        "",
+    ]
+    handoff = spec_dir / "HANDOFF.md"
+    existing = handoff.read_text(encoding="utf-8").rstrip("\n") if handoff.exists() else ""
+    handoff.write_text(existing + "\n" + "\n".join(note), encoding="utf-8")
+
+
+def _stop_for_human(spec_dir: Path, rejected: int) -> None:
+    _die(
+        f"SPEC_COMPLETE was rejected {rejected} times in a row; {spec_dir}/HANDOFF.md lists "
+        f"the markers that blocked it. Resolve them in {spec_dir}/domains/ by hand and "
+        f"answer any open questions in QUESTIONS.md, then set REJECTED_COMPLETIONS: 0 in "
+        f"PROGRESS.md and run: speccer run --continue --spec-dir {spec_dir}",
+        code=EXIT_NEEDS_HUMAN,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -536,6 +681,42 @@ Immutable principles that ALL specs and implementations must respect. The spec a
     print("")
 
 
+def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejection: bool) -> None:
+    """Check that a NEEDS_INPUT spec may continue, and archive its questions round.
+
+    Answers are required only when QUESTIONS.md asks something. After a
+    rejected SPEC_COMPLETE none are needed either: the next session's job is
+    to resolve the markers listed in HANDOFF.md. That rejection may have
+    come from a first iteration that wrote no questions at all, and once a
+    human has fixed the markers and reset the rejection count, an empty
+    QUESTIONS.md is all that is left.
+    """
+    if not cont:
+        _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
+        _log(f"  {_CYAN}{spec_dir}/QUESTIONS.md{_RESET}")
+        _log("")
+        _log(f"Then run: {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")
+        sys.exit(0)
+    questions_file = spec_dir / "QUESTIONS.md"
+    questions = _read_file(questions_file)
+    has_questions = bool(questions.strip())
+    has_answers = any(line.startswith("> ") for line in questions.splitlines())
+    if has_questions and not has_answers and not after_rejection:
+        _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
+    if has_questions:
+        archive_dir = spec_dir / "questions-archive"
+        archive_dir.mkdir(exist_ok=True)
+        import shutil
+        shutil.copy(questions_file, archive_dir / f"round-{iteration}.md")
+        _log(f"Archived questions to {_CYAN}questions-archive/round-{iteration}.md{_RESET}")
+    if after_rejection:
+        _log("Continuing to resolve the markers that blocked SPEC_COMPLETE...")
+    elif has_questions:
+        _log("Continuing after user answers...")
+    else:
+        _log("QUESTIONS.md asks nothing; continuing...")
+
+
 async def _cmd_run_async(
     spec_dir: Path,
     cont: bool,
@@ -552,8 +733,12 @@ async def _cmd_run_async(
 
     status    = read_status(spec_dir)
     iteration = read_iteration(spec_dir)
+    rejected  = read_rejected_completions(spec_dir)
 
     # ── Validate state ──────────────────────────────────────────────────────
+    if rejected >= MAX_REJECTED_COMPLETIONS and status not in ("COMPLETE", "GENERATED"):
+        _stop_for_human(spec_dir, rejected)
+
     if status == "INIT":
         desc_file = spec_dir / "FEATURE-DESCRIPTION.md"
         if not desc_file.exists() or desc_file.stat().st_size == 0:
@@ -561,27 +746,7 @@ async def _cmd_run_async(
         _log(f"First spec iteration for {_CYAN}{feature_name}{_RESET}")
 
     elif status == "NEEDS_INPUT":
-        if not cont:
-            _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
-            _log(f"  {_CYAN}{spec_dir}/QUESTIONS.md{_RESET}")
-            _log("")
-            _log(f"Then run: {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")
-            sys.exit(0)
-        # Validate answers exist
-        questions_file = spec_dir / "QUESTIONS.md"
-        if not questions_file.exists() or not any(
-            line.startswith("> ")
-            for line in questions_file.read_text(encoding="utf-8").splitlines()
-        ):
-            _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
-        # Archive questions round
-        archive_dir = spec_dir / "questions-archive"
-        archive_dir.mkdir(exist_ok=True)
-        round_file = archive_dir / f"round-{iteration}.md"
-        import shutil
-        shutil.copy(questions_file, round_file)
-        _log(f"Archived questions to {_CYAN}questions-archive/round-{iteration}.md{_RESET}")
-        _log("Continuing after user answers...")
+        _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
 
     elif status == "COMPLETE":
         _log(f"{_GREEN}Spec is already complete.{_RESET} Run generate to produce artifacts:")
@@ -602,25 +767,7 @@ async def _cmd_run_async(
             if not desc_file.exists() or desc_file.stat().st_size == 0:
                 _die("FEATURE-DESCRIPTION.md is empty. Write your feature description first.")
         elif status == "NEEDS_INPUT":
-            if not cont:
-                _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
-                _log(f"  {_CYAN}{spec_dir}/QUESTIONS.md{_RESET}")
-                _log("")
-                _log(f"Then run: {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")
-                sys.exit(0)
-            questions_file = spec_dir / "QUESTIONS.md"
-            if not questions_file.exists() or not any(
-                line.startswith("> ")
-                for line in questions_file.read_text(encoding="utf-8").splitlines()
-            ):
-                _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
-            archive_dir = spec_dir / "questions-archive"
-            archive_dir.mkdir(exist_ok=True)
-            round_file = archive_dir / f"round-{iteration}.md"
-            import shutil
-            shutil.copy(questions_file, round_file)
-            _log(f"Archived questions to {_CYAN}questions-archive/round-{iteration}.md{_RESET}")
-            _log("Continuing after user answers...")
+            _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
 
     else:
         _die(f"Unknown status: {status}")
@@ -654,11 +801,14 @@ async def _cmd_run_async(
         prompt,
         model="claude-opus-4-8",
         max_turns=200,
+        append_args=_SESSION_ARGS,
         cwd=str(spec_dir),
     )
 
     _log("")
     _log(f"Claude finished in {result.duration:.1f}s (exit_code={result.exit_code})")
+
+    _restore_header(spec_dir, mode=mode, preset=preset, iteration=iteration, rejected=rejected)
 
     if result.exit_code != 0:
         update_status(spec_dir, pre_status)
@@ -668,34 +818,29 @@ async def _cmd_run_async(
         )
 
     # ── Detect promise token ─────────────────────────────────────────────────
-    claude_text = _extract_text_from_output(result.output)
-
-    promise = _detect_promise(claude_text)
-    # Fallback: also check raw output in case stream format differs
-    if promise is None:
-        promise = _detect_promise(result.output)
+    promise = _detect_promise(_final_message_text(result.output))
 
     if promise == "COMPLETE":
-        # Gate: reject SPEC_COMPLETE if any [NEEDS CLARIFICATION] markers remain
-        unresolved: list[str] = []
-        domains_dir = spec_dir / "domains"
-        if domains_dir.is_dir():
-            for f in domains_dir.glob("*.md"):
-                content = f.read_text(encoding="utf-8")
-                if "[NEEDS CLARIFICATION" in content:
-                    unresolved.append(f.name)
-
-        if unresolved:
+        # Gate: reject SPEC_COMPLETE while [NEEDS CLARIFICATION: ...] markers remain
+        markers = _find_clarification_markers(spec_dir)
+        if markers:
+            rejected += 1
+            update_rejected_completions(spec_dir, rejected)
+            _record_rejection(spec_dir, iteration, markers, rejected)
             update_status(spec_dir, "NEEDS_INPUT")
             _log(f"{_RED}{_BOLD}SPEC_COMPLETE rejected — unresolved clarification markers{_RESET}")
             _log("")
-            _log(f"The following domain specs contain {_YELLOW}[NEEDS CLARIFICATION]{_RESET} markers:")
-            for fname in unresolved:
-                _log(f"  {_CYAN}{fname}{_RESET}")
+            for marker in markers:
+                _log(f"  {_CYAN}{marker}{_RESET}")
             _log("")
+            _log(f"Listed in {_CYAN}{spec_dir}/HANDOFF.md{_RESET} for the next iteration.")
+            if rejected >= MAX_REJECTED_COMPLETIONS:
+                _stop_for_human(spec_dir, rejected)
             _log(f"Resolve all markers, then run: {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")
             sys.exit(1)
 
+        if rejected:
+            update_rejected_completions(spec_dir, 0)
         update_status(spec_dir, "COMPLETE")
         _log(f"{_GREEN}{_BOLD}SPEC COMPLETE after {iteration} iterations{_RESET}")
         print("")
@@ -704,6 +849,8 @@ async def _cmd_run_async(
         await _cmd_generate_async(spec_dir=spec_dir, split_prs=False)
 
     elif promise == "NEEDS_INPUT":
+        if rejected:
+            update_rejected_completions(spec_dir, 0)
         update_status(spec_dir, "NEEDS_INPUT")
         print("")
         _log(f"{_YELLOW}{_BOLD}Questions ready for you{_RESET}")
@@ -721,7 +868,7 @@ async def _cmd_run_async(
         # No token — revert status
         update_status(spec_dir, pre_status)
         _log(f"{_RED}{_BOLD}No promise token detected{_RESET}")
-        _log("Claude finished without emitting SPEC_NEEDS_INPUT or SPEC_COMPLETE.")
+        _log("Claude's final message contains neither SPEC_NEEDS_INPUT nor SPEC_COMPLETE.")
         _log(f"Status reverted to {pre_status}. You may need to run again.")
         sys.exit(1)
 
@@ -776,6 +923,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
         prompt,
         model="claude-opus-4-8",
         max_turns=200,
+        append_args=_SESSION_ARGS,
         cwd=str(docs_dir),
     )
 
@@ -803,12 +951,21 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
     if not (docs_dir / "IMPLEMENTATION-PLAN.md").exists():
         missing.append("IMPLEMENTATION-PLAN.md")
 
-    if not (docs_dir / "run.sh").exists():
-        missing.append("run.sh")
-
-    prompts_dir = docs_dir / "prompts"
-    if not prompts_dir.is_dir() or not any(prompts_dir.glob("*.md")):
-        missing.append("prompts/*.md")
+    # A single sequence keeps its phase manifest (run.sh) and prompts/ in the
+    # docs dir; split PRs put one of each in every pr-N/ subdirectory.
+    if split_prs:
+        run_dirs = sorted(d for d in docs_dir.glob("pr-*") if d.is_dir())
+        if not run_dirs:
+            missing.append("pr-*/")
+    else:
+        run_dirs = [docs_dir]
+    for run_dir in run_dirs:
+        prefix = "" if run_dir == docs_dir else f"{run_dir.name}/"
+        if not (run_dir / "run.sh").exists():
+            missing.append(f"{prefix}run.sh")
+        prompts_dir = run_dir / "prompts"
+        if not prompts_dir.is_dir() or not any(prompts_dir.glob("*.md")):
+            missing.append(f"{prefix}prompts/*.md")
 
     if missing:
         _log(f"{_YELLOW}Some expected files were not generated:{_RESET}")
@@ -829,12 +986,11 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
         if mode == "backend":
             _log("  API-CONTRACTS.md")
         _log("  IMPLEMENTATION-PLAN.md")
-        _log("  run.sh")
-        for f in sorted(prompts_dir.glob("*.md")):
-            _log(f"  prompts/{f.name}")
-        print("")
-        _log(f"Run implementation: {_CYAN}{docs_dir}/run.sh{_RESET}")
-        _log(f"Dry run first:      {_CYAN}{docs_dir}/run.sh --dry-run{_RESET}")
+        for run_dir in run_dirs:
+            prefix = "" if run_dir == docs_dir else f"{run_dir.name}/"
+            _log(f"  {prefix}run.sh")
+            for f in sorted((run_dir / "prompts").glob("*.md")):
+                _log(f"  {prefix}prompts/{f.name}")
     print("")
 
 

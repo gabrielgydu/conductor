@@ -26,6 +26,12 @@ The spec loop has produced detailed test domain specs for this feature. Read the
 
 {INJECT:DOMAIN_SPECS}
 
+{IF HAS_CONSTITUTION}
+### Project Constitution
+
+{INJECT:CONSTITUTION}
+{ENDIF HAS_CONSTITUTION}
+
 {IF HAS_SPEC_CONTEXT}
 ### Feature Spec Context
 
