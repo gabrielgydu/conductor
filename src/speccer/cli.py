@@ -924,12 +924,21 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
     if not (docs_dir / "IMPLEMENTATION-PLAN.md").exists():
         missing.append("IMPLEMENTATION-PLAN.md")
 
-    if not (docs_dir / "run.sh").exists():
-        missing.append("run.sh")
-
-    prompts_dir = docs_dir / "prompts"
-    if not prompts_dir.is_dir() or not any(prompts_dir.glob("*.md")):
-        missing.append("prompts/*.md")
+    # A single sequence keeps its phase manifest (run.sh) and prompts/ in the
+    # docs dir; split PRs put one of each in every pr-N/ subdirectory.
+    if split_prs:
+        run_dirs = sorted(d for d in docs_dir.glob("pr-*") if d.is_dir())
+        if not run_dirs:
+            missing.append("pr-*/")
+    else:
+        run_dirs = [docs_dir]
+    for run_dir in run_dirs:
+        prefix = "" if run_dir == docs_dir else f"{run_dir.name}/"
+        if not (run_dir / "run.sh").exists():
+            missing.append(f"{prefix}run.sh")
+        prompts_dir = run_dir / "prompts"
+        if not prompts_dir.is_dir() or not any(prompts_dir.glob("*.md")):
+            missing.append(f"{prefix}prompts/*.md")
 
     if missing:
         _log(f"{_YELLOW}Some expected files were not generated:{_RESET}")
@@ -950,12 +959,11 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
         if mode == "backend":
             _log("  API-CONTRACTS.md")
         _log("  IMPLEMENTATION-PLAN.md")
-        _log("  run.sh")
-        for f in sorted(prompts_dir.glob("*.md")):
-            _log(f"  prompts/{f.name}")
-        print("")
-        _log(f"Run implementation: {_CYAN}{docs_dir}/run.sh{_RESET}")
-        _log(f"Dry run first:      {_CYAN}{docs_dir}/run.sh --dry-run{_RESET}")
+        for run_dir in run_dirs:
+            prefix = "" if run_dir == docs_dir else f"{run_dir.name}/"
+            _log(f"  {prefix}run.sh")
+            for f in sorted((run_dir / "prompts").glob("*.md")):
+                _log(f"  {prefix}prompts/{f.name}")
     print("")
 
 

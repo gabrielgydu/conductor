@@ -322,3 +322,49 @@ def test_init_with_existing_domains_resumes_instead_of_starting_over(spec_dir, m
     resumed = sc.build_spec_prompt(spec_dir, "feat", mode, "INIT", 2)
     assert "Resuming Spec Work" in resumed and "First Iteration" not in resumed
     assert "Half-written by an iteration that crashed." in resumed
+
+
+# ---------------------------------------------------------------------------
+# generate output check
+# ---------------------------------------------------------------------------
+
+
+def _write_generate_outputs(docs_dir: Path, run_dirs: list[Path]) -> None:
+    for name in ("PRD.md", "TECHNICAL-DESIGN.md", "API-CONTRACTS.md", "IMPLEMENTATION-PLAN.md"):
+        (docs_dir / name).write_text("x\n", encoding="utf-8")
+    for run_dir in run_dirs:
+        (run_dir / "prompts").mkdir(parents=True)
+        (run_dir / "prompts" / "phase-1.md").write_text("x\n", encoding="utf-8")
+        (run_dir / "run.sh").write_text('PHASES[1]="phase-1.md"\n', encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_prs", [False, True])
+async def test_generate_accepts_the_layout_its_template_asks_for(spec_dir, fake_claude, split_prs):
+    docs_dir = spec_dir.parent
+    _domain(spec_dir, "Done.")
+    sc.update_status(spec_dir, "COMPLETE")
+    run_dirs = [docs_dir / "pr-1", docs_dir / "pr-2"] if split_prs else [docs_dir]
+    fake_claude.on_call = lambda n: _write_generate_outputs(docs_dir, run_dirs)
+
+    await sc._cmd_generate_async(spec_dir=spec_dir, split_prs=split_prs)
+
+    assert sc.read_status(spec_dir) == "GENERATED"
+
+
+@pytest.mark.asyncio
+async def test_split_generate_rejects_a_pr_without_prompts(spec_dir, fake_claude):
+    docs_dir = spec_dir.parent
+    _domain(spec_dir, "Done.")
+    sc.update_status(spec_dir, "COMPLETE")
+
+    def outputs(n):
+        _write_generate_outputs(docs_dir, [docs_dir / "pr-1"])
+        (docs_dir / "pr-2").mkdir()
+        (docs_dir / "pr-2" / "run.sh").write_text("", encoding="utf-8")
+
+    fake_claude.on_call = outputs
+
+    with pytest.raises(SystemExit):
+        await sc._cmd_generate_async(spec_dir=spec_dir, split_prs=True)
+    assert sc.read_status(spec_dir) == "COMPLETE"
