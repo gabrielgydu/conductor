@@ -266,10 +266,12 @@ def assert_reaped(pidfile: Path) -> None:
         os.kill(pid, 0)  # killed *and* reaped: not even a zombie is left
 
 
+# The pid file is written first: once the event is out, run_claude may stop
+# the script at any moment (test_run_claude_error_stops_the_cli aborts on it).
 _HANGING_CLAUDE = """\
+echo $$ > "$PIDFILE"
 cat >/dev/null
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
-echo $$ > "$PIDFILE"
 exec sleep 30
 """
 
