@@ -28,13 +28,24 @@ Use the Agent tool with `subagent_type="codex:codex-rescue"` and ask it to revie
 draft output. Incorporate its feedback where it makes good points, then finalize.
 
 This is non-blocking: if the agent call fails, errors, or times out, proceed with your
-own judgment. Do not let Codex failures delay or block your output.
+own judgment. Do not let Codex failures delay or block your output. So:
+
+- Make one Agent call, in the foreground (not `run_in_background`), and do not
+  schedule wakeups or poll while it runs.
+- Tell the subagent to make a single Codex attempt and to report any error straight
+  back, without retrying or switching models.
 
 **Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.
 If Codex responded, summarize what it said and what you incorporated or disagreed with.
 If the call failed or timed out, note that explicitly (e.g. "Codex was unavailable: <error>").
 This section is important for auditability — always include it.
 """
+
+# Spec and generate sessions are headless one-shots, so a tool that schedules a
+# later re-invocation can only make them wait. In a live run the generate agent
+# armed a 20-minute "fallback heartbeat" wakeup while a background Codex review
+# ran.
+_SESSION_ARGS = ["--disallowedTools", "ScheduleWakeup,CronCreate"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANSI helpers
@@ -776,6 +787,7 @@ async def _cmd_run_async(
         prompt,
         model="claude-opus-4-8",
         max_turns=200,
+        append_args=_SESSION_ARGS,
         cwd=str(spec_dir),
     )
 
@@ -897,6 +909,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
         prompt,
         model="claude-opus-4-8",
         max_turns=200,
+        append_args=_SESSION_ARGS,
         cwd=str(docs_dir),
     )
 

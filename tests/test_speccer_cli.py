@@ -75,11 +75,13 @@ class FakeClaude:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.outputs: list[str] = []
         self.prompts: list[str] = []
+        self.kwargs: list[dict] = []
         self.on_call = None  # optional hook(call number): edit the spec dir like the agent
         monkeypatch.setattr(claude_mod, "run_claude", self)
 
     async def __call__(self, prompt: str, **kwargs) -> ClaudeResult:
         self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
         if self.on_call is not None:
             self.on_call(len(self.prompts))
         output = self.outputs.pop(0) if self.outputs else _stream(_result("done"))
@@ -368,3 +370,34 @@ async def test_split_generate_rejects_a_pr_without_prompts(spec_dir, fake_claude
     with pytest.raises(SystemExit):
         await sc._cmd_generate_async(spec_dir=spec_dir, split_prs=True)
     assert sc.read_status(spec_dir) == "COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# Session latency guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sessions_cannot_schedule_wakeups(spec_dir, fake_claude):
+    _domain(spec_dir, "Done.")
+    fake_claude.outputs = [_complete()]
+
+    await _run(spec_dir)  # spec session, then the auto-invoked generate session
+
+    assert len(fake_claude.kwargs) == 2
+    for kwargs in fake_claude.kwargs:
+        args = kwargs.get("append_args") or []
+        assert "--disallowedTools" in args
+        denied = args[args.index("--disallowedTools") + 1].split(",")
+        assert {"ScheduleWakeup", "CronCreate"} <= set(denied)
+
+
+def test_codex_review_is_one_foreground_attempt(spec_dir):
+    prompts = [
+        sc.build_spec_prompt(spec_dir, "feat", "backend", "INIT", 1),
+        sc.build_generate_prompt(spec_dir, "feat", "backend", False, "toy"),
+    ]
+    for prompt in prompts:
+        assert "in the foreground (not `run_in_background`)" in prompt
+        assert "single Codex attempt" in prompt
+
