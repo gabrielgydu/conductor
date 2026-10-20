@@ -27,6 +27,7 @@ def run_filter(tmp_path: Path, stdin: bytes, **popen_kwargs) -> tuple[subprocess
         input=stdin,
         capture_output=True,
         timeout=10,
+        check=False,
         env={"PYTHONIOENCODING": "utf-8:strict"},
         **popen_kwargs,
     )
@@ -56,6 +57,7 @@ def test_runs_as_a_module_without_warnings(tmp_path):
         input=stream,
         capture_output=True,
         timeout=20,
+        check=False,
         env={"PYTHONPATH": str(FILTER.parents[2]), "PYTHONIOENCODING": "utf-8:strict"},
     )
     assert proc.returncode == 0
@@ -113,8 +115,10 @@ def test_closed_terminal_does_not_stop_the_copy(tmp_path):
             (
                 "error",
                 " (1 turn, $0.0000, 0.7s)",
-                "There's an issue with the selected model (claude-nonexistent-model-0). It may not exist "
-                "or you may not have access to it. Run --model to pick a different model.",
+                (
+                    "There's an issue with the selected model (claude-nonexistent-model-0). It may not exist "
+                    "or you may not have access to it. Run --model to pick a different model."
+                ),
             ),
         ),
     ],

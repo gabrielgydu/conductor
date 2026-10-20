@@ -10,7 +10,7 @@ from typing import Any
 from conductor.core.model_catalog import ModelPricing, pricing_for
 
 # Re-exported: the runner resolves phase models through conductor.core.stats.
-from conductor.core.model_catalog import resolve_model as resolve_model
+from conductor.core.model_catalog import resolve_model as resolve_model  # noqa: PLC0414
 
 
 @dataclass

@@ -199,7 +199,7 @@ def main() -> None:
                 _format_event(event)
             except OSError:
                 display = False  # the terminal went away; keep copying
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 _warn(f"cannot display a {event.get('type')!r} event: {exc!r}")
 
 

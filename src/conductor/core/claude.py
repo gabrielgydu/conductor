@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Callable
 
 # Re-exported: callers resolve aliases through conductor.core.claude.
-from conductor.core.model_catalog import resolve_model as resolve_model
+from conductor.core.model_catalog import resolve_model as resolve_model  # noqa: PLC0414
 from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
@@ -298,7 +298,7 @@ async def _read_stdout(
             continue
         try:
             on_event(event)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Progress output is best effort; it must not cost the session.
             if not callback_failed:
                 callback_failed = True
