@@ -2064,12 +2064,12 @@ async def _run_generation(
     # it here would wipe a previous coverage attempt's matrix on retry.
     save_manual_state(state, conductor_dir, write_markdown=write_markdown_on_finish)
 
-    safe = _safe_name(state.name)
     label_safe = _safe_name(label)
     prompt_file = conductor_dir / "logs" / f"manual-prompt-{generation.index:03d}-{label_safe}.md"
     output_file = conductor_dir / "logs" / f"manual-output-{generation.index:03d}-{label_safe}.jsonl"
     stderr_file = conductor_dir / "logs" / f"manual-stderr-{generation.index:03d}-{label_safe}.log"
-    exit_file = Path(f"/tmp/conductor-manual-exit-{safe}-{generation.index:03d}-{label_safe}")
+    # Per run directory, so two projects using the same --name cannot collide.
+    exit_file = conductor_dir / "logs" / f"manual-exit-{generation.index:03d}-{label_safe}"
     prompt_file.write_text(prompt, encoding="utf-8")
     exit_file.unlink(missing_ok=True)
     output_file.unlink(missing_ok=True)

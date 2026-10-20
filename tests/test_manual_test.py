@@ -1,6 +1,5 @@
 import json
 import subprocess
-import uuid
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -161,8 +160,7 @@ def _new_state(tmp_path: Path):
     plan.write_text(PLAN_TABLE, encoding="utf-8")
     conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        # Unique: _run_generation's exit file lives in /tmp, keyed by this name.
-        name=f"checkout-manual-{uuid.uuid4().hex[:8]}",
+        name="checkout-manual",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -266,6 +264,40 @@ async def test_run_generation_closes_its_window(tmp_path, monkeypatch):
     )
 
     assert tmux.windows and tmux.killed == tmux.windows
+
+
+@pytest.mark.asyncio
+async def test_same_named_runs_in_two_projects_do_not_share_exit_files(tmp_path, monkeypatch):
+    import conductor.core.loop as loop
+
+    _fake_claude(monkeypatch, [(_assistant_text(PASS_RESULT), 0, "")] * 2)
+    fake_wait = loop._wait_for_exit
+    exit_files = []
+
+    async def recording_wait(exit_file, *args):
+        exit_files.append(exit_file)
+        await fake_wait(exit_file, *args)
+
+    monkeypatch.setattr(loop, "_wait_for_exit", recording_wait)
+
+    for project in ["shop", "blog"]:
+        (tmp_path / project).mkdir()
+        repo, conductor_dir, state = _new_state(tmp_path / project)
+        await manual_test._run_generation(
+            state=state,
+            project_dir=repo,
+            conductor_dir=conductor_dir,
+            tmux=_FakeTmux(),
+            prompt="prompt",
+            label="scenario-0",
+            model="sonnet",
+            scenario=state.scenarios[0],
+            log_path=conductor_dir / "MANUAL-TEST-LOG.md",
+            audit_path=conductor_dir / "MANUAL-TEST-AUDIT.jsonl",
+        )
+        assert exit_files[-1].parent == conductor_dir / "logs"
+
+    assert exit_files[0] != exit_files[1]
 
 
 USAGE_LIMIT = "\n".join(
