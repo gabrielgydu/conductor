@@ -19,29 +19,22 @@ from helpers import (
     make_conductor_state,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_run_loop")
+
 
 def _make_spawn_callback(mock_speccer, mock_tmux):
-    """Return a spawn callback that drives MockSpeccer and marks window dead on each spawn.
+    """Return a spawn callback that drives MockSpeccer.
 
-    Runner spawns (window name ends with -exec) are handled separately:
-    they write exit_code=0 so the orchestrator detects clean completion.
+    Speccer spawns are blocking (spawn_in_window_and_wait), so MockTmux ends
+    them itself. Runner spawns (window name ends with -exec) finish at once
+    with exit code 0, so the orchestrator sees a clean completion.
     """
-    import re as _re
 
     def callback(name: str, cmd: str) -> None:
         if name.endswith("-exec"):
-            # Runner spawn — write exit_code=0 so stage transitions to DONE
-            m = _re.search(r"bash docs/([^/]+)/run\.sh", cmd)
-            if m:
-                fname = m.group(1)
-                exit_file = Path(f"/tmp/conductor-exit-{fname}")
-                exit_file.write_text("0")
-            mock_tmux.set_window_alive(name, False)
-            return
-
-        # Speccer spawn
-        mock_speccer._handle_spawn(name, cmd)
-        mock_tmux.set_window_alive(name, False)
+            mock_tmux.finish_window(name, 0)
+        else:
+            mock_speccer._handle_spawn(name, cmd)
 
     return callback
 

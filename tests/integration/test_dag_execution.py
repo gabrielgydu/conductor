@@ -14,18 +14,33 @@ from tests.helpers import (
 
 
 def test_parallel_independent_runs():
-    """DAG-1: Two runs with no deps both activate simultaneously."""
+    """DAG-1: Two runs with no deps both activate simultaneously (no cap)."""
     runs = [
         make_run_state(0, "run-a"),
         make_run_state(1, "run-b"),
     ]
     state = make_conductor_state("dag-test", runs)
 
-    activated = activate_ready_runs(state)
+    activated = activate_ready_runs(state, max_parallel=0)  # 0 = unlimited
 
     assert activated == [0, 1]
     assert state.runs[0].status == RunStatus.ACTIVE
     assert state.runs[1].status == RunStatus.ACTIVE
+
+
+def test_max_parallel_caps_activation():
+    """DAG-1b: The default max_parallel=1 activates one ready run at a time."""
+    runs = [
+        make_run_state(0, "run-a"),
+        make_run_state(1, "run-b"),
+    ]
+    state = make_conductor_state("dag-test", runs)
+
+    assert activate_ready_runs(state) == [0]
+    assert state.runs[1].status == RunStatus.PENDING
+
+    complete_run(state, 0)
+    assert activate_ready_runs(state) == [1]
 
 
 def test_sequential_dependent_runs():
@@ -50,7 +65,7 @@ def test_sequential_dependent_runs():
 
 
 def test_diamond_dependency():
-    """DAG-3: Diamond DAG A -> {B, C} -> D."""
+    """DAG-3: Diamond DAG A -> {B, C} -> D (no concurrency cap)."""
     runs = [
         make_run_state(0, "A"),
         make_run_state(1, "B", depends_on=[0]),
@@ -60,22 +75,22 @@ def test_diamond_dependency():
     state = make_conductor_state("dag-test", runs)
 
     # Pass 1: only A
-    activated = activate_ready_runs(state)
+    activated = activate_ready_runs(state, max_parallel=0)
     assert activated == [0]
 
     # Pass 2: A done -> B and C activate
     complete_run(state, 0)
-    activated = activate_ready_runs(state)
+    activated = activate_ready_runs(state, max_parallel=0)
     assert activated == [1, 2]
 
     # Pass 3: B done, C still active -> D cannot activate (C still active)
     complete_run(state, 1)
-    activated = activate_ready_runs(state)
+    activated = activate_ready_runs(state, max_parallel=0)
     assert 3 not in activated  # D should not be activated yet
 
     # Pass 4: C done -> D activates
     complete_run(state, 2)
-    activated = activate_ready_runs(state)
+    activated = activate_ready_runs(state, max_parallel=0)
     assert activated == [3]
 
 

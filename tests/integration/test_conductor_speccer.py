@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 from conductor.core.enums import StageStatus
 from conductor.core.orchestrator import ConductorConfig, conductor_run_loop
 
+pytestmark = pytest.mark.usefixtures("isolated_run_loop")
+
 # Helpers from shared module
 sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
 from helpers import (
@@ -24,32 +26,18 @@ from helpers import (
 
 
 def _make_spawn_callback(mock_speccer, mock_tmux, *, write_progress: bool = True):
-    """Return a spawn callback that drives MockSpeccer and marks window dead after spawn.
+    """Return a spawn callback that drives MockSpeccer.
 
-    Runner spawns (window name ends with -exec) are handled separately:
-    they write exit_code=0 so the orchestrator detects clean completion.
+    Speccer spawns are blocking (spawn_in_window_and_wait), so MockTmux ends
+    them itself. Runner spawns (window name ends with -exec) finish at once
+    with exit code 0, so the orchestrator sees a clean completion.
     """
 
     def callback(name: str, cmd: str) -> None:
         if name.endswith("-exec"):
-            # This is a runner spawn — write exit_code=0 so stage transitions to DONE
-            import re
-
-            # Extract fname from cmd: "cd {wt} && bash docs/{fname}/run.sh ..."
-            m = re.search(r"bash docs/([^/]+)/run\.sh", cmd)
-            if m:
-                fname = m.group(1)
-                exit_file = Path(f"/tmp/conductor-exit-{fname}")
-                exit_file.write_text("0")
-            # Window stays alive briefly then becomes idle (runner finished)
-            mock_tmux.set_window_alive(name, False)
-            return
-
-        # Speccer spawn
-        if write_progress:
+            mock_tmux.finish_window(name, 0)
+        elif write_progress:
             mock_speccer._handle_spawn(name, cmd)
-        # Mark process as dead (simulates process exiting after writing status)
-        mock_tmux.set_window_alive(name, False)
 
     return callback
 

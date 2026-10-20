@@ -1,4 +1,4 @@
-"""Integration tests: E2E testing pipeline (TDD — conductor.integration.e2e not yet implemented)."""
+"""Integration tests: E2E testing pipeline (conductor.integration.e2e.run_integration_testing)."""
 
 from __future__ import annotations
 
@@ -60,29 +60,6 @@ def _make_state(project_name: str, *runs: RunState) -> ConductorState:
     )
 
 
-def _add_file_to_branch(repo_path: Path, branch: str, filename: str, content: str):
-    """Checkout branch, add file, commit, checkout main."""
-    subprocess.run(
-        ["git", "-C", str(repo_path), "checkout", branch],
-        check=True,
-        capture_output=True,
-    )
-    (repo_path / filename).write_text(content)
-    subprocess.run(
-        ["git", "-C", str(repo_path), "add", filename], check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo_path), "commit", "-m", f"add {filename}"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo_path), "checkout", "main"],
-        check=True,
-        capture_output=True,
-    )
-
-
 def _make_state_with_integration(project_name: str, branch_name: str) -> ConductorState:
     """ConductorState with completed merge (integration branch set)."""
     state = _make_state(
@@ -98,6 +75,53 @@ def _make_state_with_integration(project_name: str, branch_name: str) -> Conduct
     return state
 
 
+_SPEC = "tests/Playwright/tests/conductor-integration.spec.ts"
+
+
+def _integration_worktree(repo: Path, project_name: str) -> Path:
+    """Check out integration/<project> in *repo* and use it as the worktree."""
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", f"integration/{project_name}"],
+        check=True,
+        capture_output=True,
+    )
+    return repo
+
+
+def _claude_writes_spec(worktree: Path) -> AsyncMock:
+    """run_claude stand-in: 'generates' the integration spec in the worktree."""
+
+    async def generate(prompt, **kwargs):
+        assert kwargs["cwd"] == str(worktree)
+        spec = worktree / _SPEC
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("// generated tests\n")
+        return "// generated tests"
+
+    return AsyncMock(side_effect=generate)
+
+
+def _fake_npx(test_output: str = "", test_rc: int = 0, playwright_rc: int = 0) -> AsyncMock:
+    """create_subprocess_exec stand-in for `npx playwright --version` / `test`.
+
+    Never lets the real npx run: it would install Playwright from the network.
+    """
+
+    def proc(rc: int, stdout: str) -> MagicMock:
+        p = MagicMock()
+        p.returncode = rc
+        p.communicate = AsyncMock(return_value=(stdout.encode(), b""))
+        return p
+
+    async def spawn(*args, **kwargs):
+        assert args[:2] == ("npx", "playwright"), args
+        if "--version" in args:
+            return proc(playwright_rc, "Version 1.50.0" if playwright_rc == 0 else "")
+        return proc(test_rc, test_output)
+
+    return AsyncMock(side_effect=spawn)
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Claude generates tests, npx executes them, results captured
 # ---------------------------------------------------------------------------
@@ -110,90 +134,52 @@ async def test_e2e_generation_and_execution(real_merge_repo, tmp_path):
         pytest.skip("conductor.integration.e2e not yet implemented")
 
     project_name = _project_name(tmp_path)
-    integration_branch = f"integration/{project_name}"
-
-    # Create integration branch with playwright config
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "-b", integration_branch],
-        check=True,
-        capture_output=True,
-    )
-    _add_file_to_branch(
-        real_merge_repo.path,
-        integration_branch,
-        "playwright.config.ts",
-        "export default { testDir: './tests' }\n",
-    )
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "main"],
-        check=True,
-        capture_output=True,
-    )
-
-    state = _make_state_with_integration(project_name, integration_branch)
+    worktree = _integration_worktree(real_merge_repo.path, project_name)
+    state = _make_state_with_integration(project_name, f"integration/{project_name}")
     storage = FakeStorage(real_merge_repo.path)
 
-    # Mock process with communicate() returning 3 passed
-    mock_proc = MagicMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(
-        return_value=(b"3 passed, 0 failed, 0 skipped", b"")
-    )
-
-    with patch(
-        "conductor.integration.e2e.run_claude",
-        new_callable=AsyncMock,
-        return_value="// generated tests",
-    ):
-        with patch(
-            "asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=mock_proc,
-        ):
-            result = await run_integration_testing(state, storage)
+    claude = _claude_writes_spec(worktree)
+    npx = _fake_npx("3 passed, 0 failed, 0 skipped")
+    with patch("conductor.integration.e2e.run_claude", new=claude):
+        with patch("asyncio.create_subprocess_exec", new=npx):
+            result = await run_integration_testing(state, storage, worktree)
 
     assert isinstance(result, E2ETestState)
     assert result.passed == 3
     assert result.failed == 0
     assert result.skipped == 0
     assert result.last_run_at is not None
+    claude.assert_awaited_once()
+    assert ("npx", "playwright", "test", _SPEC) in [c.args for c in npx.await_args_list]
 
 
 # ---------------------------------------------------------------------------
-# Test 2: No playwright/cypress config — testing skipped
+# Test 2: No Playwright in the worktree — testing skipped
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_e2e_skipped_no_framework(real_merge_repo, tmp_path):
-    """No test framework config on integration branch — testing skipped."""
+    """No usable Playwright in the integration worktree — testing skipped, no Claude call."""
     if run_integration_testing is None:
         pytest.skip("conductor.integration.e2e not yet implemented")
 
     project_name = _project_name(tmp_path)
-    integration_branch = f"integration/{project_name}"
-
-    # Create integration branch with NO test framework config
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "-b", integration_branch],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "main"],
-        check=True,
-        capture_output=True,
-    )
-
-    state = _make_state_with_integration(project_name, integration_branch)
+    worktree = _integration_worktree(real_merge_repo.path, project_name)
+    state = _make_state_with_integration(project_name, f"integration/{project_name}")
     storage = FakeStorage(real_merge_repo.path)
 
-    result = await run_integration_testing(state, storage)
+    claude = _claude_writes_spec(worktree)
+    npx = _fake_npx(playwright_rc=1)
+    with patch("conductor.integration.e2e.run_claude", new=claude):
+        with patch("asyncio.create_subprocess_exec", new=npx):
+            result = await run_integration_testing(state, storage, worktree)
 
     assert isinstance(result, E2ETestState)
     assert result.passed == 0
     assert result.failed == 0
     assert result.skipped >= 1
+    claude.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -208,47 +194,16 @@ async def test_e2e_failures_dont_block(real_merge_repo, tmp_path):
         pytest.skip("conductor.integration.e2e not yet implemented")
 
     project_name = _project_name(tmp_path)
-    integration_branch = f"integration/{project_name}"
-
-    # Create integration branch with playwright config
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "-b", integration_branch],
-        check=True,
-        capture_output=True,
-    )
-    _add_file_to_branch(
-        real_merge_repo.path,
-        integration_branch,
-        "playwright.config.ts",
-        "export default { testDir: './tests' }\n",
-    )
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "checkout", "main"],
-        check=True,
-        capture_output=True,
-    )
-
-    state = _make_state_with_integration(project_name, integration_branch)
+    worktree = _integration_worktree(real_merge_repo.path, project_name)
+    state = _make_state_with_integration(project_name, f"integration/{project_name}")
     storage = FakeStorage(real_merge_repo.path)
 
-    # Mock process returning exit code 1 with 1 passed, 2 failed
-    mock_proc = MagicMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(
-        return_value=(b"1 passed, 2 failed, 0 skipped", b"")
-    )
-
-    with patch(
-        "conductor.integration.e2e.run_claude",
-        new_callable=AsyncMock,
-        return_value="// generated tests",
-    ):
-        with patch(
-            "asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=mock_proc,
-        ):
-            result = await run_integration_testing(state, storage)
+    # Playwright is available, but the generated tests fail: 1 passed, 2 failed
+    claude = _claude_writes_spec(worktree)
+    npx = _fake_npx("1 passed, 2 failed, 0 skipped", test_rc=1)
+    with patch("conductor.integration.e2e.run_claude", new=claude):
+        with patch("asyncio.create_subprocess_exec", new=npx):
+            result = await run_integration_testing(state, storage, worktree)
 
     # Function must return normally — no exception raised
     assert isinstance(result, E2ETestState)

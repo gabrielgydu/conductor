@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,16 +12,52 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from conductor.core.enums import RunStatus, StageStatus
-from conductor.core.orchestrator import ConductorConfig, conductor_run_loop
-from conductor.core.storage import StorageResolver
+from conductor.core.orchestrator import (
+    ConductorConfig,
+    compute_progress_hash,
+    conductor_run_loop,
+)
 
 # Helpers from shared module
 sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
 from helpers import (
     assert_brain_call_logged,
+    assert_log_contains_events,
     make_conductor_state,
     make_run_state,
 )
+
+pytestmark = pytest.mark.usefixtures("isolated_run_loop")
+
+WINDOW = "run0:stage-0-exec"
+
+
+def _audit_log(storage_dir: Path) -> Path:
+    """CONDUCTOR-AUDIT.jsonl gets every event; CONDUCTOR-LOG.md only some."""
+    return storage_dir / "conductor" / "test-project" / "CONDUCTOR-AUDIT.jsonl"
+
+
+def _executing_state(tmp_path: Path, activity: str | None = None):
+    """test-run stage-0 EXECUTING in a worktree, runner started 10 minutes ago.
+
+    The start time puts the stage past monitor_runner's 30 s/60 s and
+    check_stall's 5 min grace periods. *activity* becomes the runner's
+    docs/test-run/activity.log, the file the stall check hashes.
+    """
+    run = make_run_state(0, "test-run")
+    stage = run.stages[0]
+    stage.status = StageStatus.EXECUTING
+    stage.pid = 12345
+    stage.started_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    wt_dir = tmp_path / "worktrees" / "wt-0"
+    wt_dir.mkdir(parents=True, exist_ok=True)
+    stage.worktree = str(wt_dir)
+    stage.branch = "conductor/test-project/test-run/stage-0"
+    if activity is not None:
+        log = wt_dir / "docs" / "test-run" / "activity.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(activity)
+    return make_conductor_state("test-project", [run])
 
 
 # ---------------------------------------------------------------------------
@@ -46,20 +83,13 @@ async def test_conductor_starts_runner_after_generate(
     state = make_conductor_state("test-project", [run])
     config = ConductorConfig(check_interval_s=0.0, max_iterations=20)
 
-    # Write run.sh to feature dir
-    storage = StorageResolver(Path.cwd())
-    feature_dir = storage.feature_dir("test-run")
-    mock_runner.write_run_sh(feature_dir)
+    # speccer generate leaves run.sh (with PHASES) in the worktree's docs/<feature>/
+    mock_runner.write_run_sh(wt_dir / "docs" / "test-run")
 
-    # Spawn callback: runner exits immediately after spawning
+    # Spawn callback: runner exits 0 right after spawning
     def spawn_callback(name: str, cmd: str) -> None:
-        if "run.sh" in cmd or "-exec" in name:
-            mock_tmux.set_window_alive(name, False)
-            mock_tmux.set_window_exit_code(name, 0)
-            # Write exit_code file so orchestrator can read it
-            # The orchestrator looks for /tmp/conductor-exit-{fname}
-            exit_file = Path(f"/tmp/conductor-exit-test-run")
-            exit_file.write_text("0")
+        if name.endswith("-exec"):
+            mock_tmux.finish_window(name, 0)
 
     mock_tmux.set_spawn_callback(spawn_callback)
 
@@ -71,20 +101,16 @@ async def test_conductor_starts_runner_after_generate(
         f"Expected EXECUTING or DONE after runner spawn, got {final_status}"
     )
 
-    # Runner window spawned (cmd contains run.sh or is a runner-type spawn)
+    # Runner window spawned via spawn_runner_in_window
     spawned = mock_tmux.get_spawned_commands()
-    assert any("run.sh" in entry["cmd"] or entry.get("runner") for entry in spawned), (
+    assert any(entry.get("runner") for entry in spawned), (
         f"Expected runner spawn, got: {[e['cmd'] for e in spawned]}"
     )
 
-    # CONDUCTOR-LOG.md contains runner start event
-    conductor_log = tmp_storage_dir / "conductor" / "test-project" / "CONDUCTOR-LOG.md"
-    assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
-    log_content = conductor_log.read_text()
-    assert any(
-        keyword in log_content.lower()
-        for keyword in ["runner", "executing", "run_started", "runner_started"]
-    ), f"Expected runner event in log, got: {log_content}"
+    # Audit log records the runner start and its clean exit
+    assert_log_contains_events(
+        _audit_log(tmp_storage_dir), ["RUNNER_START", "RUNNER_EXIT"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +170,7 @@ async def test_conductor_detects_runner_completion(
 
 
 # ---------------------------------------------------------------------------
-# CR-3: Stall detection with 5-check cap
+# CR-3: Stall detection with heartbeat suppression
 # ---------------------------------------------------------------------------
 
 
@@ -156,56 +182,28 @@ async def test_conductor_detects_runner_stall(
     tmp_storage_dir,
     tmp_path,
 ):
-    """Stall detection fires, brain invoked, auto-fail at stall_count=5."""
-    run = make_run_state(0, "test-run")
-    run.stages[0].status = StageStatus.EXECUTING
-    run.stages[0].pid = 12345
-    # Set up worktree for the stage
-    wt_dir = tmp_path / "worktrees" / "wt-0"
-    wt_dir.mkdir(parents=True, exist_ok=True)
-    run.stages[0].worktree = str(wt_dir)
-    run.stages[0].branch = "conductor/test-project/test-run/stage-0"
-    state = make_conductor_state("test-project", [run])
-    config = ConductorConfig(check_interval_s=0.0, max_iterations=20)
+    """Frozen activity log is counted as a stall, but a live Claude caps it.
 
-    # Runner window stays alive but makes no progress
-    window_name = "run0:stage-0-exec"
-    mock_tmux.set_window_alive(window_name, True)
-
-    # Activity log exists but never changes (stall condition)
-    # The orchestrator looks for /tmp/conductor-activity-{fname}*
-    activity_log = Path("/tmp/conductor-activity-test-run")
-    activity_log.write_text("stuck here\n")
-
-    # Brain returns retry action when diagnosed
-    mock_claude_cli.set_response(
-        "diagnos",
-        '{"action": "retry", "message": "Retrying"}',
-    )
+    While the runner's process tree is healthy (has_active_children), the
+    heartbeat keeps stall_count at 1, so no diagnose-stall brain call is made
+    and the stage keeps EXECUTING: a long tool call is not a stall.
+    """
+    state = _executing_state(tmp_path, activity="stuck here\n")
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=6)
+    mock_tmux.set_window_alive(WINDOW, True)
+    mock_tmux.set_window_children(WINDOW, True)
 
     result = await conductor_run_loop(state, config)
 
-    # Stage should be FAILED or BLOCKED after stall_count reaches 5
-    assert result.runs[0].stages[0].status in (
-        StageStatus.FAILED,
-        StageStatus.BLOCKED,
-    ), (
-        f"Expected FAILED or BLOCKED after stall cap, got {result.runs[0].stages[0].status}"
+    run = result.runs[0]
+    assert run.stages[0].status == StageStatus.EXECUTING
+    assert run.monitor.stall_count == 1, (
+        f"Expected heartbeat to cap stall_count at 1, got {run.monitor.stall_count}"
     )
+    assert run.monitor.last_heartbeat_ts is not None
+    assert mock_claude_cli.call_count == 0, "No brain call while Claude is alive"
 
-    # stall_count should have reached 5
-    assert result.runs[0].monitor.stall_count >= 5, (
-        f"Expected stall_count >= 5, got {result.runs[0].monitor.stall_count}"
-    )
-
-    # CONDUCTOR-LOG.md contains stall event
-    conductor_log = tmp_storage_dir / "conductor" / "test-project" / "CONDUCTOR-LOG.md"
-    assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
-    log_content = conductor_log.read_text()
-    assert any(
-        keyword in log_content.lower()
-        for keyword in ["stall", "stall_count", "auto-failed"]
-    ), f"Expected stall event in log, got: {log_content}"
+    assert_log_contains_events(_audit_log(tmp_storage_dir), ["STALL_CHECK"])
 
 
 # ---------------------------------------------------------------------------
@@ -221,45 +219,36 @@ async def test_conductor_steers_stalled_runner(
     tmp_storage_dir,
     tmp_path,
 ):
-    """Brain diagnosis returns STEER, conductor sends steer message to runner."""
-    run = make_run_state(0, "test-run")
-    run.stages[0].status = StageStatus.EXECUTING
-    run.stages[0].pid = 12345
-    # Set up worktree for the stage
-    wt_dir = tmp_path / "worktrees" / "wt-0"
-    wt_dir.mkdir(parents=True, exist_ok=True)
-    run.stages[0].worktree = str(wt_dir)
-    run.stages[0].branch = "conductor/test-project/test-run/stage-0"
-    state = make_conductor_state("test-project", [run])
-    config = ConductorConfig(check_interval_s=0.0, max_iterations=20)
+    """Brain diagnosis returns STEER, conductor writes it to the runner's steer_inbox.
 
-    # Runner window alive but stalled
-    window_name = "run0:stage-0-exec"
-    mock_tmux.set_window_alive(window_name, True)
-
-    # Activity log never changes
-    # The orchestrator looks for /tmp/conductor-activity-{fname}*
-    activity_log = Path("/tmp/conductor-activity-test-run")
-    activity_log.write_text("working on task\n")
+    Escalation needs stall_count >= 2 without the heartbeat cap: the activity
+    log already looked frozen on the previous check (stall_count=1) and the
+    Claude process is gone now (shallow process tree).
+    """
+    state = _executing_state(tmp_path, activity="working on task\n")
+    run = state.runs[0]
+    run.monitor.last_progress_hash = compute_progress_hash(state, 0, 0, None)
+    run.monitor.stall_count = 1
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=1)
+    mock_tmux.set_window_alive(WINDOW, True)
+    mock_tmux.set_window_children(WINDOW, False)
 
     steer_message = "Focus on the database migration"
-
-    # Brain returns steer action
-    mock_claude_cli.set_response(
-        "diagnos",
-        f'{{"action": "steer", "message": "{steer_message}"}}',
-    )
+    # The diagnose-stall prompt carries a "## Stall Duration" section
+    mock_claude_cli.set_response("## Stall Duration", f"ACTION: STEER\n{steer_message}")
 
     result = await conductor_run_loop(state, config)
 
-    # Brain should have been called - check that brain was invoked in logs
-    # (brain call logs dir might not exist if brain is mocked)
-    conductor_log = tmp_storage_dir / "conductor" / "test-project" / "CONDUCTOR-LOG.md"
-    assert conductor_log.exists(), "CONDUCTOR-LOG.md was not created"
-    log_content = conductor_log.read_text()
-    assert any(
-        keyword in log_content.lower() for keyword in ["brain", "diagnos", "stall"]
-    ), f"Expected brain call in log, got: {log_content}"
+    assert result.runs[0].monitor.stall_count == 2
+    assert mock_claude_cli.call_count == 1, "Expected one diagnose-stall brain call"
+
+    inbox = Path(state.runs[0].stages[0].worktree) / "docs" / "test-run" / "steer_inbox"
+    messages = [m.read_text() for m in sorted(inbox.glob("*.msg"))]
+    assert messages == [steer_message], f"Expected steer message in inbox, got {messages}"
+
+    assert_log_contains_events(
+        _audit_log(tmp_storage_dir), ["diagnose-stall", "RUNNER_STEER"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -276,20 +265,11 @@ async def test_conductor_detects_dead_runner(
     tmp_path,
 ):
     """Runner dies without exit file, conductor detects and handles it."""
-    run = make_run_state(0, "test-run")
-    run.stages[0].status = StageStatus.EXECUTING
-    run.stages[0].pid = 12345
-    # Set up worktree for the stage
-    wt_dir = tmp_path / "worktrees" / "wt-0"
-    wt_dir.mkdir(parents=True, exist_ok=True)
-    run.stages[0].worktree = str(wt_dir)
-    run.stages[0].branch = "conductor/test-project/test-run/stage-0"
-    state = make_conductor_state("test-project", [run])
+    state = _executing_state(tmp_path)
     config = ConductorConfig(check_interval_s=0.0, max_iterations=20)
 
     # Runner window is dead — no exit file written
-    window_name = "run0:stage-0-exec"
-    mock_tmux.set_window_alive(window_name, False)
+    mock_tmux.set_window_alive(WINDOW, False)
     # Intentionally no exit_code file (this is the key to dead runner detection)
 
     result = await conductor_run_loop(state, config)
@@ -310,3 +290,37 @@ async def test_conductor_detects_dead_runner(
         keyword in log_content.lower()
         for keyword in ["failure", "failed", "brain_call", "diagnose"]
     ), f"Expected failure event in log, got: {log_content}"
+
+
+# ---------------------------------------------------------------------------
+# CR-6: Zombie runner (window open, Claude process gone)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_conductor_detects_zombie_runner(
+    mock_tmux,
+    mock_runner,
+    mock_claude_cli,
+    tmp_storage_dir,
+    tmp_path,
+):
+    """Shallow process tree on 3 checks -> exit 143 -> infra retry from GENERATED."""
+    state = _executing_state(tmp_path, activity="last words\n")
+    mock_runner.write_run_sh(Path(state.runs[0].stages[0].worktree) / "docs" / "test-run")
+    # 3 checks to declare the zombie, then one advance to handle the failure
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=4)
+    mock_tmux.set_window_alive(WINDOW, True)
+    mock_tmux.set_window_children(WINDOW, False)
+
+    result = await conductor_run_loop(state, config)
+
+    stage = result.runs[0].stages[0]
+    assert stage.infra_retries == 1, f"Expected one infra retry, got {stage.infra_retries}"
+    assert stage.status == StageStatus.GENERATED, (
+        f"Expected restart from GENERATED (valid run.sh), got {stage.status}"
+    )
+    assert mock_claude_cli.call_count == 0, "Infra failures retry without a brain call"
+    assert_log_contains_events(
+        _audit_log(tmp_storage_dir), ["RUNNER_SHALLOW_TREE", "RUNNER_ZOMBIE", "INFRA_RETRY"]
+    )

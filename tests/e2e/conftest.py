@@ -16,6 +16,7 @@ from tests.integration.conftest import (  # noqa: F401
     mock_tmux,
     mock_speccer,
     mock_runner,
+    isolated_run_loop,
     tmp_git_repo,
     tmp_storage_dir,
     MockClaudeCLI,
