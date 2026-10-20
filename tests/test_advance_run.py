@@ -372,3 +372,25 @@ async def test_advance_run_blocked_sets_run_status(tmp_path):
         await advance_run(state, 0, tmux, storage, config)
 
     assert state.runs[0].status == RunStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_advance_run_pending_blocks_on_conflicting_dependencies(tmp_path):
+    state = _make_state(StageStatus.PENDING)
+    stage = state.runs[0].stages[0]
+
+    def conflict(*args, **kwargs):
+        raise orch.DependencyMergeError("dependency x conflicts with y in: app.py")
+
+    with (
+        patch.object(orch, "create_worktree", side_effect=conflict),
+        patch.object(orch, "run_speccer_init", new=AsyncMock()) as init,
+        patch.object(orch, "atomic_save"),
+    ):
+        await advance_run(
+            state, 0, _make_tmux(), _make_storage(tmp_path), _make_config()
+        )
+
+    assert stage.status == StageStatus.BLOCKED
+    assert "app.py" in stage.last_error
+    init.assert_not_awaited()

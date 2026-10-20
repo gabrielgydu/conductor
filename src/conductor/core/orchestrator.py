@@ -395,6 +395,47 @@ def _release_stale_worktrees(
     return None
 
 
+class DependencyMergeError(RuntimeError):
+    """A run's dependency branches could not be merged into its first worktree."""
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
+def _merge_dependencies(wt: Path, branch: str, dep_branches: list[str]) -> list[str]:
+    """Merge every dependency branch that *wt*'s HEAD does not contain yet.
+
+    Returns the branches merged by this call. Idempotent: a branch already
+    in HEAD is skipped, and a merge a crash left half-done is aborted and
+    redone. On a conflict the merge is aborted (the worktree stays clean)
+    and DependencyMergeError names the conflicting files.
+    """
+    def merging() -> bool:
+        return _git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+
+    if merging():
+        _git(wt, "merge", "--abort")
+    merged: list[str] = []
+    for dep in dep_branches:
+        if _git(wt, "merge-base", "--is-ancestor", dep, "HEAD").returncode == 0:
+            continue
+        r = _git(wt, "merge", "--no-edit", "-m", f"Merge dependency {dep} into {branch}", dep)
+        if r.returncode != 0:
+            conflicts = _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            if merging():
+                _git(wt, "merge", "--abort")
+            if conflicts:
+                raise DependencyMergeError(
+                    f"dependency {dep} conflicts with {branch} in: {', '.join(conflicts)}"
+                )
+            raise DependencyMergeError(
+                f"git merge {dep} failed in {wt}: {(r.stderr or r.stdout).strip()[-500:]}"
+            )
+        merged.append(dep)
+    return merged
+
+
 def create_worktree(
     state: ConductorState,
     run_idx: int,
@@ -445,13 +486,20 @@ def create_worktree(
     if stage.worktree and _worktree_branch(Path(stage.worktree)) == branch:
         wt_candidate = Path(stage.worktree)
 
-    # Determine base ref
+    # Determine base ref. The first stage of a run with dependencies starts
+    # from the last one and merges the others in (below), so it sees the
+    # work of every dependency, not just one.
+    dep_branches: list[str] = []
+    if stage_idx == 0 and run.depends_on:
+        run_by_index = {r.index: r for r in state.runs}
+        dep_branches = [
+            b for d in run.depends_on
+            if (b := run_by_index[d].stages[-1].branch if run_by_index[d].stages else None)
+        ]
     if stage_idx > 0:
         base_ref = run.stages[stage_idx - 1].branch
-    elif run.depends_on:
-        run_by_index = {r.index: r for r in state.runs}
-        dep_run = run_by_index[run.depends_on[-1]]
-        base_ref = dep_run.stages[-1].branch
+    elif dep_branches:
+        base_ref = dep_branches[-1]
     else:
         base_ref = state.base_branch
 
@@ -501,9 +549,14 @@ def create_worktree(
     stage.branch = branch
     stage.worktree = str(wt_candidate)
 
+    # Raises DependencyMergeError on a conflict, with branch and worktree
+    # already recorded so the conflict can be resolved there.
+    merged = _merge_dependencies(wt_candidate, branch, dep_branches)
+
     _log(
         "WORKTREE_CREATE",
-        f"run {run_idx} stage {stage_idx}: {wt_candidate} <- {base_ref}",
+        f"run {run_idx} stage {stage_idx}: {wt_candidate} <- {base_ref}"
+        + (f" (merged {', '.join(merged)})" if merged else ""),
         log_path,
         audit_path,
         run=run_idx,
@@ -511,6 +564,7 @@ def create_worktree(
         branch=branch,
         worktree=str(wt_candidate),
         base_ref=base_ref,
+        merged_dependencies=merged,
     )
 
 
@@ -2685,9 +2739,27 @@ async def advance_run(
 
     # ----- pending -----
     if status == StageStatus.PENDING:
-        create_worktree(
-            state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
-        )  # noqa: E501
+        try:
+            create_worktree(
+                state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+            )
+        except DependencyMergeError as exc:
+            # Retrying cannot resolve a conflict between dependencies; block
+            # until someone commits the merge in the worktree.
+            stage.last_error = str(exc)
+            stage.status = StageStatus.BLOCKED
+            _log(
+                "FAILURE",
+                f"Run {run.name} stage {stage.name}: {exc}. Commit the merge in "
+                f"{stage.worktree} by hand; the stage resumes from there on restart.",
+                log_path,
+                audit_path,
+                run=run_idx,
+                stage=stage_idx,
+                reason="dependency_conflict",
+            )
+            atomic_save(state, storage.conductor_state(state.project_name))
+            return
         await run_speccer_init(
             state, run_idx, stage_idx, tmux, storage, log_path, audit_path
         )
