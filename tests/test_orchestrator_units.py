@@ -435,3 +435,14 @@ async def test_restart_regenerates_an_unusable_manifest(tmp_path):
 
     assert stage.status == StageStatus.SPEC_COMPLETE
     assert not run_sh.exists()
+
+
+def test_ordinary_runner_failure_is_diagnosed_not_blindly_restarted(tmp_path):
+    """The runner writes activity.log until it exits 1 (max iterations, gates)."""
+    docs = tmp_path / "wt" / "docs" / "feat"
+    docs.mkdir(parents=True)
+    (docs / "activity.log").write_text("phase 2: max iterations reached\n")
+    stage = StageState(name="s", spec_mode="full", worktree=str(tmp_path / "wt"))
+
+    assert orch.classify_failure("feat", 1, stage, []) == "logic"
+    assert orch.classify_failure("feat", 143, stage, []) == "infra"

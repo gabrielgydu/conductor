@@ -2176,22 +2176,16 @@ def classify_failure(
 
     - Exit 137/143 (signal kills) → infra
     - Exit 1 + transient API error patterns in fail log → transient
-    - Exit 1 + activity log modified within 60s → infra (mid-work crash)
-    - Everything else → logic
+    - Everything else → logic, which gets a diagnosis
+
+    A recently written activity.log says nothing about the cause: the runner
+    logs until just before it exits, so an ordinary phase failure (max
+    iterations, failing gates) always looks fresh when handled promptly.
     """
     if exit_code in (137, 143):
         return "infra"
-    if exit_code == 1:
-        if _is_transient_api_error(fail_logs or []):
-            return "transient"
-        if stage.worktree:
-            activity_log = Path(stage.worktree) / "docs" / fname / "activity.log"
-            try:
-                mtime = activity_log.stat().st_mtime
-                if time.time() - mtime < 60:
-                    return "infra"
-            except OSError:
-                pass
+    if exit_code == 1 and _is_transient_api_error(fail_logs or []):
+        return "transient"
     return "logic"
 
 
