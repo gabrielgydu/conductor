@@ -59,6 +59,19 @@ class StageState(BaseModel):
     first_transient_failure_ts: datetime | None = None
     backoff_until: datetime | None = None
     last_exit_code: int | None = None
+    # Why conductor itself failed or stopped this stage (an exception while
+    # advancing it, a silent speccer step, an unusable run.sh), shown to the
+    # failure diagnosis.
+    last_error: str | None = None
+    # Consecutive speccer runs that exited non-zero and left the spec waiting
+    # for input, plus auto-answers that did not answer every question. Reset
+    # by a clean speccer exit; the stage FAILs when it reaches the limit.
+    spec_failures: int = 0
+    # `speccer run --continue` rounds started with auto-answered questions.
+    question_rounds: int = 0
+    # Worktree HEAD when the last failure was handled; a different HEAD at the
+    # next failure means the runner committed in between (real progress).
+    last_failure_head: str | None = None
 
 
 class RunState(BaseModel):
@@ -121,6 +134,10 @@ class IntegrationState(BaseModel):
     status: IntegrationStatus = IntegrationStatus.PENDING
     branch: str
     merged_runs: list[int] = []
+    # DONE runs when this integration was attempted. A run DONE later is not
+    # in it and triggers a new integration; an attempt that failed before it
+    # could merge anything leaves it empty, so it is retried on the next start.
+    considered_runs: list[int] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     e2e: Optional[E2ETestState] = None
@@ -142,6 +159,9 @@ class ConductorState(BaseModel):
     quick: bool = False
     max_parallel: int = 1
     worktrees_base: Optional[str] = None
+    # sha256 of the LEARNINGS.md set last reviewed, so an unchanged set is
+    # not reviewed (and appended to CLAUDE.md) again on every loop exit.
+    learnings_reviewed: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

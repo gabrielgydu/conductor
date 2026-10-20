@@ -10,8 +10,8 @@ Covers:
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,7 +23,6 @@ from conductor.core.orchestrator import (
     compute_progress_hash,
     pre_reset_speccer_status,
     speccer_exit_code_handler,
-    sync_speccer_status,
 )
 
 
@@ -191,54 +190,50 @@ def test_pre_reset_no_progress_file_is_noop(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _ipc_storage(tmp_path: Path) -> SimpleNamespace:
+    """Storage stub whose conductor_dir is a real directory under tmp_path."""
+    return SimpleNamespace(conductor_dir=lambda name: tmp_path / "conductor-home" / name)
+
+
+def _write_speccer_exit(storage, fname: str, code: str) -> Path:
+    exit_file = orch._speccer_exit_file(storage, "proj", fname)
+    exit_file.write_text(code)
+    return exit_file
+
+
 def test_exit_handler_exit_0_calls_sync(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "COMPLETE")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "0")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("0")
-
-    try:
-        with patch.object(orch, "sync_speccer_status") as mock_sync:
-            speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        mock_sync.assert_called_once()
-    finally:
-        exit_file.unlink(missing_ok=True)
+    with patch.object(orch, "sync_speccer_status") as mock_sync:
+        speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    mock_sync.assert_called_once()
 
 
 def test_exit_handler_nonzero_recoverable_calls_sync(tmp_path):
     """Non-zero exit + PROGRESS shows NEEDS_INPUT -> sync (not failed)."""
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "NEEDS_INPUT")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "1")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("1")
-
-    try:
-        with patch.object(orch, "sync_speccer_status") as mock_sync:
-            speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        mock_sync.assert_called_once()
-        assert state.runs[0].stages[0].status != StageStatus.FAILED
-    finally:
-        exit_file.unlink(missing_ok=True)
+    with patch.object(orch, "sync_speccer_status") as mock_sync:
+        speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    mock_sync.assert_called_once()
+    assert state.runs[0].stages[0].status != StageStatus.FAILED
 
 
 def test_exit_handler_nonzero_nonrecoverable_sets_failed(tmp_path):
     """Non-zero exit + PROGRESS shows INIT -> stage set to FAILED."""
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "INIT")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "2")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("2")
-
-    try:
-        speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        assert state.runs[0].stages[0].status == StageStatus.FAILED
-    finally:
-        exit_file.unlink(missing_ok=True)
+    speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    assert state.runs[0].stages[0].status == StageStatus.FAILED
 
 
 def test_exit_handler_no_exit_file_recoverable_status_syncs(tmp_path):
@@ -246,12 +241,8 @@ def test_exit_handler_no_exit_file_recoverable_status_syncs(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "GENERATED")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.unlink(missing_ok=True)
-
     with patch.object(orch, "sync_speccer_status") as mock_sync:
-        speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
+        speccer_exit_code_handler(state, 0, 0, "run-0", _ipc_storage(tmp_path))
 
     mock_sync.assert_called_once()
 
@@ -265,13 +256,41 @@ def test_exit_handler_no_exit_file_no_progress_sets_failed(tmp_path):
     )
     state = ConductorState(project_name="proj", base_branch="main", runs=[run])
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.unlink(missing_ok=True)
-
-    speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
+    speccer_exit_code_handler(state, 0, 0, "run-0", _ipc_storage(tmp_path))
 
     assert state.runs[0].stages[0].status == StageStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Exit/fail files are per project, not global /tmp names
+# ---------------------------------------------------------------------------
+
+
+def test_exit_files_of_two_projects_do_not_collide(tmp_path):
+    """Project B must not pick up project A's result for a same-named run."""
+    storage_a = _ipc_storage(tmp_path / "repo-a")
+    storage_b = _ipc_storage(tmp_path / "repo-b")
+    _write_speccer_exit(storage_a, "run-0", "0")
+
+    state, wt = _make_state_with_worktree(tmp_path)
+    _write_progress(wt, "run-0", "SPECCING")  # B's speccer is still mid-run
+    speccer_exit_code_handler(state, 0, 0, "run-0", storage_b)
+
+    assert state.runs[0].stages[0].status == StageStatus.FAILED
+    for path in (
+        orch._runner_exit_file(storage_b, "proj", "run-0"),
+        orch._runner_fail_log(storage_b, "proj", "run-0"),
+        orch._speccer_exit_file(storage_b, "proj", "run-0"),
+    ):
+        assert path.is_relative_to(tmp_path / "repo-b"), path
+
+
+def test_runner_fail_log_matches_tmux_wrapper_naming(tmp_path):
+    """spawn_runner_in_window writes the fail log next to the exit file it is given."""
+    storage = _ipc_storage(tmp_path)
+    exit_file = orch._runner_exit_file(storage, "proj", "run-0")
+    derived = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
+    assert Path(derived) == orch._runner_fail_log(storage, "proj", "run-0")
 
 
 # ---------------------------------------------------------------------------
@@ -279,95 +298,221 @@ def test_exit_handler_no_exit_file_no_progress_sets_failed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _parse_learnings_blocks(response_text: str, project_dir: Path) -> dict[str, str]:
-    """Replicate the regex logic from _review_learnings for testing."""
-    updates: dict[str, str] = {}
-    for file_path in re.findall(r"<<<FILE:\s*([^>]+)>>>", response_text):
-        file_path = file_path.strip()
-        full_path = project_dir / file_path
-        if not full_path.exists():
-            continue
-        content_match = re.search(
-            rf"<<<FILE:\s*{re.escape(file_path)}\s*>>>(.*?)<<<END>>>",
-            response_text,
-            re.DOTALL,
-        )
-        if content_match:
-            addition = content_match.group(1).strip()
-            if addition:
-                updates[file_path] = addition
-    return updates
-
-
-def test_learnings_parsing_single_file(tmp_path):
-    claude_md = tmp_path / ".claude" / "CLAUDE.md"
-    claude_md.parent.mkdir(parents=True)
-    claude_md.write_text("# Existing content\n", encoding="utf-8")
-
+def test_learnings_parsing_single_file():
     response = "<<<FILE: .claude/CLAUDE.md>>>\nNew learning content here\n<<<END>>>\n"
 
-    updates = _parse_learnings_blocks(response, tmp_path)
+    assert orch._parse_learning_blocks(response) == {
+        ".claude/CLAUDE.md": "New learning content here"
+    }
 
-    assert ".claude/CLAUDE.md" in updates
-    assert "New learning content here" in updates[".claude/CLAUDE.md"]
 
-
-def test_learnings_parsing_multiple_files(tmp_path):
-    f1 = tmp_path / "a.md"
-    f2 = tmp_path / "b.md"
-    f1.write_text("existing a\n")
-    f2.write_text("existing b\n")
-
+def test_learnings_parsing_multiple_files():
     response = (
         "<<<FILE: a.md>>>\nLearning A\n<<<END>>>\n"
         "Some other text\n"
         "<<<FILE: b.md>>>\nLearning B\n<<<END>>>\n"
     )
 
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert "a.md" in updates
-    assert "b.md" in updates
-    assert updates["a.md"] == "Learning A"
-    assert updates["b.md"] == "Learning B"
+    assert orch._parse_learning_blocks(response) == {"a.md": "Learning A", "b.md": "Learning B"}
 
 
-def test_learnings_parsing_file_not_on_disk_skipped(tmp_path):
-    response = "<<<FILE: nonexistent.md>>>\nsome content\n<<<END>>>\n"
+def test_learnings_parsing_merges_repeated_blocks():
+    response = (
+        "<<<FILE: CLAUDE.md>>>\n- first\n<<<END>>>\n"
+        "<<<FILE: CLAUDE.md>>>\n- second\n<<<END>>>\n"
+    )
 
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert len(updates) == 0
-
-
-def test_learnings_parsing_no_changes_marker(tmp_path):
-    response = "<<<NO_CHANGES>>>"
-
-    assert "<<<NO_CHANGES>>>" in response
-    updates = _parse_learnings_blocks(response, tmp_path)
-    assert len(updates) == 0
+    assert orch._parse_learning_blocks(response) == {"CLAUDE.md": "- first\n- second"}
 
 
-def test_learnings_parsing_empty_block_skipped(tmp_path):
-    f = tmp_path / "empty.md"
-    f.write_text("existing\n")
-
-    response = "<<<FILE: empty.md>>>\n\n<<<END>>>\n"
-    updates = _parse_learnings_blocks(response, tmp_path)
-
-    assert "empty.md" not in updates
+def test_learnings_parsing_no_changes_and_empty_blocks():
+    assert orch._parse_learning_blocks("<<<NO_CHANGES>>>") == {}
+    assert orch._parse_learning_blocks("<<<FILE: empty.md>>>\n\n<<<END>>>\n") == {}
 
 
-def test_learnings_parsing_multiline_content(tmp_path):
-    f = tmp_path / "multi.md"
-    f.write_text("existing\n")
+def test_learnings_extend_the_existing_section_without_repeating_lines():
+    existing = "# Project\n\n## Conductor Learnings\n\n- rule A\n\n## Other\n\ntext\n"
 
-    response = "<<<FILE: multi.md>>>\nLine 1\nLine 2\nLine 3\n<<<END>>>\n"
+    updated = orch._with_learnings(existing, "## Conductor Learnings\n- rule A\n- rule B")
 
-    updates = _parse_learnings_blocks(response, tmp_path)
+    assert updated.count("## Conductor Learnings") == 1
+    assert updated.count("- rule A") == 1
+    assert updated.index("- rule B") < updated.index("## Other")
 
-    assert "multi.md" in updates
-    content = updates["multi.md"]
-    assert "Line 1" in content
-    assert "Line 2" in content
-    assert "Line 3" in content
+
+def test_exit_file_poll_targets_tmux_windows_exactly(tmp_path, monkeypatch):
+    """A prefix target would let run0:api resolve to its sibling run0:api-exec."""
+    state, _ = _make_state_with_worktree(tmp_path)
+    state.runs[0].stages[0].status = StageStatus.EXECUTING
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        out = "run0:stage-0-exec\n" if cmd[1] == "list-windows" else "12345\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+    monkeypatch.setattr(orch._tmux_module, "check_pstree_depth", lambda pid: True)
+
+    assert not orch._any_runner_exit_file_ready(state, _ipc_storage(tmp_path), "conductor-proj")
+
+    targets = [cmd[cmd.index("-t") + 1] for cmd in calls]
+    assert targets == ["=conductor-proj", "=conductor-proj:=run0:stage-0-exec"]
+
+
+def _executing_shallow_runner(tmp_path, monkeypatch, age_s: float):
+    """A live runner window whose process tree is shallow (no Claude under it)."""
+    from datetime import datetime, timedelta, timezone
+
+    state, _ = _make_state_with_worktree(tmp_path)
+    stage = state.runs[0].stages[0]
+    stage.status = StageStatus.EXECUTING
+    stage.started_at = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+
+    def fake_run(cmd, **kwargs):
+        out = "run0:stage-0-exec\n" if cmd[1] == "list-windows" else "12345\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+    monkeypatch.setattr(orch._tmux_module, "check_pstree_depth", lambda pid: False)
+    monkeypatch.setattr(orch, "_shallow_since", {})
+    storage = _ipc_storage(tmp_path)
+    exit_file = orch._runner_exit_file(storage, "proj", "run-0")
+    return state, storage, exit_file
+
+
+ZOMBIE_KEY = "conductor-proj:run0:stage-0-exec"
+
+
+def test_zombie_needs_a_minute_of_shallow_tree_not_a_few_samples(tmp_path, monkeypatch):
+    """Polls 10 s apart plus monitor checks used to reach 3 samples in seconds."""
+    state, storage, exit_file = _executing_shallow_runner(tmp_path, monkeypatch, 600)
+
+    for _ in range(5):
+        assert not orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert not exit_file.exists()
+
+    orch._shallow_since[ZOMBIE_KEY] -= orch.ZOMBIE_SHALLOW_S
+    assert orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert exit_file.read_text() == "143"
+
+
+def test_starting_runner_is_not_judged_by_its_process_tree(tmp_path, monkeypatch):
+    state, storage, exit_file = _executing_shallow_runner(tmp_path, monkeypatch, 10)
+    orch._shallow_since[ZOMBIE_KEY] = 0.0  # streak left by an earlier runner
+
+    for _ in range(5):
+        assert not orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert not exit_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_starting_a_runner_clears_the_previous_runners_shallow_streak(
+    tmp_path, monkeypatch
+):
+    """A new runner in the same window starts its own streak, not a dead one's."""
+    state, wt = _make_state_with_worktree(tmp_path)
+    docs = wt / "docs" / "run-0"
+    (docs / "prompts").mkdir(parents=True)
+    (docs / "prompts" / "01-backend.md").write_text("do it\n")
+    (docs / "run.sh").write_text(
+        'PHASES[1]="01-backend.md"\nPHASE_TOKENS[1]="DONE"\nPHASE_NAMES[1]="Backend"\n'
+    )
+    monkeypatch.setattr(orch, "_shallow_since", {ZOMBIE_KEY: 0.0})
+    storage = _ipc_storage(tmp_path)
+    storage.repo_root = tmp_path
+    storage.tmux_log = lambda name, label: tmp_path / f"{label}.log"
+    tmux = MagicMock()
+    tmux.spawn_runner_in_window = AsyncMock()
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    tmux.spawn_runner_in_window.assert_awaited_once()
+    assert ZOMBIE_KEY not in orch._shallow_since
+
+
+# ---------------------------------------------------------------------------
+# Single-run push and PR
+# ---------------------------------------------------------------------------
+
+
+class _Proc:
+    def __init__(self, rc: int, out: str = "", err: str = "") -> None:
+        self.returncode = rc
+        self._out, self._err = out.encode(), err.encode()
+
+    async def communicate(self):
+        return self._out, self._err
+
+
+def _fake_exec(monkeypatch, results: dict[str, list[_Proc]]):
+    calls: list[tuple] = []
+
+    async def exec_(*cmd, **kwargs):
+        calls.append(cmd)
+        return results[cmd[0]].pop(0)
+
+    monkeypatch.setattr(orch.asyncio, "create_subprocess_exec", exec_)
+    monkeypatch.setattr(orch.asyncio, "sleep", AsyncMock())
+    return calls
+
+
+def _single_run():
+    return RunState(index=0, name="feat", description="d", stages=[])
+
+
+@pytest.mark.asyncio
+async def test_pr_creation_failure_is_an_error_not_a_pr(monkeypatch, tmp_path):
+    _fake_exec(monkeypatch, {"git": [_Proc(0)], "gh": [_Proc(1, err="HTTP 502")] * 3})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="gh pr create failed"):
+        await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+
+
+@pytest.mark.asyncio
+async def test_failed_push_is_an_error(monkeypatch, tmp_path):
+    calls = _fake_exec(monkeypatch, {"git": [_Proc(1, err="no such remote 'origin'")]})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="no such remote"):
+        await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+    assert [c[0] for c in calls] == ["git"]
+
+
+@pytest.mark.asyncio
+async def test_existing_pr_for_the_branch_counts_as_created(monkeypatch, tmp_path):
+    err = 'a pull request for branch "b" into branch "main" already exists:\nhttps://github.com/o/r/pull/7'
+    _fake_exec(monkeypatch, {"git": [_Proc(0)], "gh": [_Proc(1, err=err)]})
+    storage = SimpleNamespace(repo_root=tmp_path)
+
+    url = await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+
+    assert url == "https://github.com/o/r/pull/7"
+
+
+@pytest.mark.asyncio
+async def test_restart_regenerates_an_unusable_manifest(tmp_path):
+    """run.sh whose phase prompt is missing: regenerate, don't rerun the runner."""
+    state, wt = _make_state_with_worktree(tmp_path)
+    stage = state.runs[0].stages[0]
+    stage.status = StageStatus.FAILED
+    _write_progress(wt, "run-0", "GENERATED")
+    run_sh = wt / "docs" / "run-0" / "run.sh"
+    run_sh.write_text('PHASES[1]="phase-1.md"\n')  # prompts/phase-1.md never written
+
+    await orch.restart_stage(state, 0, 0, _ipc_storage(tmp_path))
+
+    assert stage.status == StageStatus.SPEC_COMPLETE
+    assert not run_sh.exists()
+
+
+def test_ordinary_runner_failure_is_diagnosed_not_blindly_restarted(tmp_path):
+    """The runner writes activity.log until it exits 1 (max iterations, gates)."""
+    docs = tmp_path / "wt" / "docs" / "feat"
+    docs.mkdir(parents=True)
+    (docs / "activity.log").write_text("phase 2: max iterations reached\n")
+    stage = StageState(name="s", spec_mode="full", worktree=str(tmp_path / "wt"))
+
+    assert orch.classify_failure("feat", 1, stage, []) == "logic"
+    assert orch.classify_failure("feat", 143, stage, []) == "infra"

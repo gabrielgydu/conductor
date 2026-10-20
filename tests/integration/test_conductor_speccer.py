@@ -28,16 +28,15 @@ from helpers import (
 def _make_spawn_callback(mock_speccer, mock_tmux, *, write_progress: bool = True):
     """Return a spawn callback that drives MockSpeccer.
 
-    Speccer spawns are blocking (spawn_in_window_and_wait), so MockTmux ends
-    them itself. Runner spawns (window name ends with -exec) finish at once
-    with exit code 0, so the orchestrator sees a clean completion.
+    Every window finishes at once with exit code 0: speccer windows after
+    MockSpeccer has written its files, runner windows (name ends with -exec)
+    straight away, so the orchestrator sees a clean completion.
     """
 
     def callback(name: str, cmd: str) -> None:
-        if name.endswith("-exec"):
-            mock_tmux.finish_window(name, 0)
-        elif write_progress:
+        if not name.endswith("-exec") and write_progress:
             mock_speccer._handle_spawn(name, cmd)
+        mock_tmux.finish_window(name, 0)
 
     return callback
 
@@ -96,8 +95,8 @@ async def test_conductor_handles_spec_needs_input(
 
     mock_speccer.set_lifecycle(needs_input=True, final_status="COMPLETE")
     mock_claude_cli.set_response(
-        "answer-questions",
-        "## QUESTIONS.md\n### Q1: Scope\n> Full scope, all endpoints\n### Q2: Auth\n> Use JWT tokens",
+        "answering clarification questions",  # answer_questions' prompt
+        "### Q1: Scope\nFull scope, all endpoints\n### Q2: Auth\nUse JWT tokens",
     )
     mock_tmux.set_spawn_callback(_make_spawn_callback(mock_speccer, mock_tmux))
 
@@ -180,8 +179,11 @@ async def test_conductor_retries_failed_spec(
     # fail_count=1: first speccer run fails, second succeeds
     mock_speccer.set_lifecycle(fail_count=1, final_status="COMPLETE")
     # Brain returns RETRY on first failure
-    # The context contains "## Retries" and "## Stage Config"
-    mock_claude_cli.set_response("## Retries", "ACTION: RETRY\nRetry the speccer run")
+    # Matches the diagnose-failure-prompt.md template the orchestrator renders
+    mock_claude_cli.set_response(
+        "diagnosing a failed automation pipeline stage",
+        "ACTION: RETRY\nRetry the speccer run",
+    )
     mock_tmux.set_spawn_callback(_make_spawn_callback(mock_speccer, mock_tmux))
 
     result = await conductor_run_loop(state, config)
@@ -229,8 +231,11 @@ async def test_conductor_fails_after_max_retries(
     # fail_count=3: speccer fails 3 times — exceeds max_retries (2)
     mock_speccer.set_lifecycle(fail_count=3)
     # Brain returns RETRY for first 2 failures, then max retries kicks in
-    # The context contains "## Retries" and "## Stage Config"
-    mock_claude_cli.set_response("## Retries", "ACTION: RETRY\nRetry the speccer run")
+    # Matches the diagnose-failure-prompt.md template the orchestrator renders
+    mock_claude_cli.set_response(
+        "diagnosing a failed automation pipeline stage",
+        "ACTION: RETRY\nRetry the speccer run",
+    )
     mock_tmux.set_spawn_callback(_make_spawn_callback(mock_speccer, mock_tmux))
 
     result = await conductor_run_loop(state, config)

@@ -11,6 +11,7 @@ import pytest
 # Ensure src is importable
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
+import conductor.core.orchestrator as orch
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.orchestrator import (
     ConductorConfig,
@@ -142,9 +143,9 @@ async def test_conductor_detects_runner_completion(
     mock_tmux.set_window_alive(window_name, False)
     mock_tmux.set_window_exit_code(window_name, 0)
 
-    # Write exit file that the orchestrator will read
-    # The orchestrator looks for /tmp/conductor-exit-{fname}
-    exit_file = Path(f"/tmp/conductor-exit-test-run")
+    # The runner's tmux wrapper wrote its exit file into the project's ipc dir
+    exit_file = tmp_storage_dir / "conductor" / "test-project" / "ipc" / "conductor-exit-test-run"
+    exit_file.parent.mkdir(parents=True, exist_ok=True)
     exit_file.write_text("0")
 
     result = await conductor_run_loop(state, config)
@@ -234,8 +235,11 @@ async def test_conductor_steers_stalled_runner(
     mock_tmux.set_window_children(WINDOW, False)
 
     steer_message = "Focus on the database migration"
-    # The diagnose-stall prompt carries a "## Stall Duration" section
-    mock_claude_cli.set_response("## Stall Duration", f"ACTION: STEER\n{steer_message}")
+    # Matches the diagnose-stall-prompt.md template the orchestrator renders
+    mock_claude_cli.set_response(
+        "diagnosing a stalled automation pipeline stage",
+        f"ACTION: STEER\n{steer_message}",
+    )
 
     result = await conductor_run_loop(state, config)
 
@@ -271,6 +275,10 @@ async def test_conductor_detects_dead_runner(
     # Runner window is dead — no exit file written
     mock_tmux.set_window_alive(WINDOW, False)
     # Intentionally no exit_code file (this is the key to dead runner detection)
+    # Speccer steps of a restarted stage finish at once.
+    mock_tmux.set_spawn_callback(
+        lambda name, cmd: None if name.endswith("-exec") else mock_tmux.finish_window(name, 0)
+    )
 
     result = await conductor_run_loop(state, config)
 
@@ -304,11 +312,19 @@ async def test_conductor_detects_zombie_runner(
     mock_claude_cli,
     tmp_storage_dir,
     tmp_path,
+    monkeypatch,
 ):
-    """Shallow process tree on 3 checks -> exit 143 -> infra retry from GENERATED."""
+    """Shallow process tree for a minute -> exit 143 -> infra retry from GENERATED."""
     state = _executing_state(tmp_path, activity="last words\n")
     mock_runner.write_run_sh(Path(state.runs[0].stages[0].worktree) / "docs" / "test-run")
-    # 3 checks to declare the zombie, then one advance to handle the failure
+    # Checks 30 s apart: shallow for 0 s, 30 s, then 60 s declares the zombie;
+    # one more advance handles the failure.
+    clock = iter(range(0, 3600, 30))
+    shallow_for = orch._shallow_for
+    monkeypatch.setattr(
+        orch, "_shallow_for",
+        lambda key, shallow, now=None: shallow_for(key, shallow, float(next(clock))),
+    )
     config = ConductorConfig(check_interval_s=0.0, max_iterations=4)
     mock_tmux.set_window_alive(WINDOW, True)
     mock_tmux.set_window_children(WINDOW, False)

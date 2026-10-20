@@ -2,7 +2,6 @@ import os
 import pytest
 from collections import Counter
 from pathlib import Path
-import glob
 
 from conductor.core.models import (
     ConductorState,
@@ -145,34 +144,6 @@ def sample_conductor_state() -> ConductorState:
 @pytest.fixture
 def tmp_state_dir(tmp_path: Path) -> Path:
     return tmp_path
-
-
-@pytest.fixture(autouse=True)
-def clean_tmp_files():
-    """Clean up conductor temp files before and after each test."""
-    # Remove old conductor exit and activity files to avoid test pollution
-    for pattern in [
-        "/tmp/conductor-exit-*",
-        "/tmp/conductor-activity-*",
-        "/tmp/conductor-speccer-exit-*",
-    ]:
-        for f in glob.glob(pattern):
-            try:
-                Path(f).unlink()
-            except (OSError, FileNotFoundError):
-                pass
-    yield
-    # Also clean up after test
-    for pattern in [
-        "/tmp/conductor-exit-*",
-        "/tmp/conductor-activity-*",
-        "/tmp/conductor-speccer-exit-*",
-    ]:
-        for f in glob.glob(pattern):
-            try:
-                Path(f).unlink()
-            except (OSError, FileNotFoundError):
-                pass
 
 
 @pytest.fixture(autouse=True)

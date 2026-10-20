@@ -49,6 +49,9 @@ def _make_tmux() -> MagicMock:
     tmux.spawn_in_window = AsyncMock()
     tmux.spawn_in_window_and_wait = AsyncMock(return_value=0)
     tmux.spawn_runner_in_window = AsyncMock()
+    tmux.get_pane_pid = AsyncMock(return_value=None)
+    tmux.has_active_children = AsyncMock(return_value=True)
+    tmux.kill_window = AsyncMock()
     return tmux
 
 
@@ -195,6 +198,10 @@ async def test_advance_run_spec_needs_input_overnight_answers_and_continues(tmp_
 @pytest.mark.asyncio
 async def test_advance_run_spec_needs_input_not_overnight_skips(tmp_path):
     state = _make_state(StageStatus.SPEC_NEEDS_INPUT, overnight=False)
+    questions = tmp_path / "wt" / "docs" / "run-0" / "spec" / "QUESTIONS.md"
+    questions.parent.mkdir(parents=True)
+    questions.write_text("### Q1: Scope\n**Answer:**\n")
+    state.runs[0].stages[0].worktree = str(tmp_path / "wt")
     tmux = _make_tmux()
     storage = _make_storage(tmp_path)
     config = _make_config(overnight=False)
@@ -365,3 +372,25 @@ async def test_advance_run_blocked_sets_run_status(tmp_path):
         await advance_run(state, 0, tmux, storage, config)
 
     assert state.runs[0].status == RunStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_advance_run_pending_blocks_on_conflicting_dependencies(tmp_path):
+    state = _make_state(StageStatus.PENDING)
+    stage = state.runs[0].stages[0]
+
+    def conflict(*args, **kwargs):
+        raise orch.DependencyMergeError("dependency x conflicts with y in: app.py")
+
+    with (
+        patch.object(orch, "create_worktree", side_effect=conflict),
+        patch.object(orch, "run_speccer_init", new=AsyncMock()) as init,
+        patch.object(orch, "atomic_save"),
+    ):
+        await advance_run(
+            state, 0, _make_tmux(), _make_storage(tmp_path), _make_config()
+        )
+
+    assert stage.status == StageStatus.BLOCKED
+    assert "app.py" in stage.last_error
+    init.assert_not_awaited()

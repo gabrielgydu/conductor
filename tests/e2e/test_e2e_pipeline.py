@@ -25,16 +25,15 @@ pytestmark = pytest.mark.usefixtures("isolated_run_loop")
 def _make_spawn_callback(mock_speccer, mock_tmux):
     """Return a spawn callback that drives MockSpeccer.
 
-    Speccer spawns are blocking (spawn_in_window_and_wait), so MockTmux ends
-    them itself. Runner spawns (window name ends with -exec) finish at once
-    with exit code 0, so the orchestrator sees a clean completion.
+    Every window finishes at once with exit code 0: speccer windows after
+    MockSpeccer has written its files, runner windows (name ends with -exec)
+    straight away, so the orchestrator sees a clean completion.
     """
 
     def callback(name: str, cmd: str) -> None:
-        if name.endswith("-exec"):
-            mock_tmux.finish_window(name, 0)
-        else:
+        if not name.endswith("-exec"):
             mock_speccer._handle_spawn(name, cmd)
+        mock_tmux.finish_window(name, 0)
 
     return callback
 
@@ -184,8 +183,8 @@ async def test_overnight_mode(e2e_env, tmp_storage_dir):
     # First invocation -> NEEDS_INPUT, second -> COMPLETE
     e2e_env.speccer.set_lifecycle(needs_input=True, final_status="COMPLETE")
     e2e_env.claude.set_response(
-        "answer-questions",
-        "## QUESTIONS.md\n### Q1: Scope\n> Full scope\n### Q2: Auth\n> JWT tokens",
+        "answering clarification questions",  # answer_questions' prompt
+        "### Q1: Scope\nFull scope\n### Q2: Auth\nJWT tokens",
     )
     e2e_env.tmux.set_spawn_callback(_make_spawn_callback(e2e_env.speccer, e2e_env.tmux))
 
