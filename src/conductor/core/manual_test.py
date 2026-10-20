@@ -190,6 +190,8 @@ class ManualSignal(BaseModel):
     result_status: str | None = None
     valid: bool = False
     errors: list[str] = Field(default_factory=list)
+    # Problems recorded for the audit log that do not invalidate the result.
+    warnings: list[str] = Field(default_factory=list)
     evidence: ManualEvidence | None = None
     severity: str | None = None
     category: str | None = None
@@ -1279,7 +1281,13 @@ def parse_manual_signal(
 
     signal.evidence = _parse_evidence(block)
     signal.shortcuts = _parse_shortcuts(block)
-    signal.errors.extend(_shortcut_errors(signal.shortcuts))
+    # With auto-approval (the default) declaring a shortcut is optional, so an
+    # incomplete or honest "not approved" declaration must not cost more than
+    # staying silent would.
+    if (policy or ManualTestPolicy()).auto_approve_shortcuts:
+        signal.warnings.extend(_shortcut_errors(signal.shortcuts))
+    else:
+        signal.errors.extend(_shortcut_errors(signal.shortcuts))
 
     if signal.kind == "pass":
         if not _has_required_evidence(signal.evidence):
@@ -1334,7 +1342,8 @@ def parse_manual_signal(
     missing_shortcuts = [
         flag
         for flag in signal.policy_flags
-        if not _is_auto_approved(flag, policy)
+        if not flag.fatal_reason  # already an error above
+        and not _is_auto_approved(flag, policy)
         and not any(_shortcut_covers_flag(shortcut, flag) for shortcut in signal.shortcuts)
     ]
     if missing_shortcuts:
@@ -1399,6 +1408,16 @@ def build_scenario_prompt(
     handoff_section = _scenario_handoff_section(scenario)
     policy = policy or ManualTestPolicy()
     project_rules = f"\n{policy.policy_text}" if policy.policy_text else ""
+    if policy.auto_approve_shortcuts:
+        shortcut_rule = (
+            "- Declare each SQL/test-route/mutating HTTP shortcut in the result with a <shortcut>\n"
+            "  entry, for the audit report:"
+        )
+    else:
+        shortcut_rule = (
+            "- Every SQL/test-route/mutating HTTP shortcut must include a <shortcut> entry in the\n"
+            "  result, with approved_by_policy=true, or the result is rejected:"
+        )
     return f"""\
 You are a senior manual QA engineer running Conductor manual-test mode.
 
@@ -1429,7 +1448,7 @@ Artifacts directory: {artifacts_dir}
   at least once.
 - SQL/test routes may be used only for non-user-facing preconditions, bulk fixture creation,
   cleanup, or impossible setup.
-- Every SQL/test-route/mutating HTTP shortcut must include a <shortcut> entry in the result:
+{shortcut_rule}
   <shortcut><reason>...</reason><command_or_route>...</command_or_route><user_flow_supported>...</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
 - If a UI setup step fails, record a finding. Do not silently bypass it with SQL.{project_rules}
 
@@ -2008,6 +2027,8 @@ async def _run_generation(
         if signal.infra_error
         else f"signal {signal.kind}, valid={signal.valid}"
     )
+    if signal.warnings:
+        outcome += f"; warnings: {'; '.join(signal.warnings)}"
     _log(
         "MANUAL_GENERATION_END",
         f"Generation {generation.index}: exit {exit_code}, {outcome}",
@@ -2017,6 +2038,7 @@ async def _run_generation(
         signal=signal.kind,
         valid=signal.valid,
         errors=signal.errors,
+        warnings=signal.warnings,
         infra_error=signal.infra_error,
         auto_approved=[
             f"{flag.pattern}: {flag.value}"

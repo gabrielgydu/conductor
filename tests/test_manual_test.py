@@ -871,8 +871,34 @@ def test_policy_scanner_rejects_incomplete_and_forbidden_shortcuts():
     assert "toggled through the admin UI" in "; ".join(rollout.errors)
     # Without a preset policy the same shortcut is merely a non-fatal, declared shortcut.
     assert unpoliced.valid is True
-    assert incomplete.valid is False
-    assert "DataShortcut" in "; ".join(incomplete.errors)
+    # Auto-approval (the default): an incomplete declaration is only a warning.
+    assert incomplete.valid is True
+    assert "DataShortcut 1 missing reason, user_flow_supported" in incomplete.warnings
+
+
+@pytest.mark.parametrize("auto_approve", [True, False])
+def test_shortcut_declaration_problems_only_reject_in_strict_mode(auto_approve, tmp_path):
+    policy = ManualTestPolicy(auto_approve_shortcuts=auto_approve)
+    final = """<manual-result status="pass">
+  <evidence><summary>Seeded via fixture, checked in UI</summary><screenshot>artifacts/screenshots/p.png</screenshot></evidence>
+  <shortcut><reason>Seed a tenant</reason><command_or_route>make fixtures</command_or_route><user_flow_supported>No signup UI yet</user_flow_supported><approved_by_policy>false</approved_by_policy></shortcut>
+</manual-result>
+<manual-pass/>"""
+
+    signal = _signal_for(policy=policy, final=final)
+    _, conductor_dir, state = _new_state(tmp_path)
+    prompt = build_scenario_prompt(state, "plan", state.scenarios[0], conductor_dir, policy)
+
+    message = "DataShortcut 1 must set approved_by_policy=true"
+    if auto_approve:
+        assert signal.valid is True
+        assert signal.warnings == [message]
+        assert "for the audit report" in prompt
+        assert "or the result is rejected" not in prompt
+    else:
+        assert signal.valid is False
+        assert message in signal.errors
+        assert "or the result is rejected" in prompt
 
 
 def test_policy_scanner_flags_test_routes_without_shortcut():
