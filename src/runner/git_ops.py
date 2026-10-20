@@ -78,17 +78,20 @@ def git_snapshot_untracked(cwd: Path, snapshot_file: Path) -> set[str]:
         log(dim(f"  Reusing untracked snapshot ({len(existing)} files)"))
         return existing
 
+    files = git_untracked_files(cwd)
+    snapshot_file.write_text("\n".join(sorted(files)), "utf-8")
+    log(dim(f"  Saved untracked snapshot ({len(files)} files)"))
+    return files
+
+
+def git_untracked_files(cwd: Path) -> set[str]:
+    """Untracked, non-ignored files (repo-relative)."""
     result = _run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=cwd,
         check=False,
     )
-    files = {
-        line for line in result.stdout.splitlines() if line.strip()
-    }
-    snapshot_file.write_text("\n".join(sorted(files)), "utf-8")
-    log(dim(f"  Saved untracked snapshot ({len(files)} files)"))
-    return files
+    return {line for line in result.stdout.splitlines() if line.strip()}
 
 
 def git_unstage_pre_existing(cwd: Path, pre_existing: set[str]) -> None:

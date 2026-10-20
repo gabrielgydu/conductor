@@ -514,6 +514,7 @@ async def _run_phase(
                 review_full_command=cfg.local_review_full_command,
                 review_max_retries=cfg.local_review_max_retries,
                 fix_model=cfg.fix_model,
+                runner_owned=runner_owned,
             )
             if not checks_ok:
                 error(f"PHASE {phase_num} FAILED — local checks failed")
@@ -661,6 +662,7 @@ async def run_phase_loop(
             review_max_retries=cfg.local_review_max_retries,
             fix_model=cfg.fix_model,
             full_mode=True,
+            runner_owned=_runner_owned_paths(project_dir, feature_dir, cfg.feature_name),
         )
         if not checks_ok:
             exit_code = 1

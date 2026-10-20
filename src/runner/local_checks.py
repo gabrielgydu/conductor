@@ -4,10 +4,34 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 from conductor.core.claude import run_claude, resolve_model
-from runner.logging import log, success, warn, error, dim, bold
+from runner.git_ops import git_stage_all, git_unstage_paths, git_untracked_files
+from runner.logging import log, success, warn, error, dim
+
+
+def _commit_fixes(project_dir: Path, message: str, keep_out: Collection[str]) -> bool:
+    """Commit the fix loop's changes, leaving *keep_out* paths unstaged.
+
+    Same rule as phase commits: files that were untracked before the checks
+    (speccer docs) and the runner's own files never go into a commit.
+    Returns True if a commit was made.
+    """
+    git_stage_all(project_dir)
+    git_unstage_paths(project_dir, sorted(keep_out))
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=project_dir, capture_output=True,
+    )
+    if staged.returncode == 0:
+        return False
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=project_dir, capture_output=True, text=True,
+    )
+    return True
 
 
 async def run_local_ci(
@@ -78,6 +102,7 @@ async def local_ci_fix_loop(
     feature_name: str,
     fix_model: str | None = None,
     scripts_root: Path | None = None,
+    keep_out: Collection[str] = (),
 ) -> bool:
     """Run CI, and if it fails, loop up to max_retries calling Claude to fix.
     Returns True if CI eventually passes."""
@@ -100,16 +125,7 @@ async def local_ci_fix_loop(
         await run_claude(prompt, model=model, max_turns=50, cwd=str(project_dir))
 
         # Stage and commit fix
-        subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=project_dir, capture_output=True,
-        )
-        if result.returncode != 0:
-            subprocess.run(
-                ["git", "commit", "-m", f"fix: local CI fixes (attempt {attempt})"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
+        if _commit_fixes(project_dir, f"fix: local CI fixes (attempt {attempt})", keep_out):
             log(dim(f"  Committed CI fix (attempt {attempt})"))
 
         # Re-run CI
@@ -166,6 +182,7 @@ async def local_review_fix_loop(
     feature_name: str,
     fix_model: str | None = None,
     scripts_root: Path | None = None,
+    keep_out: Collection[str] = (),
 ) -> bool:
     """Run review once, fix once, done. Never blocks the phase."""
     model = resolve_model(fix_model) if fix_model else None
@@ -197,16 +214,7 @@ async def local_review_fix_loop(
     await run_claude(prompt, model=model, max_turns=50, cwd=str(project_dir))
 
     # Stage and commit if there are changes
-    subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
-    result = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"],
-        cwd=project_dir, capture_output=True,
-    )
-    if result.returncode != 0:
-        subprocess.run(
-            ["git", "commit", "-m", "fix: local review fixes"],
-            cwd=project_dir, capture_output=True, text=True,
-        )
+    if _commit_fixes(project_dir, "fix: local review fixes", keep_out):
         success("Committed review fixes")
     else:
         warn(f"No changes made — {count} finding(s) likely false positives, continuing")
@@ -229,20 +237,25 @@ async def run_local_checks(
     fix_model: str | None = None,
     full_mode: bool = False,
     scripts_root: Path | None = None,
+    runner_owned: Collection[str] = (),
 ) -> bool:
-    """Run all local checks (CI + review). Returns True if all pass."""
+    """Run all local checks (CI + review). Returns True if all pass.
+
+    Fix commits leave out *runner_owned* paths and whatever is untracked now.
+    """
     if not ci_enabled:
         return True
 
     ci_cmd = ci_full_command if full_mode and ci_full_command else ci_command
     rev_cmd = review_full_command if full_mode and review_full_command else review_command
+    keep_out = git_untracked_files(project_dir) | set(runner_owned)
 
     if ci_cmd:
-        if not await local_ci_fix_loop(ci_cmd, ci_max_retries, project_dir, feature_name, fix_model, scripts_root):
+        if not await local_ci_fix_loop(ci_cmd, ci_max_retries, project_dir, feature_name, fix_model, scripts_root, keep_out):
             return False
 
     if review_enabled and rev_cmd:
-        if not await local_review_fix_loop(rev_cmd, review_max_retries, project_dir, feature_name, fix_model, scripts_root):
+        if not await local_review_fix_loop(rev_cmd, review_max_retries, project_dir, feature_name, fix_model, scripts_root, keep_out):
             return False
 
     return True
