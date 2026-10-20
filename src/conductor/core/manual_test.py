@@ -203,6 +203,9 @@ class PolicyFlag(BaseModel):
     value: str
     source: str = "tool"
     fatal_reason: str = ""
+    # The fatal hit clearly made the forbidden change (see _fatal_tool_input),
+    # rather than only naming the protected thing in a call that may just read it.
+    fatal_mutation: bool = False
 
 
 class ManualSignal(BaseModel):
@@ -988,12 +991,41 @@ _BROWSER_CODE_TOOL_RE = re.compile(r"browser_(evaluate|run_code)")
 _JS_MUTATION = re.compile(
     r"\b(localStorage|sessionStorage|document\.cookie|fetch|XMLHttpRequest|ajax|axios|sendBeacon)\b", re.I
 )
+# What makes a call clearly change state (see _fatal_tool_input). SQL writes
+# are statement-shaped, so prose ("update the notes") and str.replace() do
+# not count.
+_SQL_WRITE = re.compile(
+    r"\b(INSERT\s+(IGNORE\s+)?INTO|REPLACE\s+INTO|DELETE\s+FROM|ALTER\s+TABLE|DROP\s+(TABLE|DATABASE|SCHEMA)"
+    r"|TRUNCATE\s+(TABLE\s+)?[\w`\"]+|UPDATE\s+[\w`\".]+(\s+(AS\s+)?\w+)?\s+SET)\b",
+    re.I,
+)
+_JS_WRITE = re.compile(
+    r"\b(localStorage|sessionStorage)\s*(\.\s*(setItem|removeItem|clear)\s*\(|\.\s*\w+\s*=(?!=)|\[[^\]]*\]\s*=(?!=))"
+    r"|\bdocument\.cookie\s*=(?!=)"
+    r"|\bmethod\s*:\s*[\"'`](POST|PUT|PATCH|DELETE)\b"
+    r"|\.open\(\s*[\"'`](POST|PUT|PATCH|DELETE)\b"
+    r"|(\baxios|\bjQuery|\$)\s*\.\s*(post|put|patch|delete)\s*\("
+    r"|\bsendBeacon\s*\(",
+    re.I,
+)
+_MUTATING_HTTP = dict(_POLICY_PATTERNS)["mutating http"]
+_TEST_ROUTE = dict(_POLICY_PATTERNS)["test route"]
+_DB_CLIENTS = {"mysql", "mariadb", "mycli", "psql", "pgcli", "sqlite3", "mongo", "mongosh", "redis-cli"}
+_HTTP_CLIENTS = {"curl", "wget", "http", "httpie", "xh"}
+_SHELLS = {"bash", "sh", "zsh", "dash"}
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\1(?P<rest>[^\n]*)\n"
+    r"(?P<body>.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
+    re.S,
+)
 _FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
 _COMMAND_PREFIXES = {"sudo", "env", "time", "nice", "nohup", "command", "builtin", "exec"}
 
 
 def _shell_tokens(command: str) -> list[str] | None:
     """Shell words and operators of *command*, comments dropped; None if unparsable."""
+    # A backslash-newline continues the command; shlex would make it a newline.
+    command = command.replace("\\\n", " ")
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars="".join(_SHELL_OPERATOR_CHARS))
         lexer.whitespace = " \t\r"
@@ -1014,38 +1046,98 @@ def _is_read_only_command(command: str) -> bool:
     if tokens is None:
         return False
 
-    segments: list[list[str]] = [[]]
     for index, token in enumerate(tokens):
-        if not set(token) <= _SHELL_OPERATOR_CHARS:
-            segments[-1].append(token)
-        elif ">" in token:
+        if ">" in token and set(token) <= _SHELL_OPERATOR_CHARS:
             target = tokens[index + 1] if index + 1 < len(tokens) else ""
             if target != "/dev/null" and not target.isdigit():
                 return False
-        elif "<" not in token:
-            segments.append([])
+    return all(_reads_only(words) for pipeline in _pipelines(tokens) for words in pipeline)
 
-    for words in segments:
-        while words and (
-            words[0] in _COMMAND_PREFIXES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])
+
+def _pipelines(tokens: list[str]) -> list[list[list[str]]]:
+    """The pipelines in *tokens*, each a list of simple commands' words.
+
+    A redirection's target stays with its command.
+    """
+    pipelines: list[list[list[str]]] = [[[]]]
+    for token in tokens:
+        if not set(token) <= _SHELL_OPERATOR_CHARS:
+            pipelines[-1][-1].append(token)
+        elif token in ("|", "|&"):
+            pipelines[-1].append([])
+        elif "<" not in token and ">" not in token:
+            pipelines.append([[]])
+    return [[words for words in pipeline if words] for pipeline in pipelines if any(pipeline)]
+
+
+def _reads_only(words: list[str]) -> bool:
+    """True for a simple command (its shell words) that only searches or reads."""
+    while words and (
+        words[0] in _COMMAND_PREFIXES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])
+    ):
+        words = words[1:]
+    if not words:
+        return True
+    program, args = Path(words[0]).name, words[1:]
+    if program == "git":
+        return next((arg for arg in args if not arg.startswith("-")), "") in _READ_ONLY_GIT_COMMANDS
+    if program == "find":
+        return not _FIND_ACTIONS.intersection(args)
+    if program == "xargs":
+        return next((arg for arg in args if not arg.startswith("-")), "") in _READ_ONLY_PROGRAMS
+    return program in _READ_ONLY_PROGRAMS
+
+
+def _state_changing_calls(command: str, written: dict[str, str], depth: int = 0) -> list[str]:
+    """What the shell command's clearly state-changing DB and HTTP calls send.
+
+    A pipeline counts when it runs a DB client and its SQL (inline, piped in,
+    a heredoc or a file in *written*) writes, or runs an HTTP client that
+    sends a mutating request or calls a test route. A heredoc belongs to the
+    command reading it, so notes or scripts written through one are not
+    calls. A command string handed to a shell (`bash -c '...'`) or starting
+    with a client (`docker exec app "curl ..."`) is looked into too.
+    """
+    bodies: dict[str, str] = {}
+
+    def keep_body(match: re.Match[str]) -> str:
+        key = f"heredoc-{len(bodies)}"
+        bodies[key] = match.group("body")
+        return f"<< {key}{match.group('rest')}"
+
+    stripped = _HEREDOC_RE.sub(keep_body, command)
+    tokens = _shell_tokens(stripped)
+    calls: list[str] = []
+    for pipeline in _pipelines(tokens if tokens is not None else stripped.split()):
+        words = [word for simple in pipeline for word in simple]
+        sent = " ".join(
+            [*words, *(bodies[word] for word in words if word in bodies)]
+            + [
+                content
+                for path, content in written.items()
+                if any(path in word or Path(path).name in word for word in words)
+            ]
+        )
+        acting = [simple for simple in pipeline if not _reads_only(simple)]
+        programs = {Path(word).name for simple in acting for word in simple}
+        if (programs & _DB_CLIENTS and _SQL_WRITE.search(sent)) or (
+            programs & _HTTP_CLIENTS and (_MUTATING_HTTP.search(sent) or _TEST_ROUTE.search(sent))
         ):
-            words = words[1:]
-        if not words:
+            calls.append(sent)
+        if depth >= 2:
             continue
-        program, args = Path(words[0]).name, words[1:]
-        if program == "git":
-            subcommand = next((arg for arg in args if not arg.startswith("-")), "")
-            if subcommand not in _READ_ONLY_GIT_COMMANDS:
-                return False
-        elif program == "find":
-            if _FIND_ACTIONS.intersection(args):
-                return False
-        elif program == "xargs":
-            if next((arg for arg in args if not arg.startswith("-")), "") not in _READ_ONLY_PROGRAMS:
-                return False
-        elif program not in _READ_ONLY_PROGRAMS:
-            return False
-    return True
+        for simple in acting:
+            for index, word in enumerate(simple):
+                inner = word.split()
+                if len(inner) < 2 or word in bodies:
+                    continue
+                handed_to_shell = (
+                    index >= 2 and re.fullmatch(r"-\w*c", simple[index - 1]) is not None
+                    and Path(simple[index - 2]).name in _SHELLS
+                )
+                if handed_to_shell or Path(inner[0]).name in _DB_CLIENTS | _HTTP_CLIENTS:
+                    calls += _state_changing_calls(word, written, depth + 1)
+    return calls
 
 
 # Tool-input keys that describe a call rather than make it.
@@ -1109,8 +1201,8 @@ def _fatal_tool_input(
     written: dict[str, str],
     policy: ManualTestPolicy,
     check_written_files: bool,
-) -> tuple[str, str]:
-    """(reason, offending text) when a tool call matches a preset fatal pattern.
+) -> tuple[str, str, bool]:
+    """(reason, offending text, mutation) when a tool call matches a preset fatal pattern.
 
     Only calls that can change state count. Shell commands must match a
     shortcut detector (DB CLI other than a readback, mutating HTTP, framework
@@ -1120,31 +1212,56 @@ def _fatal_tool_input(
     that does not just read or drive the UI is checked in full, minus SQL
     readbacks. A bare flag name in a pattern would otherwise reject every
     screenshot named after the flag and every grep or GET readback of it.
+
+    *mutation* is True when the match is in what a clearly state-changing
+    call sent: SQL that writes through a DB client or SQL tool, a mutating
+    HTTP request or test-route call (see _state_changing_calls), or a
+    browser script that writes storage or sends a mutating request. A
+    console, script or readback that names the flag may only be reading it.
     """
     tool = name.rsplit("__", 1)[-1]
     if tool in _FATAL_EXEMPT_TOOLS or tool in _FILE_EDIT_TOOLS or _UI_ACTION_TOOL_RE.fullmatch(tool):
-        return "", ""
+        return "", "", False
+    # (text checked, what the call's state-changing parts sent)
+    candidates: list[tuple[str, list[str]]]
     if tool == "Bash":
         command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else str(tool_input)
         # Match what runs: shell comments are not part of it.
         tokens = _shell_tokens(command)
         text = " ".join(tokens) if tokens is not None else command
         if _is_read_only_command(command) or not _is_acting_command(text):
-            return "", ""
-        candidates = [text]
+            return "", "", False
+        calls = _state_changing_calls(command, written if check_written_files else {})
+        candidates = [(text, calls)]
         if check_written_files:
             candidates += [
-                content for path, content in written.items() if path in text or Path(path).name in text
+                (content, calls)
+                for path, content in written.items()
+                if path in text or Path(path).name in text
             ]
     elif _BROWSER_CODE_TOOL_RE.fullmatch(tool):
-        candidates = [leaf for leaf in _string_leaves(tool_input) if _JS_MUTATION.search(leaf)]
+        candidates = [
+            (leaf, [leaf] if _JS_WRITE.search(leaf) else [])
+            for leaf in _string_leaves(tool_input)
+            if _JS_MUTATION.search(leaf)
+        ]
     else:
-        candidates = [leaf for leaf in _string_leaves(tool_input) if not _is_sql_readback(leaf)]
-    for value in candidates:
+        candidates = [
+            (leaf, [leaf] if _SQL_WRITE.search(leaf) or _TEST_ROUTE.fullmatch(leaf.strip()) else [])
+            for leaf in _string_leaves(tool_input)
+            if not _is_sql_readback(leaf)
+        ]
+    # A clear mutation anywhere in the call outranks an earlier hit that may only read.
+    first_hit = ("", "", False)
+    for value, sent in candidates:
         for fatal in policy.fatal_patterns:
-            if re.search(fatal.pattern, value, re.I):
-                return fatal.reason, _excerpt(value, fatal.pattern)
-    return "", ""
+            if not re.search(fatal.pattern, value, re.I):
+                continue
+            if any(re.search(fatal.pattern, part, re.I) for part in sent):
+                return fatal.reason, _excerpt(value, fatal.pattern), True
+            if not first_hit[0]:
+                first_hit = (fatal.reason, _excerpt(value, fatal.pattern), False)
+    return first_hit
 
 
 def scan_policy_shortcuts(
@@ -1168,16 +1285,21 @@ def scan_policy_shortcuts(
     flags: list[PolicyFlag] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(label: str, value: str, source: str, fatal_reason: str = "") -> None:
+    def add(label: str, value: str, source: str, fatal_reason: str = "", fatal_mutation: bool = False) -> None:
         if (label, value) not in seen:
             seen.add((label, value))
-            flags.append(PolicyFlag(pattern=label, value=value, source=source, fatal_reason=fatal_reason))
+            flags.append(
+                PolicyFlag(
+                    pattern=label, value=value, source=source,
+                    fatal_reason=fatal_reason, fatal_mutation=fatal_mutation,
+                )
+            )
 
     written: dict[str, str] = {}
     for name, tool_input in _tool_uses(output):
-        fatal_reason, fatal_value = "", ""
+        fatal_reason, fatal_value, fatal_mutation = "", "", False
         if check_fatal:
-            fatal_reason, fatal_value = _fatal_tool_input(
+            fatal_reason, fatal_value, fatal_mutation = _fatal_tool_input(
                 name, tool_input, written, policy, fatal_scope == "all"
             )
         if isinstance(tool_input, dict):
@@ -1189,9 +1311,9 @@ def scan_policy_shortcuts(
             for label, pattern in _POLICY_PATTERNS:
                 if pattern.search(value):
                     flagged = True
-                    add(label, value, "tool", fatal_reason)
+                    add(label, value, "tool", fatal_reason, fatal_mutation)
         if fatal_reason and not flagged:
-            add("fatal pattern", fatal_value, "tool", fatal_reason)
+            add("fatal pattern", fatal_value, "tool", fatal_reason, fatal_mutation)
         if name.rsplit("__", 1)[-1] in _FILE_EDIT_TOOLS and isinstance(tool_input, dict):
             path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
             if path:
@@ -2214,9 +2336,11 @@ def _apply_signal_to_scenario(
     scenario.shortcuts.extend(signal.shortcuts)
 
     fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
-    if fatal_flags:
+    if any(flag.fatal_mutation for flag in fatal_flags):
         # The forbidden change has already happened, so a retry would only
-        # test against polluted state (and could then "pass").
+        # test against polluted state (and could then "pass"). Any other
+        # fatal hit (e.g. a console script that may only read the flag) just
+        # invalidates the result, which is retried below like any other.
         scenario.status = "policy_violation"
         scenario.evidence = ManualEvidence(
             summary="Generation used a shortcut the preset forbids",

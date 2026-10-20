@@ -1203,20 +1203,14 @@ def test_fixer_may_run_code_it_edited():
     assert _signal_for(_tool_use("Bash", {"command": "mysql -e 'update t set useNewCheckout=1'"}), fatal_scope="none").valid is True
 
 
-def test_fatal_violation_ends_the_scenario_as_policy_violation(tmp_path):
+def _apply_scenario_generation(tmp_path: Path, *events: str, final: str):
     _, conductor_dir, state = _new_state(tmp_path)
     scenario = state.scenarios[0]
-    output = "\n".join(
-        [
-            _tool_use("Bash", {"command": "mysql -e 'update tenants set useNewCheckout=1'"}),
-            _assistant_text("Flag set, handing off.\n<manual-handoff/>"),
-        ]
-    )
+    output = "\n".join([*events, _assistant_text(final)])
     scenario.attempts += 1
     generation = manual_test.ManualGeneration(
         index=1, started_at=manual_test.datetime.now(manual_test.timezone.utc), scenario_index=0
     )
-
     manual_test._apply_signal_to_scenario(
         state=state,
         conductor_dir=conductor_dir,
@@ -1227,10 +1221,82 @@ def test_fatal_violation_ends_the_scenario_as_policy_violation(tmp_path):
         ),
         output_text=output,
     )
+    return state, scenario
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [_tool_use("Bash", {"command": "mysql -e 'update tenants set useNewCheckout=1'"})],
+        [_tool_use("Bash", {"command": "mysql app <<'SQL'\nUPDATE tenants SET useNewCheckout = 1;\nSQL"})],
+        [_tool_use("Bash", {"command": "echo 'UPDATE tenants SET useNewCheckout=1' | docker exec -i db mysql app"})],
+        [_tool_use("Bash", {"command": "docker exec db sh -c \"mysql -e 'UPDATE tenants SET useNewCheckout=1'\""})],
+        [_tool_use("Bash", {"command": "curl -d '{\"useNewCheckout\":true}' http://localhost/api/admin/flags"})],
+        [_tool_use("Bash", {"command": "curl -s \\\n  -X PATCH http://localhost/api/tenants/4 \\\n  -d useNewCheckout=1"})],
+        [_tool_use("Bash", {"command": "curl -s http://app.test/_test/flags/useNewCheckout/on"})],
+        [_tool_use("Bash", {"command": "./scripts/env.sh exec app \"curl -X POST http://app/_test/flags/useNewCheckout\""})],
+        [_tool_use("mcp__playwright__browser_evaluate", {"function": "() => localStorage.setItem('useNewCheckout', '1')"})],
+        [_tool_use("mcp__playwright__browser_navigate", {"url": "http://app.test/_test/flags?useNewCheckout=1"})],
+        [_tool_use("mcp__db__query", {"sql": "UPDATE tenants SET useNewCheckout = 1"})],
+        [
+            _tool_use("Write", {"file_path": "/tmp/enable.sql", "content": "UPDATE tenants SET useNewCheckout=1;"}),
+            _tool_use("Bash", {"command": "mysql app < /tmp/enable.sql"}),
+        ],
+    ],
+    ids=["sql-update", "heredoc-sql", "piped-sql", "sql-in-sh-c", "curl-post", "curl-continued-lines", "test-route",
+         "wrapped-curl", "storage-write", "navigate-test-route", "mcp-sql", "written-sql-file"],
+)
+@pytest.mark.parametrize("final", [PASS_RESULT, "Flag set, handing off.\n<manual-handoff/>"], ids=["pass", "handoff"])
+def test_fatal_mutation_ends_the_scenario_as_policy_violation(tmp_path, events, final):
+    state, scenario = _apply_scenario_generation(tmp_path, *events, final=final)
 
     assert scenario.status == "policy_violation"
     assert "toggled through the admin UI" in scenario.evidence.notes[0]
     assert manual_test._next_open_scenario(state).index == 1
+
+
+# Shapes from real runs: the call names the flag but may only read it.
+@pytest.mark.parametrize(
+    "command",
+    [
+        # doctrine bootstrap in `php -r`, printing the flag
+        (
+            "docker exec app php -r \"require 'vendor/autoload.php'; "
+            "\\$em = (require 'src/dependencies/doctrine.php')(\\$settings); "
+            "\\$c = \\$em->getRepository(TenantConfig::class)->findOneBy(['tenant' => 4]); "
+            "echo 'useNewCheckout: ' . var_export(\\$c->getUseNewCheckout(), true);\""
+        ),
+        # artisan tinker readback through the project's env wrapper
+        (
+            "./scripts/env.sh exec app \"php artisan tinker --execute=\\\"echo 'useNewCheckout: ' "
+            ". var_export(app(Client::class)->tenantConfig(4)->getUseNewCheckout(), true);\\\"\" 2>&1"
+        ),
+        # clearing the mail catcher, then reading the flag off a page
+        (
+            "curl -s -X DELETE http://localhost:8025/api/v1/messages && "
+            "curl -s http://app.test/admin/tenants/4 | grep -o 'useNewCheckout[^,]*'"
+        ),
+        # a script whose notes name the flag, a test route and SQL it did not run
+        (
+            "python3 << 'PYEOF'\nimport json\nstate = json.load(open('state.json'))\n"
+            "state['notes'] = 'useNewCheckout enabled via the admin UI; not via POST /_test/flags "
+            "or SQL UPDATE tenants SET useNewCheckout = 1'\n"
+            "json.dump(state, open('state.json', 'w'))\nPYEOF"
+        ),
+        # notes documenting a forbidden call, written through a heredoc
+        "cat > notes.md << 'EOF'\nNot used: curl -X POST http://app.test/_test/flags/useNewCheckout\nEOF",
+    ],
+    ids=["doctrine-readback", "tinker-readback", "mailcatcher-then-grep", "notes-in-script", "notes-heredoc"],
+)
+def test_fatal_hit_that_may_only_read_is_retried_not_terminal(tmp_path, command):
+    state, scenario = _apply_scenario_generation(
+        tmp_path, _tool_use("Bash", {"command": command}), final=PASS_RESULT
+    )
+
+    assert scenario.status == "pending"
+    assert manual_test._next_open_scenario(state).index == 0
+    handoff = Path(scenario.handoff_notes.removeprefix("See "))
+    assert "toggled through the admin UI" in handoff.read_text(encoding="utf-8")
 
 
 def test_read_only_command_detection():
