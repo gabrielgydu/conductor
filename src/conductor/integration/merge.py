@@ -605,7 +605,8 @@ async def _integrate(
     # --- Push (once, after every commit above) ---
     _print(f"Pushing {branch_name}")
     rc, _, err = await _run_git(["push", "origin", branch_name], wt)
-    if rc != 0:
+    pushed = rc == 0
+    if not pushed:
         logger.error("Pushing %s failed: %s", branch_name, err.strip())
 
     # --- PR ---
@@ -669,7 +670,8 @@ async def _integrate(
 
     if has_partial:
         final_status = IntegrationStatus.PARTIAL
-    elif not validation_passed:
+    elif not validation_passed or not pushed:
+        # Unpublished, the branch has no PR; DONE would hide that.
         final_status = IntegrationStatus.NEEDS_FIX
     else:
         final_status = IntegrationStatus.DONE

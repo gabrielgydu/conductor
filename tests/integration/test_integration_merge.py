@@ -470,9 +470,14 @@ async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermeti
         _done_run_with_branch(1, "feat-b", "fx-b"),
     )
 
+    smoke_spec = "tests/Playwright/tests/conductor-smoke.spec.ts"
+
     async def validate_with_fix(vctx, max_attempts):
         (vctx.project_dir / "app.txt").write_text("fixed\n")
         (vctx.project_dir / "helper.txt").write_text("added by the fix\n")
+        # The smoke check writes its spec; merge.py commits it after the fixes.
+        (vctx.project_dir / smoke_spec).parent.mkdir(parents=True)
+        (vctx.project_dir / smoke_spec).write_text("// smoke\n")
         return ValidationResult(passed=True, summary="1/1 checks passed", fix_attempts=1)
 
     hermetic_merge.validate.side_effect = validate_with_fix
@@ -487,9 +492,9 @@ async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermeti
     assert result.status == IntegrationStatus.DONE
     branch_name = f"integration/{project_name}"
 
-    def show(path: str) -> str:
+    def show(path: str, repo: Path = real_merge_repo.path) -> str:
         return subprocess.run(
-            ["git", "-C", str(real_merge_repo.path), "show", f"{branch_name}:{path}"],
+            ["git", "-C", str(repo), "show", f"{branch_name}:{path}"],
             capture_output=True,
             text=True,
             check=True,
@@ -497,6 +502,9 @@ async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermeti
 
     assert show("app.txt") == "fixed\n"
     assert show("helper.txt") == "added by the fix\n"
+    # One push, after every commit: origin has the fix and the spec commit.
+    assert show("app.txt", real_merge_repo.origin) == "fixed\n"
+    assert show(smoke_spec, real_merge_repo.origin) == "// smoke\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1042,3 +1050,31 @@ async def test_worktree_at_the_old_default_location_is_removed(
     assert result.status == IntegrationStatus.DONE
     assert result.merged_runs == [0, 1]
     assert str(legacy) not in _worktree_list(real_merge_repo.path)
+
+
+# ---------------------------------------------------------------------------
+# Test 17: An integration branch that could not be pushed is not DONE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_push_is_not_reported_done(real_merge_repo, tmp_path, hermetic_merge):
+    real_merge_repo.create_branch("np-a", {"np_a.txt": "a\n"})
+    real_merge_repo.create_branch("np-b", {"np_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "np-a"),
+        _done_run_with_branch(1, "feat-b", "np-b"),
+    )
+    real_merge_repo.origin.rename(tmp_path / "origin-gone.git")
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX  # validation itself passed
+    assert result.merged_runs == [0, 1]
+    assert result.pr_url is None

@@ -653,8 +653,9 @@ def tmp_git_repo(tmp_path) -> Path:
 class RealMergeRepo:
     """A real git repo with helpers for creating feature branches."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, origin: Path) -> None:
         self.path = path
+        self.origin = origin  # bare repo registered as the `origin` remote
 
     def create_branch(self, name: str, files: dict[str, str]) -> None:
         """Create a branch from main with the given file contents."""
@@ -716,7 +717,18 @@ def real_merge_repo(tmp_path) -> RealMergeRepo:
         check=True,
         capture_output=True,
     )
-    return RealMergeRepo(repo)
+    # The integration branch is pushed here. Nothing else is: without an
+    # origin/main the integration worktree starts from the local main.
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    return RealMergeRepo(repo, origin)
 
 
 @pytest.fixture
