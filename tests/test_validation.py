@@ -169,6 +169,29 @@ async def test_validate_and_fix_without_failures_runs_no_fix_session(repo, monke
     assert result.fix_attempts == 0
 
 
+@pytest.mark.asyncio
+async def test_a_crashing_fix_attempt_still_reports_its_session(repo, monkeypatch):
+    """A crash after the session edited files must not lose fix_attempts: the
+    callers commit only when it is set."""
+
+    async def claude_edits_then_crashes(prompt, **kwargs):
+        (Path(kwargs["cwd"]) / "app.txt").write_text("half fixed\n")
+        raise RuntimeError("stream closed")
+
+    monkeypatch.setattr(validation, "run_validation", AsyncMock(return_value=_failing()))
+    monkeypatch.setattr(validation, "run_claude", claude_edits_then_crashes)
+
+    ctx = ValidationContext(project_dir=repo, stage="post-run", feature_name="feat")
+    result = await validate_and_fix(ctx, max_attempts=3)
+
+    assert not result.passed
+    assert result.fix_attempts == 1
+    assert result.summary.endswith("fix attempt 1 crashed: stream closed")
+    assert [c.name for c in result.checks] == ["lint"]
+    assert await commit_validation_fixes(repo, "fixes", keep_untracked=result.untracked_before_fix)
+    assert _git(repo, "show", "HEAD:app.txt") == "half fixed\n"
+
+
 # ---------------------------------------------------------------------------
 # commit_validation_fixes
 # ---------------------------------------------------------------------------

@@ -466,7 +466,9 @@ async def validate_and_fix(
     Loops up to *max_attempts* times; every attempt runs *checks* (default:
     detect_checks). Returns the final ValidationResult. The fixes are left
     uncommitted; callers commit them with commit_validation_fixes when
-    result.fix_attempts > 0.
+    result.fix_attempts > 0. Once a fix session has started, an exception
+    ends the loop with a failed result instead of propagating; only the
+    first validation run can raise.
     """
     result = await run_validation(ctx, checks)
     fix_attempts = 0
@@ -512,15 +514,26 @@ async def validate_and_fix(
         logger.info(
             "Asking Claude to fix failures (attempt %d/%d)…", attempt, max_attempts
         )
-        await run_claude(
-            prompt,
-            model="claude-opus-4-8[1m]",
-            max_turns=30,
-            cwd=str(ctx.project_dir),
-        )
+        # Counted before it runs: a session that crashes may have edited files.
         fix_attempts += 1
-
-        result = await run_validation(ctx, checks)
+        try:
+            await run_claude(
+                prompt,
+                model="claude-opus-4-8[1m]",
+                max_turns=30,
+                cwd=str(ctx.project_dir),
+            )
+            result = await run_validation(ctx, checks)
+        except Exception as exc:
+            # Raising would lose fix_attempts, and with it the caller's commit
+            # of the edits made so far (the integration worktree is removed).
+            logger.exception("Fix attempt %d/%d crashed", attempt, max_attempts)
+            result = ValidationResult(
+                passed=False,
+                checks=result.checks,
+                summary=f"{result.summary}; fix attempt {attempt} crashed: {exc}",
+            )
+            break
 
     result.fix_attempts = fix_attempts
     result.untracked_before_fix = untracked_before

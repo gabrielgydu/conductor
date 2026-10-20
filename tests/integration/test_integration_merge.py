@@ -1078,3 +1078,49 @@ async def test_failed_push_is_not_reported_done(real_merge_repo, tmp_path, herme
     assert result.status == IntegrationStatus.NEEDS_FIX  # validation itself passed
     assert result.merged_runs == [0, 1]
     assert result.pr_url is None
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Edits from a fix session that crashed reach the branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_edits_of_a_crashed_fix_session_are_committed(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """The worktree is force-removed at the end, so edits that are not committed
+    are lost; a crash used to drop fix_attempts and with it the commit."""
+    import conductor.core.validation as validation_module
+    import conductor.integration.merge as merge_module
+    from conductor.core.validation import CheckResult, ValidationResult, validate_and_fix
+
+    real_merge_repo.create_branch("cf-a", {"app.txt": "broken\n"})
+    real_merge_repo.create_branch("cf-b", {"other.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "cf-a"),
+        _done_run_with_branch(1, "feat-b", "cf-b"),
+    )
+    failing = ValidationResult(
+        passed=False, checks=[CheckResult("lint", False, "app broken", 0.0)], summary="0/1"
+    )
+
+    async def claude_edits_then_crashes(prompt, **kwargs):
+        (Path(kwargs["cwd"]) / "app.txt").write_text("fixed\n")
+        raise RuntimeError("stream closed")
+
+    monkeypatch.setattr(merge_module, "validate_and_fix", validate_and_fix)
+    monkeypatch.setattr(validation_module, "run_validation", AsyncMock(return_value=failing))
+    monkeypatch.setattr(validation_module, "run_claude", claude_edits_then_crashes)
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == "fixed\n"
