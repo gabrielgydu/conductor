@@ -823,12 +823,12 @@ async def run_speccer_generate(
         stage.status = StageStatus.FAILED
         return
 
-    run_sh_text = run_sh.read_text(encoding="utf-8")
-    if "PHASES[" not in run_sh_text:
+    problem = _manifest_problem(run_sh)
+    if problem:
+        stage.last_error = f"speccer generate produced an unusable run.sh: {problem}"
         _log(
             "SPECCER_GENERATE_FAILED",
-            f"speccer generate {fname} produced run.sh without PHASES arrays — "
-            f"regeneration needed",
+            f"speccer generate {fname}: unusable run.sh ({problem}) — regeneration needed",
             log_path, audit_path, run=run_idx, stage=stage_idx,
         )
         stage.status = StageStatus.FAILED
@@ -1271,6 +1271,99 @@ async def answer_questions(
 # ---------------------------------------------------------------------------
 
 
+class ManifestError(ValueError):
+    """run.sh does not describe a runnable set of phases."""
+
+
+@dataclass
+class Manifest:
+    phases: list  # list[runner.config.PhaseConfig]
+    model: str
+    fix_model: str
+
+
+_VALUE = r"""(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([^\s"'#;)]+))"""
+_ARRAY_ITEM = re.compile(
+    r"^\s*(PHASES|PHASE_TOKENS|PHASE_NAMES)\[\s*(\d+)\s*\]\s*=\s*" + _VALUE
+)
+_ARRAY_COMPOUND = re.compile(
+    r"^\s*(?:declare\s+-A\s+)?(PHASES|PHASE_TOKENS|PHASE_NAMES)\s*=\s*\((.*)\)"
+)
+_COMPOUND_ITEM = re.compile(r"\[\s*(\d+)\s*\]\s*=\s*" + _VALUE)
+_MODEL_VAR = re.compile(
+    r"^\s*(?:export\s+)?(CONDUCTOR_MODEL|CONDUCTOR_FIX_MODEL)\s*=\s*" + _VALUE
+)
+_DEFAULT_EXPANSION = re.compile(r"^\$\{\w+:?-([^}]*)\}$")
+
+
+def _shell_value(dq: str | None, sq: str | None, bare: str | None) -> str:
+    if dq is not None:
+        return re.sub(r"\\(.)", r"\1", dq)
+    return sq if sq is not None else (bare or "")
+
+
+def parse_manifest(run_sh: Path) -> Manifest:
+    """Read the phases and models a generated run.sh declares.
+
+    Accepts the forms bash accepts for the template's arrays (double or
+    single quotes, bare words, ``declare -A X=([1]=...)``, padded keys),
+    ignores comments, and resolves ``${VAR:-default}`` to its default.
+    Raises ManifestError for no phases, an unresolvable model value, or a
+    phase prompt file that does not exist (the runner would run Claude on a
+    placeholder prompt).
+    """
+    from runner.config import PhaseConfig  # noqa: PLC0415
+
+    arrays: dict[str, dict[int, str]] = {"PHASES": {}, "PHASE_TOKENS": {}, "PHASE_NAMES": {}}
+    models: dict[str, str] = {}
+    for line in run_sh.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if m := _ARRAY_ITEM.match(line):
+            arrays[m.group(1)][int(m.group(2))] = _shell_value(*m.group(3, 4, 5))
+        elif m := _ARRAY_COMPOUND.match(line):
+            for item in _COMPOUND_ITEM.finditer(m.group(2)):
+                arrays[m.group(1)][int(item.group(1))] = _shell_value(*item.group(2, 3, 4))
+        elif m := _MODEL_VAR.match(line):
+            value = _shell_value(*m.group(2, 3, 4))
+            if d := _DEFAULT_EXPANSION.match(value):
+                value = d.group(1)
+            if "$" in value:
+                raise ManifestError(f"{run_sh}: cannot resolve {m.group(1)}={value}")
+            models[m.group(1)] = value
+
+    files = arrays["PHASES"]
+    if not files:
+        raise ManifestError(f"No PHASES found in {run_sh}")
+    prompt_dir = run_sh.parent / "prompts"
+    phases = []
+    missing = []
+    for num in sorted(files):
+        rel = files[num].removeprefix("./").removeprefix("prompts/")
+        prompt = prompt_dir / rel
+        if not prompt.is_file():
+            missing.append(str(prompt))
+        phases.append(PhaseConfig(
+            number=num,
+            name=arrays["PHASE_NAMES"].get(num, f"Phase {num}"),
+            prompt_file=str(prompt),
+            token=arrays["PHASE_TOKENS"].get(num, f"PHASE_{num}_COMPLETE"),
+        ))
+    if missing:
+        raise ManifestError(f"{run_sh}: phase prompt file(s) missing: {', '.join(missing)}")
+    model = models.get("CONDUCTOR_MODEL", "")
+    return Manifest(phases, model, models.get("CONDUCTOR_FIX_MODEL", "") or model)
+
+
+def _manifest_problem(run_sh: Path) -> str | None:
+    """Why *run_sh* is not a usable manifest, or None if it is."""
+    try:
+        parse_manifest(run_sh)
+    except (ManifestError, OSError) as exc:
+        return str(exc)
+    return None
+
+
 def generate_run_config(
     run_sh_path: Path,
     feature_name: str,
@@ -1282,47 +1375,20 @@ def generate_run_config(
 ) -> Path:
     """Parse a generated run.sh and write RUN-CONFIG.json for the Python runner.
 
-    Returns path to the written RUN-CONFIG.json.
+    Returns path to the written RUN-CONFIG.json. Raises ManifestError (a
+    ValueError) when run.sh is not a usable manifest.
     """
-    from runner.config import PhaseConfig, RunConfig  # noqa: PLC0415
+    from runner.config import RunConfig  # noqa: PLC0415
 
-    text = run_sh_path.read_text(encoding="utf-8")
-
-    # Extract phases, tokens, names from bash associative arrays
-    phases_re = re.compile(r'PHASES\[(\d+)\]\s*=\s*"([^"]+)"')
-    tokens_re = re.compile(r'PHASE_TOKENS\[(\d+)\]\s*=\s*"([^"]+)"')
-    names_re = re.compile(r'PHASE_NAMES\[(\d+)\]\s*=\s*"([^"]+)"')
-
-    phase_files = dict(phases_re.findall(text))
-    phase_tokens = dict(tokens_re.findall(text))
-    phase_names = dict(names_re.findall(text))
-
-    if not phase_files:
-        raise ValueError(f"No PHASES found in {run_sh_path}")
-
-    prompt_dir = run_sh_path.parent / "prompts"
-    phase_configs = []
-    for num_str in sorted(phase_files.keys(), key=int):
-        num = int(num_str)
-        prompt_file = str(prompt_dir / phase_files[num_str])
-        phase_configs.append(PhaseConfig(
-            number=num,
-            name=phase_names.get(num_str, f"Phase {num}"),
-            prompt_file=prompt_file,
-            token=phase_tokens.get(num_str, f"PHASE_{num}_COMPLETE"),
-            model=preset_config.phase_models.get(num) or None,
-        ))
+    manifest = parse_manifest(run_sh_path)
+    phase_configs = manifest.phases
+    for phase in phase_configs:
+        phase.model = preset_config.phase_models.get(phase.number) or None
 
     # Models: the preset wins over run.sh, whose values the generate step
     # always writes as the speccer default ("opus").
-    model_match = re.search(r'CONDUCTOR_MODEL\s*=\s*"([^"]+)"', text)
-    model = preset_config.model or (model_match.group(1) if model_match else "")
-    fix_model_match = re.search(r'CONDUCTOR_FIX_MODEL\s*=\s*"([^"]+)"', text)
-    fix_model = (
-        preset_config.fix_model
-        or (fix_model_match.group(1) if fix_model_match else "")
-        or model
-    )
+    model = preset_config.model or manifest.model
+    fix_model = preset_config.fix_model or manifest.fix_model or model
 
     cfg = RunConfig(
         feature_name=feature_name,
@@ -2353,11 +2419,7 @@ async def restart_stage(
         # Otherwise, consult PROGRESS.md to re-enter the pipeline at the correct phase.
         wt = stage.worktree
         run_sh = Path(wt) / "docs" / fname / "run.sh" if wt else None
-        run_sh_valid = (
-            run_sh is not None
-            and run_sh.exists()
-            and "PHASES[" in run_sh.read_text(encoding="utf-8")
-        )
+        run_sh_valid = run_sh is not None and _manifest_problem(run_sh) is None
         if run_sh_valid:
             exit_file = _runner_exit_file(storage, state.project_name, fname)
             exit_file.unlink(missing_ok=True)

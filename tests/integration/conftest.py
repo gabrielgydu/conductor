@@ -512,7 +512,7 @@ def _parse_speccer_cmd(cmd: str) -> tuple[str | None, dict[str, str]]:
 
 
 def write_generated_run_sh(feature_docs_dir: Path, phases: int = 2) -> Path:
-    """Write a run.sh shaped like `speccer generate` output (PHASES arrays)."""
+    """Write run.sh and prompts/ shaped like `speccer generate` output."""
     lines = ["#!/bin/bash", 'CONDUCTOR_MODEL="sonnet"']
     for n in range(1, phases + 1):
         lines += [
@@ -521,7 +521,10 @@ def write_generated_run_sh(feature_docs_dir: Path, phases: int = 2) -> Path:
             f'PHASE_TOKENS[{n}]="PHASE_{n}_COMPLETE"',
         ]
     run_sh = feature_docs_dir / "run.sh"
-    run_sh.parent.mkdir(parents=True, exist_ok=True)
+    prompts = feature_docs_dir / "prompts"
+    prompts.mkdir(parents=True, exist_ok=True)
+    for n in range(1, phases + 1):
+        (prompts / f"phase-{n}.md").write_text(f"Do phase {n}. Emit PHASE_{n}_COMPLETE.\n")
     run_sh.write_text("\n".join(lines) + "\n")
     run_sh.chmod(run_sh.stat().st_mode | stat.S_IEXEC)
     return run_sh

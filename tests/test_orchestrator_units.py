@@ -419,3 +419,19 @@ async def test_existing_pr_for_the_branch_counts_as_created(monkeypatch, tmp_pat
     url = await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
 
     assert url == "https://github.com/o/r/pull/7"
+
+
+@pytest.mark.asyncio
+async def test_restart_regenerates_an_unusable_manifest(tmp_path):
+    """run.sh whose phase prompt is missing: regenerate, don't rerun the runner."""
+    state, wt = _make_state_with_worktree(tmp_path)
+    stage = state.runs[0].stages[0]
+    stage.status = StageStatus.FAILED
+    _write_progress(wt, "run-0", "GENERATED")
+    run_sh = wt / "docs" / "run-0" / "run.sh"
+    run_sh.write_text('PHASES[1]="phase-1.md"\n')  # prompts/phase-1.md never written
+
+    await orch.restart_stage(state, 0, 0, _ipc_storage(tmp_path))
+
+    assert stage.status == StageStatus.SPEC_COMPLETE
+    assert not run_sh.exists()
