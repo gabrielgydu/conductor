@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import conductor.core.lock as lock_module
 import conductor.core.orchestrator as orch
 from conductor.core.enums import RunStatus, StageStatus
+from conductor.core.lock import LockHeld, acquire_project_lock, release_project_lock
 from conductor.core.models import ConductorState
 from conductor.core.orchestrator import ConductorConfig, conductor_run_loop
 from conductor.core.storage import StorageResolver
@@ -282,22 +286,62 @@ async def test_human_wait_does_not_stop_an_executing_run(loop_env, monkeypatch, 
     assert state.runs[0].stages[0].status == StageStatus.SPEC_NEEDS_INPUT
 
 
+def _hold_lock_in_other_process(conductor_dir: Path) -> subprocess.Popen:
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from conductor.core.lock import acquire_project_lock\n"
+        f"acquire_project_lock(Path({str(conductor_dir)!r}), 'run')\n"
+        "print('locked', flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    env.pop("TMUX", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env
+    )
+    assert proc.stdout.readline().strip() == "locked"
+    return proc
+
+
 @pytest.mark.asyncio
-async def test_second_conductor_on_the_same_project_is_refused(loop_env, tmp_path):
+async def test_second_conductor_on_the_same_project_is_refused(loop_env, tmp_path, monkeypatch):
     """A second loop must not start while one runs: it would kill the first
     one's tmux windows and overwrite its state file."""
+    monkeypatch.delenv("TMUX", raising=False)
     state = _state(_active(0, "feat-a", StageStatus.EXECUTING))
     config = ConductorConfig(check_interval_s=0.0, max_iterations=1, project_root=tmp_path)
-    storage = StorageResolver(tmp_path)
-    holder = orch._lock_project(storage, state.project_name)
+    conductor_dir = StorageResolver(tmp_path).conductor_dir(state.project_name)
+    holder = _hold_lock_in_other_process(conductor_dir)
     try:
         with patch.object(orch, "_conductor_run_loop", AsyncMock()) as loop:
-            with pytest.raises(orch.ProjectLocked, match=f"pid {os.getpid()}"):
+            with pytest.raises(LockHeld, match=f"pid {holder.pid}"):
                 await conductor_run_loop(state, config)
         loop.assert_not_awaited()
     finally:
-        holder.close()
+        holder.stdin.close()
+        holder.wait(timeout=10)
 
-    # Released: the next start runs.
+    # Released: the next start runs, and gives the lock back afterwards.
     with patch.object(orch, "_conductor_run_loop", AsyncMock(return_value=state)) as loop:
         assert await conductor_run_loop(state, config) is state
+    assert conductor_dir.resolve() / "conductor.lock" not in lock_module._held
+
+
+@pytest.mark.asyncio
+async def test_loop_runs_under_the_lock_conductor_run_already_holds(loop_env, tmp_path, monkeypatch):
+    """`conductor run` takes the project lock before it starts the loop in
+    the same process; the loop must not refuse its own caller."""
+    monkeypatch.delenv("TMUX", raising=False)
+    state = _state(_active(0, "feat-a", StageStatus.EXECUTING))
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=1, project_root=tmp_path)
+    conductor_dir = StorageResolver(tmp_path).conductor_dir(state.project_name)
+    assert acquire_project_lock(conductor_dir, "run")
+    try:
+        with patch.object(orch, "_conductor_run_loop", AsyncMock(return_value=state)) as loop:
+            assert await conductor_run_loop(state, config) is state
+        loop.assert_awaited_once()
+        # Still the CLI's lock: the loop did not release what it did not take.
+        assert conductor_dir.resolve() / "conductor.lock" in lock_module._held
+    finally:
+        release_project_lock(conductor_dir)

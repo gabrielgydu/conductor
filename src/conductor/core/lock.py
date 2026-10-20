@@ -77,14 +77,16 @@ def _read_holder(path: Path) -> dict:
     return holder if isinstance(holder, dict) else {}
 
 
-def acquire_project_lock(conductor_dir: Path, command: str) -> None:
+def acquire_project_lock(conductor_dir: Path, command: str) -> bool:
     """Take the project lock for the rest of this process, or raise LockHeld.
 
-    Re-acquiring a lock this process already holds is a no-op.
+    Re-acquiring a lock this process already holds is a no-op. Returns True
+    only when this call took the lock, so a caller that found it already
+    held (the orchestrator loop under `conductor run`) leaves it alone.
     """
     path = _lock_path(conductor_dir)
     if path in _held:
-        return
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -103,6 +105,7 @@ def acquire_project_lock(conductor_dir: Path, command: str) -> None:
     os.ftruncate(fd, 0)
     os.write(fd, json.dumps(holder).encode("utf-8"))
     _held[path] = fd
+    return True
 
 
 def release_project_lock(conductor_dir: Path) -> None:

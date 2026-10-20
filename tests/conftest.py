@@ -83,6 +83,17 @@ def _isolate_conductor_home(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _release_project_locks():
+    """CLI commands keep the project lock for the life of their process; in
+    the test process that is the whole session, so drop them after each test."""
+    yield
+    from conductor.core import lock
+
+    for path in list(lock._held):
+        lock.release_project_lock(path.parent)
+
+
+@pytest.fixture(autouse=True)
 def _no_gh_retry_backoff(monkeypatch):
     """merge.py sleeps between gh retries; with gh mocked to fail that was 20 s per test."""
     import conductor.integration.merge as merge
