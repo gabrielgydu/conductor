@@ -49,6 +49,13 @@ KNOWN_MODELS: dict[str, ModelPricing] = {
     # Prompts over 100K tokens bill at $0.50/$2.50, which session totals
     # cannot reveal, so estimates for long Haiku 5.5 sessions run low.
     "claude-haiku-5-5": _list_price(0.10, 0.50, 0.01),
+    # Fable 5.1 cache reads cost a quarter of Fable 5's.
+    "claude-fable-5-1": _list_price(10.00, 50.00, 0.25),
+    "claude-fable-5": _list_price(10.00, 50.00, 1.00),
+    "claude-opus-5": _list_price(5.00, 25.00, 0.50),
+    "claude-sonnet-5": _list_price(2.00, 10.00, 0.20),
+    "claude-opus-4-7": _list_price(5.00, 25.00, 0.50),
+    "claude-opus-4-6": _list_price(5.00, 25.00, 0.50),
 }
 
 _SNAPSHOT_DATE = re.compile(r"-\d{8}$")

@@ -81,12 +81,27 @@ def test_get_pricing_resolves_aliases_and_variants():
     assert get_pricing("claude-haiku-4-5-20251001") == get_pricing("haiku")
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])
-def test_get_pricing_knows_claude_5(model):
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+        "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+        "claude-opus-4-7", "claude-opus-4-6",
+    ],
+)
+def test_get_pricing_knows_current_models(model):
     assert get_pricing(model) is not None
 
 
-@pytest.mark.parametrize("model", ["unknown-model-xyz", "claude-fable-5-1", ""])
+def test_get_pricing_fable():
+    fable_5_1 = get_pricing("claude-fable-5-1")
+    assert (fable_5_1.input_per_mtok, fable_5_1.output_per_mtok) == (10.00, 50.00)
+    assert fable_5_1.cache_read_per_mtok == 0.25
+    assert fable_5_1.cache_write_per_mtok == 20.00
+    assert get_pricing("claude-fable-5").cache_read_per_mtok == 1.00
+
+
+@pytest.mark.parametrize("model", ["unknown-model-xyz", "claude-nonexistent-model-0", ""])
 def test_get_pricing_unknown_model_is_none(model):
     # No guessing: an unknown model used to get Sonnet prices.
     assert get_pricing(model) is None
@@ -203,7 +218,7 @@ def test_estimate_cost_matches_cli_reported_cost(fixture):
     assert estimate == pytest.approx(extract_reported_cost(output), rel=1e-6)
 
 
-@pytest.mark.parametrize("model", [None, "", "claude-fable-5-1"])
+@pytest.mark.parametrize("model", [None, "", "claude-nonexistent-model-0"])
 def test_estimate_cost_unknown_model_is_none(model):
     assert estimate_cost(TokenStats(input=1000), model) is None
 
