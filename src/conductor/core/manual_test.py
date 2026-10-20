@@ -292,7 +292,7 @@ def ensure_manual_test_layout(conductor_dir: Path) -> None:
 def _split_table_cells(line: str) -> list[str]:
     """Cells of a markdown table row; ``\\|`` inside a cell is a literal pipe."""
     row = line.strip()
-    row = row[1:] if row.startswith("|") else row
+    row = row.removeprefix("|")
     row = row[:-1] if row.endswith("|") and not row.endswith("\\|") else row
     return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", row)]
 
@@ -1839,7 +1839,7 @@ def _scenario_handoff_section(scenario: ManualScenario) -> str:
     if not scenario.handoff_notes.strip():
         return ""
 
-    content = ""
+    content, handoff_path = "", None
     match = re.search(r"(/\S*generation-\d{3}-handoff\.md)", scenario.handoff_notes)
     if match:
         handoff_path = Path(match.group(1))
@@ -1851,7 +1851,7 @@ def _scenario_handoff_section(scenario: ManualScenario) -> str:
         # The newest output, including any handoff summary, is at the end.
         if len(content) > HANDOFF_EXCERPT_CHARS:
             content = (
-                f"...(earlier output omitted; Read {match.group(1)} for all of it)\n"
+                f"...(earlier output omitted; Read {handoff_path} for all of it)\n"
                 + content[-HANDOFF_EXCERPT_CHARS:]
             )
         section += f"\n```markdown\n{content}\n```\n"
