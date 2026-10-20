@@ -149,6 +149,20 @@ def tmux(monkeypatch) -> list[BashTmux]:
     return created
 
 
+def lint_hook(repo: Path) -> None:
+    """Install a pre-commit hook that rejects any notes.txt containing TODO."""
+    hooks = Path(_git(repo, "config", "core.hooksPath").strip())
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if grep -q TODO notes.txt 2>/dev/null; then\n"
+        "  echo 'LINT FAILED: TODO left in notes.txt' >&2; exit 1\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+
+
 def make_state(repo: Path, checklist: str, **kwargs) -> LoopState:
     plan = repo / "plan.md"
     plan.write_text(checklist)
@@ -208,3 +222,54 @@ async def test_session_files_live_in_the_loop_dir(repo, claude, tmux):
     (session_end,) = [e for e in events if e["event"] == "SESSION_END"]
     assert session_end["stderr_tail"] == "cli warning"
     assert list(session_dir.iterdir()) == []  # removed after the session
+
+
+# -- rejected commits ----------------------------------------------------------
+
+
+async def test_rejected_commit_is_fed_back_instead_of_crashing(repo, claude, tmux):
+    """A pre-commit hook rejecting the completed task's commit used to kill the loop."""
+    claude.script([
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "TODO\n"}},
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "done\n"}},
+    ])
+    state = make_state(repo, ONE_TASK)
+    lint_hook(repo)
+
+    saved, events = await run_loop(state, repo)
+
+    assert "LINT FAILED: TODO left in notes.txt" in claude.calls[1]["prompt"]
+    assert "Commit Rejected" not in claude.calls[0]["prompt"]
+    task = saved.tasks[0]
+    assert (task.status, task.attempts, task.commit_error) == ("completed", 2, None)
+    assert _git(repo, "show", "HEAD:notes.txt") == "done\n"
+    assert [e["event"] for e in events].count("GATE_FAILED") == 1
+    assert saved.status == "completed"
+
+
+async def test_rejected_wip_commit_leaves_work_for_the_next_session(repo, claude, tmux):
+    claude.script([
+        {"events": [say("ran out of turns")], "write": {"notes.txt": "TODO\n"}},
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "done\n"}},
+    ])
+    state = make_state(repo, ONE_TASK)
+    lint_hook(repo)
+
+    saved, _ = await run_loop(state, repo)
+
+    assert "LINT FAILED" in claude.calls[1]["prompt"]
+    assert saved.tasks[0].status == "completed"
+    assert "WIP" not in _git(repo, "log", "--format=%s")
+
+
+async def test_commit_that_keeps_failing_fails_the_task(repo, claude, tmux):
+    claude.script([{"events": [say("<task-completed/>")], "write": {"notes.txt": "TODO\n"}}])
+    state = make_state(repo, ONE_TASK + "- [ ] **Second** — another task\n")
+    lint_hook(repo)
+
+    saved, events = await run_loop(state, repo)
+
+    assert saved.tasks[0].status == "failed"
+    assert saved.tasks[0].attempts == 3
+    assert "TASK_FAILED" in [e["event"] for e in events]
+    assert len(claude.calls) >= 4  # the loop moved on to the second task

@@ -39,6 +39,8 @@ class LoopTask(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     attempts: int = 0
+    # Output of the last rejected commit (pre-commit hook), shown to the next session
+    commit_error: Optional[str] = None
 
 
 class LoopState(BaseModel):
@@ -158,6 +160,8 @@ def decompose_plan(plan_content: str, model: str = "sonnet") -> list[LoopTask]:
 # ---------------------------------------------------------------------------
 
 _TASK_COMPLETED_TAG = "<task-completed/>"
+# How much of a rejected commit's output the next prompt quotes
+_COMMIT_ERROR_PROMPT_CHARS = 4000
 
 
 def build_prompt(state: LoopState, plan_content: str) -> str:
@@ -190,6 +194,14 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
             f"**{current_task.name}**\n\n"
             f"{current_task.description}\n"
         )
+        if current_task.commit_error:
+            current_section += (
+                f"\n## Commit Rejected\n\n"
+                f"The orchestrator's last attempt to commit this task's changes was "
+                f"rejected (usually a pre-commit hook):\n\n"
+                f"```\n{current_task.commit_error.strip()[-_COMMIT_ERROR_PROMPT_CHARS:]}\n```\n\n"
+                f"Fix the cause before you signal completion. Do not bypass or disable the hook.\n"
+            )
 
     return (
         f"You are working through a fix/improvement plan. "
@@ -252,8 +264,19 @@ def create_loop_worktree(
 # ---------------------------------------------------------------------------
 
 
+class CommitRejected(Exception):
+    """git refused to stage or commit, usually a pre-commit hook; ``output`` says why."""
+
+    def __init__(self, output: str) -> None:
+        super().__init__(output.strip() or "git commit failed")
+        self.output = output
+
+
 def commit_task(cwd: Path, task: LoopTask) -> str | None:
-    """Stage all changes and commit. Returns commit hash or None."""
+    """Stage all changes and commit. Returns commit hash, or None if nothing changed.
+
+    Raises CommitRejected (with git's output) when git refuses the commit.
+    """
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=str(cwd), capture_output=True, text=True,
@@ -261,16 +284,11 @@ def commit_task(cwd: Path, task: LoopTask) -> str | None:
     if not status.stdout.strip():
         return None
 
-    subprocess.run(
-        ["git", "add", "-A"],
-        cwd=str(cwd), check=True, capture_output=True,
-    )
-
     msg = f"{task.name}\n\nTask {task.index}: {task.description[:200]}"
-    subprocess.run(
-        ["git", "commit", "-m", msg],
-        cwd=str(cwd), check=True, capture_output=True,
-    )
+    for args in (["git", "add", "-A"], ["git", "commit", "-m", msg]):
+        r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
+        if r.returncode != 0:
+            raise CommitRejected(r.stdout + r.stderr)
 
     result = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
@@ -375,6 +393,28 @@ async def _wait_for_exit(
             await tmux.kill_window(window_name)
             exit_file.write_text("1")
             return
+
+
+# ---------------------------------------------------------------------------
+# Task bookkeeping
+# ---------------------------------------------------------------------------
+
+# Sessions a task gets before it is marked failed and the loop moves on
+_MAX_ATTEMPTS_PER_TASK = 3
+
+
+def _fail_task(
+    state: LoopState, task: LoopTask, why: str,
+    log_path: Path | None, audit_path: Path | None,
+) -> None:
+    """Mark *task* failed and move the loop on to the next one."""
+    task.status = "failed"
+    state.current_task_index += 1
+    _log(
+        "TASK_FAILED",
+        f"Task {task.index} '{task.name}' failed after {task.attempts} attempts: {why}",
+        log_path, audit_path, task_index=task.index,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -536,25 +576,37 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         if signal == "completed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled completed", log_path, audit_path)
 
-            commit_hash = commit_task(cwd, task)
-            task.status = "completed"
-            task.commit = commit_hash
-            task.completed_at = datetime.now(timezone.utc)
+            try:
+                commit_hash = commit_task(cwd, task)
+            except CommitRejected as rejected:
+                # Keep the task open; the next session sees the hook's output
+                task.commit_error = rejected.output
+                _log(
+                    "GATE_FAILED",
+                    f"Task {task.index}: commit rejected, task stays open\n{rejected}",
+                    log_path, audit_path, task_index=task.index,
+                )
+                if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                    _fail_task(state, task, "its commit kept being rejected", log_path, audit_path)
+            else:
+                task.status = "completed"
+                task.commit = commit_hash
+                task.commit_error = None
+                task.completed_at = datetime.now(timezone.utc)
 
-            _log(
-                "TASK_COMPLETED",
-                f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
-                log_path, audit_path,
-                task_index=task.index, commit=commit_hash,
-            )
+                _log(
+                    "TASK_COMPLETED",
+                    f"Task {task.index} '{task.name}' completed (commit: {commit_hash})",
+                    log_path, audit_path,
+                    task_index=task.index, commit=commit_hash,
+                )
 
-            state.current_task_index += 1
+                state.current_task_index += 1
 
         elif signal == "failed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled failed", log_path, audit_path)
-            if task.attempts >= 3:
-                task.status = "failed"
-                state.current_task_index += 1
+            if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                _fail_task(state, task, "it signaled failure", log_path, audit_path)
 
         else:
             # No signal — context exhaustion or crash
@@ -563,12 +615,22 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
                 f"Session ended without signal (exit {exit_code}). Will restart.",
                 log_path, audit_path,
             )
-            partial_hash = commit_task(cwd, LoopTask(
-                index=task.index, name=f"WIP: {task.name}",
-                description=f"Partial progress on task {task.index}",
-            ))
-            if partial_hash:
-                _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
+            try:
+                partial_hash = commit_task(cwd, LoopTask(
+                    index=task.index, name=f"WIP: {task.name}",
+                    description=f"Partial progress on task {task.index}",
+                ))
+            except CommitRejected as rejected:
+                # Leave the work uncommitted for the next session, which sees why
+                task.commit_error = rejected.output
+                _log(
+                    "GATE_FAILED",
+                    f"Task {task.index}: WIP commit rejected, changes left uncommitted\n{rejected}",
+                    log_path, audit_path, task_index=task.index,
+                )
+            else:
+                if partial_hash:
+                    _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
 
         # Save state after each session
         state.updated_at = datetime.now(timezone.utc)
