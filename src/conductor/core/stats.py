@@ -55,28 +55,56 @@ def get_pricing(model: str) -> ModelPricing:
     return _DEFAULT_PRICING
 
 
-def extract_stats(stream_json_output: str) -> TokenStats:
-    """Parse stream-json output and return token usage from the result event."""
-    for line in stream_json_output.splitlines():
+def find_result_event(stream_json_output: str) -> dict | None:
+    """Return the last `result` event in Claude CLI stream-json output, or None.
+
+    The CLI ends every `-p` session with one result event. Its `result` field is
+    the final text (absent on some errors); `usage`, `total_cost_usd`,
+    `modelUsage`, `num_turns`, `is_error` and `subtype` are top-level fields.
+    See tests/fixtures/stream_json/ for captured examples.
+    """
+    for line in reversed(stream_json_output.splitlines()):
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             continue
-        if event.get("type") == "result":
-            result = event.get("result", {})
-            if not isinstance(result, dict):
-                continue
-            usage = result.get("usage", {})
-            return TokenStats(
-                input=usage.get("input_tokens", 0),
-                output=usage.get("output_tokens", 0),
-                cache_read=usage.get("cache_read_input_tokens", 0),
-                cache_write=usage.get("cache_creation_input_tokens", 0),
-            )
-    return TokenStats()
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return None
+
+
+def result_token_stats(result_event: dict | None) -> TokenStats:
+    """Token counts from a result event's top-level `usage` (zeros if absent)."""
+    usage = result_event.get("usage") if result_event else None
+    if not isinstance(usage, dict):
+        return TokenStats()
+    return TokenStats(
+        input=usage.get("input_tokens") or 0,
+        output=usage.get("output_tokens") or 0,
+        cache_read=usage.get("cache_read_input_tokens") or 0,
+        cache_write=usage.get("cache_creation_input_tokens") or 0,
+    )
+
+
+def result_cost_usd(result_event: dict | None) -> float | None:
+    """The CLI's own `total_cost_usd` for the session, or None if it reported none."""
+    cost = result_event.get("total_cost_usd") if result_event else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost)
+
+
+def extract_stats(stream_json_output: str) -> TokenStats:
+    """Token usage from the result event in stream-json output (zeros if there is none)."""
+    return result_token_stats(find_result_event(stream_json_output))
+
+
+def extract_reported_cost(stream_json_output: str) -> float | None:
+    """The CLI-reported session cost from stream-json output, or None."""
+    return result_cost_usd(find_result_event(stream_json_output))
 
 
 def calculate_cost(tokens: TokenStats, pricing: ModelPricing) -> float:

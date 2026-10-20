@@ -27,7 +27,11 @@ from conductor.core.claude import run_claude, run_claude_steerable, SteerableSes
 from conductor.core.model_catalog import resolve_model
 from conductor.core.stats import (
     get_pricing,
+    find_result_event,
+    result_token_stats,
+    result_cost_usd,
     extract_stats,
+    extract_reported_cost,
     calculate_cost,
     record_stats,
     format_tokens,
@@ -64,7 +68,8 @@ __all__ = [
     # model catalog
     "resolve_model",
     # stats
-    "get_pricing", "extract_stats", "calculate_cost", "record_stats",
+    "get_pricing", "find_result_event", "result_token_stats", "result_cost_usd",
+    "extract_stats", "extract_reported_cost", "calculate_cost", "record_stats",
     "format_tokens", "format_duration", "ModelPricing", "TokenStats", "StatsEntry",
     # logging
     "live_log", "header", "error", "die",

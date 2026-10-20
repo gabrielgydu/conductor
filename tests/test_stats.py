@@ -1,6 +1,9 @@
 """Tests for conductor.core.stats — TDD Phase 2."""
 
 import json
+from pathlib import Path
+
+import pytest
 
 from conductor.core.stats import (
     ModelPricing,
@@ -9,6 +12,8 @@ from conductor.core.stats import (
     resolve_model,
     get_pricing,
     extract_stats,
+    extract_reported_cost,
+    find_result_event,
     calculate_cost,
     record_stats,
     format_tokens,
@@ -16,15 +21,16 @@ from conductor.core.stats import (
 )
 
 # ---------------------------------------------------------------------------
-# Sample fixture
+# Real stream-json transcripts (Claude Code CLI 2.1.304, claude-haiku-5-5),
+# captured with `claude -p - --output-format stream-json --verbose` and
+# scrubbed of local paths and IDs.
 # ---------------------------------------------------------------------------
 
-SAMPLE_STREAM_JSON = "\n".join(
-    [
-        '{"type":"assistant","content":"Hello"}',
-        '{"type":"result","result":{"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":100}}}',
-    ]
-)
+STREAM_JSON_FIXTURES = Path(__file__).parent / "fixtures" / "stream_json"
+
+
+def load_stream_json(name: str) -> str:
+    return (STREAM_JSON_FIXTURES / f"{name}.jsonl").read_text("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -79,35 +85,65 @@ def test_get_pricing_sonnet_default():
 # ---------------------------------------------------------------------------
 
 
-def test_extract_stats_from_stream_json():
-    stats = extract_stats(SAMPLE_STREAM_JSON)
-    assert stats.input == 1000
-    assert stats.output == 500
-    assert stats.cache_read == 200
-    assert stats.cache_write == 100
+@pytest.mark.parametrize(
+    "fixture, expected",
+    [
+        # Read tool call + final answer, subtype success
+        ("success", TokenStats(input=4, output=149, cache_read=28539, cache_write=5815)),
+        # stopped by --max-turns 1: is_error, subtype error_max_turns, no `result` text
+        ("error_max_turns", TokenStats(input=2, output=138, cache_read=17086, cache_write=0)),
+    ],
+)
+def test_extract_stats_reads_top_level_usage(fixture, expected):
+    assert extract_stats(load_stream_json(fixture)) == expected
+
+
+@pytest.mark.parametrize(
+    "fixture, cost",
+    [("success", 0.00152329), ("error_max_turns", 0.00024006), ("model_not_found", 0.0)],
+)
+def test_extract_reported_cost(fixture, cost):
+    assert extract_reported_cost(load_stream_json(fixture)) == cost
+
+
+def test_find_result_event_shape():
+    event = find_result_event(load_stream_json("error_max_turns"))
+    assert event["subtype"] == "error_max_turns"
+    assert event["is_error"] is True
+    assert event["num_turns"] == 2
+    assert "result" not in event
+    assert event["errors"] == ["Reached maximum number of turns (1)"]
+    assert set(event["modelUsage"]) == {"claude-haiku-5-5"}
+
+
+def test_find_result_event_returns_last_result():
+    output = "\n".join([
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 1}),
+        json.dumps({"type": "assistant", "message": {"content": []}}),
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 2}),
+    ])
+    assert find_result_event(output)["num_turns"] == 2
 
 
 def test_extract_stats_no_result_event():
-    output = '{"type":"assistant","content":"hi"}\n'
-    stats = extract_stats(output)
-    assert stats.input == 0
-    assert stats.output == 0
-    assert stats.cache_read == 0
-    assert stats.cache_write == 0
+    output = '{"type":"assistant","message":{"content":[]}}\n'
+    assert find_result_event(output) is None
+    assert extract_stats(output) == TokenStats()
+    assert extract_reported_cost(output) is None
 
 
-def test_extract_stats_mixed_content():
+def test_extract_stats_skips_non_events():
     output = "\n".join(
         [
             "not-json",
-            '{"type":"assistant","content":"hi"}',
+            '["a", "list"]',
+            "",
+            '{"type":"result","subtype":"success","usage":{"input_tokens":42,"output_tokens":7},"total_cost_usd":0.5}',
             "also not json",
-            '{"type":"result","result":{"usage":{"input_tokens":42,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
         ]
     )
-    stats = extract_stats(output)
-    assert stats.input == 42
-    assert stats.output == 7
+    assert extract_stats(output) == TokenStats(input=42, output=7)
+    assert extract_reported_cost(output) == 0.5
 
 
 # ---------------------------------------------------------------------------
