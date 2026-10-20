@@ -126,6 +126,13 @@ def test_load_preset_from_user_dir(presets_dir):
     assert preset.source == presets_dir / "demo.toml"
 
 
+def test_user_presets_follow_conductor_home(tmp_path, monkeypatch):
+    monkeypatch.delenv(PRESETS_DIR_ENV, raising=False)
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    _write(tmp_path / "home" / "presets" / "demo.toml", FULL_PRESET)
+    assert load_preset("demo").source == tmp_path / "home" / "presets" / "demo.toml"
+
+
 def test_load_preset_name_defaults_to_file_stem(presets_dir):
     _write(presets_dir / "custom.toml", "[config]\nfixer_enabled = true\n")
     assert load_preset("custom").name == "custom"

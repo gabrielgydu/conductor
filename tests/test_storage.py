@@ -78,9 +78,16 @@ def make_resolver(tmp_path=None):
         return StorageResolver(KNOWN_ROOT)
 
 
-def test_base_dir_location():
+def test_base_dir_location(monkeypatch):
+    monkeypatch.delenv("CONDUCTOR_HOME", raising=False)
     resolver = make_resolver()
     assert resolver.base_dir == CONDUCTOR_BASE
+
+
+def test_conductor_home_env_overrides_base_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    resolver = make_resolver()
+    assert resolver.base_dir == tmp_path / "home" / "projects" / KNOWN_KEY
 
 
 def test_conductor_state_path(tmp_path):
@@ -180,7 +187,8 @@ def test_log_dir_path(tmp_path):
     assert "my-feature-speccer" in path.name or path.name == "my-feature-speccer"
 
 
-def test_parent_dirs_created(tmp_path):
+def test_parent_dirs_created(tmp_path, monkeypatch):
+    monkeypatch.delenv("CONDUCTOR_HOME", raising=False)
     with patch("conductor.core.storage._resolve_repo_root", return_value=KNOWN_ROOT):
         with patch(
             "conductor.core.storage.Path.home",

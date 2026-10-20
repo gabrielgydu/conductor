@@ -192,6 +192,8 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
 
 The project key is derived from the repo root path: `/srv/dev/repo` → `-srv-dev-repo`. Worktrees resolve to the main repo's key via `git rev-parse --git-common-dir`.
 
+Set `CONDUCTOR_HOME` to relocate the whole `~/.conductor` tree (project state and user-level presets); the test suite points it at a temp dir.
+
 ## Presets
 
 Presets customize quality gates, preflight checks, teardown, post-run validation, and manual-test policy per project. They are TOML files that live outside this repository, so project-specific tooling never has to be committed here.
@@ -202,7 +204,7 @@ Presets customize quality gates, preflight checks, teardown, post-run validation
 | `~/.conductor/presets/<name>.toml` | User-level presets, selected with `--preset <name>` or auto-detected via `[detect] paths` |
 | `--preset /path/to/file.toml` | Explicit preset file |
 
-`CONDUCTOR_PRESETS_DIR` overrides the user-level directory. Without any preset file the built-in `base` preset is used: no-op quality gate, no teardown, generated smoke tests.
+`CONDUCTOR_PRESETS_DIR` overrides the user-level directory (default `$CONDUCTOR_HOME/presets`, i.e. `~/.conductor/presets`). Without any preset file the built-in `base` preset is used: no-op quality gate, no teardown, generated smoke tests.
 
 See [`examples/preset.example.toml`](examples/preset.example.toml) for the full schema. A minimal preset:
 

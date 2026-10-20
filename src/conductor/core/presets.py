@@ -7,7 +7,8 @@ teardown, manual-test policy) and live *outside* this repository as TOML files:
   whenever it exists.
 * ``~/.conductor/presets/<name>.toml`` — user-level presets, selected with
   ``--preset <name>`` or auto-detected through their ``[detect] paths``.
-  Override the directory with ``CONDUCTOR_PRESETS_DIR``.
+  Override the directory with ``CONDUCTOR_PRESETS_DIR`` (it otherwise follows
+  ``CONDUCTOR_HOME``).
 * ``--preset /path/to/file.toml`` — an explicit file.
 
 ``base`` is the built-in no-op preset. See ``examples/preset.example.toml``
@@ -25,6 +26,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, List, Optional
+
+from conductor.core.storage import conductor_home
 
 PROJECT_PRESET_FILE = Path(".conductor") / "preset.toml"
 PRESETS_DIR_ENV = "CONDUCTOR_PRESETS_DIR"
@@ -429,7 +432,7 @@ def presets_dir() -> Path:
     override = os.environ.get(PRESETS_DIR_ENV)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".conductor" / "presets"
+    return conductor_home() / "presets"
 
 
 def _project_preset_file(project_dir: Path | str | None) -> Path | None:

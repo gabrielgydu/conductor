@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+CONDUCTOR_HOME_ENV = "CONDUCTOR_HOME"
+
+
+def conductor_home() -> Path:
+    """Root of conductor's per-user data: ``$CONDUCTOR_HOME`` or ``~/.conductor``."""
+    override = os.environ.get(CONDUCTOR_HOME_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".conductor"
 
 
 def _resolve_repo_root(repo_path: Path) -> Path:
@@ -28,7 +39,7 @@ class StorageResolver:
     def __init__(self, repo_path: Path) -> None:
         self.repo_root = _resolve_repo_root(repo_path)
         self._project_key = _derive_project_key(self.repo_root)
-        self.base_dir = Path.home() / ".conductor" / "projects" / self._project_key
+        self.base_dir = conductor_home() / "projects" / self._project_key
 
     def _path(self, *parts: str) -> Path:
         path = self.base_dir.joinpath(*parts)

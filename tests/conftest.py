@@ -1,4 +1,6 @@
+import os
 import pytest
+from collections import Counter
 from pathlib import Path
 import glob
 
@@ -12,6 +14,81 @@ from conductor.core.models import (
     ConflictRecord,
     E2ETestState,
 )
+from conductor.core.storage import CONDUCTOR_HOME_ENV
+from conductor.core.presets import PRESETS_DIR_ENV
+
+
+# ---------------------------------------------------------------------------
+# Hermeticity guards
+# ---------------------------------------------------------------------------
+
+# CLIs the suite must never run for real: they cost money (claude; node runs
+# the Codex companion), act on GitHub with the developer's credentials (gh),
+# download or launch browsers (npx, playwright), or touch the developer's live
+# tmux server. A test that needs one installs its own mock earlier on PATH
+# (e.g. tests/integration/conftest.py::MockClaudeCLI); that still wins because
+# it is prepended after this session-wide stub directory.
+# Set CONDUCTOR_TESTS_ALLOW_REAL_CLIS=1 to opt out.
+_BLOCKED_CLIS = ("claude", "gh", "node", "npx", "playwright", "tmux")
+_BLOCKED_CLI_EXIT = 97
+_BLOCKED_CLI_STUB = """#!/bin/sh
+printf '%s :: %s %.120s\\n' "${{PYTEST_CURRENT_TEST:-?}}" "$(basename "$0")" "$*" >> "{log}"
+echo "tests/conftest.py: blocked real '$(basename "$0")' (exit {code})" >&2
+exit {code}
+"""
+_blocked_cli_log: Path | None = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _block_external_clis(tmp_path_factory):
+    """Put fail-fast stubs for paid/networked CLIs first on PATH."""
+    global _blocked_cli_log
+    if os.environ.get("CONDUCTOR_TESTS_ALLOW_REAL_CLIS") == "1":
+        yield None
+        return
+    bindir = tmp_path_factory.mktemp("blocked-clis")
+    _blocked_cli_log = bindir / "invocations.log"
+    _blocked_cli_log.touch()
+    stub = _BLOCKED_CLI_STUB.format(log=_blocked_cli_log, code=_BLOCKED_CLI_EXIT)
+    for name in _BLOCKED_CLIS:
+        path = bindir / name
+        path.write_text(stub)
+        path.chmod(0o755)
+    mp = pytest.MonkeyPatch()
+    mp.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    yield bindir
+    mp.undo()
+
+
+def pytest_terminal_summary(terminalreporter):
+    """List every attempted call to a blocked CLI (tests often swallow the failure)."""
+    if _blocked_cli_log is None or not _blocked_cli_log.exists():
+        return
+    calls: Counter[tuple[str, str]] = Counter()
+    for ln in _blocked_cli_log.read_text().splitlines():
+        test_id, sep, cmd = ln.partition(" :: ")
+        if sep:
+            # PYTEST_CURRENT_TEST looks like "tests/x.py::test_y (call)"
+            calls[(test_id.rsplit(" (", 1)[0], cmd.split(" ", 1)[0])] += 1
+    if calls:
+        terminalreporter.section(f"blocked external CLI calls ({sum(calls.values())})")
+        for (test_id, tool), n in sorted(calls.items()):
+            terminalreporter.write_line(f"{n:3d}x {tool:10s} {test_id}")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_conductor_home(monkeypatch, tmp_path_factory):
+    """Keep StorageResolver and user-preset discovery off the real ~/.conductor."""
+    monkeypatch.setenv(CONDUCTOR_HOME_ENV, str(tmp_path_factory.mktemp("conductor-home")))
+    monkeypatch.delenv(PRESETS_DIR_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_gh_retry_backoff(monkeypatch):
+    """merge.py sleeps between gh retries; with gh mocked to fail that was 20 s per test."""
+    import conductor.integration.merge as merge
+
+    monkeypatch.setattr(merge, "_GH_RETRY_DELAY_S", 0.0)
 
 
 def make_run(index: int, name: str) -> RunState:

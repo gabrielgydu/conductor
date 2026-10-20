@@ -22,6 +22,9 @@ from conductor.core.smoke_test import generate_smoke_test
 
 logger = logging.getLogger(__name__)
 
+# Back-off between `gh pr list` / `gh pr create` retries (tests set it to 0).
+_GH_RETRY_DELAY_S = 5.0
+
 
 def _print(msg: str) -> None:
     """Print to stdout so it shows in tmux."""
@@ -409,7 +412,7 @@ async def run_integration_merge(
                 "gh pr list attempt %d failed: %s", pr_check_attempt + 1, stderr.strip()
             )
             if pr_check_attempt < 2:
-                await asyncio.sleep(5)
+                await asyncio.sleep(_GH_RETRY_DELAY_S)
 
         existing_prs = []
         if rc == 0 and stdout.strip():
@@ -442,7 +445,7 @@ async def run_integration_merge(
                     attempt + 1, rc, stderr.strip(),
                 )
                 if attempt < 2:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(_GH_RETRY_DELAY_S)
             else:
                 logger.error("PR creation failed after 3 attempts for branch %s", branch_name)
     except Exception as e:
