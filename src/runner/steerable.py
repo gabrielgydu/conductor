@@ -14,19 +14,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from asyncio.subprocess import PIPE
 from pathlib import Path
-from typing import AsyncIterator, Callable, Awaitable
+from typing import Callable, Awaitable
 
 from conductor.core.claude import progress_on_event
 from runner.activity import append_event_to_activity_log
 
 
+logger = logging.getLogger("runner.steerable")
+
 # Seconds of output silence after which we consider the session idle-complete.
 # Claude emits a "result" event only after getting EOF, so we can't wait for
 # it — instead we watch for end_turn stop_reason or idle silence.
 _DEFAULT_IDLE_TIMEOUT = 600.0
+
+# StreamReader line limit, matching conductor.core.claude. A stream-json event
+# carries whole tool results (a Read is echoed twice: message content and
+# tool_use_result), so lines of several hundred KB are routine; with asyncio's
+# 64 KiB default readline() raised and silently killed the reader.
+_STREAM_LIMIT = 10 * 1024 * 1024
+
+# Upper bound on waiting for a killed Claude process to be reaped.
+_KILL_WAIT_TIMEOUT = 10.0
 
 
 class SteerableSession:
@@ -83,6 +95,7 @@ class SteerableSession:
             stderr=PIPE,
             cwd=cwd,
             close_fds=True,
+            limit=_STREAM_LIMIT,
         )
 
         # Write the initial prompt as NDJSON — CLI expects message.role, not top-level role
@@ -116,10 +129,12 @@ class SteerableSession:
     async def _drain_stderr(self) -> None:
         """Read stderr in background to prevent buffer deadlock."""
         assert self._proc.stderr is not None
-        import logging
-        logger = logging.getLogger("runner.steerable")
         while True:
-            line = await self._proc.stderr.readline()
+            try:
+                line = await self._proc.stderr.readline()
+            except ValueError:
+                # Over-long line: readline() already dropped it; keep draining.
+                continue
             if not line:
                 return
             text = line.decode("utf-8", errors="replace").strip()
@@ -149,13 +164,29 @@ class SteerableSession:
         self._last_event_time = time.monotonic()
 
         async def _read_loop() -> None:
+            try:
+                await _read_events()
+            finally:
+                # However the reader ends (EOF, result event, an exception),
+                # stop waiting now rather than when the idle watchdog fires.
+                done.set()
+
+        async def _read_events() -> None:
             nonlocal result_event
             assert self._proc.stdout is not None
             while True:
-                line = await self._proc.stdout.readline()
+                try:
+                    line = await self._proc.stdout.readline()
+                except ValueError as exc:
+                    # A single event over _STREAM_LIMIT. readline() has already
+                    # discarded it (a tail still in flight is read as a
+                    # fragment that fails json.loads below), so keep going:
+                    # the promise text and result event come after it.
+                    logger.warning("Skipped an over-long stream-json line: %s", exc)
+                    self._last_event_time = time.monotonic()
+                    continue
                 if not line:
                     # EOF from Claude
-                    done.set()
                     return
                 self._last_event_time = time.monotonic()
                 raw = line.decode("utf-8", errors="replace").strip()
@@ -184,7 +215,6 @@ class SteerableSession:
                 # Explicit result event — Claude finished
                 if event.get("type") == "result":
                     result_event = event
-                    done.set()
                     return
 
                 # end_turn stop reason means Claude is done — but keep reading
@@ -206,18 +236,27 @@ class SteerableSession:
         read_task = asyncio.ensure_future(_read_loop())
         watchdog_task = asyncio.ensure_future(_idle_watchdog())
 
-        await done.wait()
-
-        read_task.cancel()
-        watchdog_task.cancel()
-        # Absorb cancellation exceptions
-        for t in (read_task, watchdog_task):
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            await done.wait()
+        finally:
+            # Also on cancellation: a leftover reader would race close() for stdout.
+            read_task.cancel()
+            watchdog_task.cancel()
+            # Absorb cancellation exceptions
+            for t in (read_task, watchdog_task):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning("Steerable stream reader failed: %r", exc)
 
         return "\n".join(text_parts), result_event
+
+    async def _discard_stdout(self) -> None:
+        assert self._proc.stdout is not None
+        while await self._proc.stdout.read(64 * 1024):
+            pass
 
     def get_exit_code(self) -> int | None:
         """Return process exit code if finished, else None."""
@@ -229,17 +268,32 @@ class SteerableSession:
             return self._proc.returncode or 0
         self._closed = True
 
-        if self._proc.returncode is None:
+        # Nothing reads stdout once stream_events() has returned, so drain it
+        # while Claude winds down. Unread output fills the pipe and blocks
+        # Claude, and Process.wait() only returns once every pipe has reached
+        # EOF, which a paused stdout transport never does.
+        discard_task = asyncio.ensure_future(self._discard_stdout())
+        try:
+            if self._proc.returncode is None:
+                try:
+                    if self._proc.stdin and not self._proc.stdin.is_closing():
+                        self._proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    self._proc.kill()
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=_KILL_WAIT_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.warning("Claude (pid %s) killed but its pipes never closed", self._proc.pid)
+        finally:
+            discard_task.cancel()
             try:
-                if self._proc.stdin and not self._proc.stdin.is_closing():
-                    self._proc.stdin.close()
-            except Exception:
+                await discard_task
+            except (asyncio.CancelledError, Exception):
                 pass
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                self._proc.kill()
-                await self._proc.wait()
 
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
