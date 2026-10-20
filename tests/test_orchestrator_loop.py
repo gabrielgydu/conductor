@@ -96,6 +96,21 @@ async def test_error_inside_failure_handling_blocks_instead_of_spinning(loop_env
 
 
 @pytest.mark.asyncio
+async def test_error_while_blocking_a_stage_blocks_the_run(loop_env):
+    """The BLOCKED branch raising must not leave the run ACTIVE to repeat it."""
+    state = _state(_active(0, "feat-a", StageStatus.BLOCKED))
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=50)
+    stop = AsyncMock(side_effect=OSError("no server running"))
+
+    with patch.object(orch, "_stop_runner", stop):
+        result = await conductor_run_loop(state, config)
+
+    assert stop.await_count == 1
+    assert result.runs[0].status == RunStatus.BLOCKED
+    assert "OSError: no server running" in result.runs[0].stages[0].last_error
+
+
+@pytest.mark.asyncio
 async def test_executing_stage_survives_a_single_monitor_error(loop_env):
     """A runner is not abandoned because one monitoring pass raised."""
     state = _state(_active(0, "feat-a", StageStatus.EXECUTING))

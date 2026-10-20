@@ -3094,7 +3094,8 @@ def _record_advance_error(
     must not stop the orchestration of every run, and must not re-raise on
     every resume). If the stage was already FAILED or STALLED, handle_failure
     itself raised: the stage is BLOCKED directly, otherwise the loop would
-    retry the same crash without ever spending a retry. An EXECUTING stage
+    retry the same crash without ever spending a retry; if blocking it
+    raised as well, the run is BLOCKED right away. An EXECUTING stage
     keeps its runner (it lives in its own tmux window and reports through its
     exit file) until monitoring has failed MAX_MONITOR_ERRORS times in a row.
     """
@@ -3111,7 +3112,13 @@ def _record_advance_error(
         outcome = "run blocked"
     elif stage.status == StageStatus.EXECUTING and consecutive < MAX_MONITOR_ERRORS:
         outcome = f"still executing (monitor error {consecutive}/{MAX_MONITOR_ERRORS})"
-    elif stage.status in (StageStatus.FAILED, StageStatus.STALLED, StageStatus.BLOCKED):
+    elif stage.status == StageStatus.BLOCKED:
+        # Blocking the stage raised (stopping its runner, say). Block the run
+        # here, or every iteration would run into the same error.
+        stage.last_error = error
+        run.status = RunStatus.BLOCKED
+        outcome = "run blocked without stopping its runner or containers"
+    elif stage.status in (StageStatus.FAILED, StageStatus.STALLED):
         stage.last_error = error
         stage.status = StageStatus.BLOCKED
         outcome = "stage blocked (failure handling itself raised)"
