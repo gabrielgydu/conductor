@@ -31,6 +31,7 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "RUNNER_CONFIG_ERROR": EventConfig("✗", True),
     "RUNNER_SHALLOW_TREE": EventConfig("!", True),
     "RUNNER_ZOMBIE":     EventConfig("✗",  True),
+    "RUNNER_KILLED":     EventConfig("✗",  True),
     "TEARDOWN_WARN":     EventConfig("!",  False),
     "VALIDATION_WARNING": EventConfig("!", False),
     "SPECCER_STATUS_SYNC": EventConfig("⚙", False),

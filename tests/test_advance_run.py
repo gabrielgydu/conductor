@@ -49,6 +49,9 @@ def _make_tmux() -> MagicMock:
     tmux.spawn_in_window = AsyncMock()
     tmux.spawn_in_window_and_wait = AsyncMock(return_value=0)
     tmux.spawn_runner_in_window = AsyncMock()
+    tmux.get_pane_pid = AsyncMock(return_value=None)
+    tmux.has_active_children = AsyncMock(return_value=True)
+    tmux.kill_window = AsyncMock()
     return tmux
 
 

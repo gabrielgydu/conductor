@@ -1536,6 +1536,164 @@ def _any_runner_exit_file_ready(
     return False
 
 
+def _runner_window(run_idx: int, stage: StageState) -> str:
+    return f"run{run_idx}:{stage.name}-exec"
+
+
+def _runner_outcome(
+    state: ConductorState, run_idx: int, stage_idx: int, storage: StorageResolver
+) -> int | None:
+    """Exit code of the stage's current runner, or None if it has not exited.
+
+    The wrapper's exit file is the primary record. The runner also writes
+    docs/<feature>/exit_code itself, which survives the exit file being
+    removed; it is never cleared between attempts, so it only counts when
+    written after this attempt started.
+    """
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    fname = run.name + stage.feature_suffix
+    exit_file = _runner_exit_file(storage, state.project_name, fname)
+    try:
+        return int(exit_file.read_text().strip())
+    except OSError:
+        pass
+    except ValueError:
+        return 1
+    if not stage.worktree or stage.started_at is None:
+        return None
+    durable = Path(stage.worktree) / "docs" / fname / "exit_code"
+    try:
+        if durable.stat().st_mtime <= stage.started_at.timestamp():
+            return None
+        return int(durable.read_text().strip())
+    except OSError:
+        return None
+    except ValueError:
+        return 1
+
+
+def _own_pane_group(pid: int, exit_file: Path) -> bool:
+    """Whether *pid* leads the process group of our runner wrapper for *exit_file*.
+
+    A pane pid can outlive its process and be reused, so signal a group only
+    when the process is its own group leader and its command line is the
+    wrapper that writes this stage's exit file (Linux /proc; elsewhere the
+    window is just killed).
+    """
+    try:
+        if os.getpgid(pid) != pid or pid == os.getpgid(0):
+            return False
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except (OSError, ProcessLookupError):
+        return False
+    return str(exit_file).encode() in cmdline
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _stop_runner(
+    tmux: _tmux_module.TmuxManager,
+    window: str,
+    exit_file: Path,
+    reason: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+    **audit,
+) -> None:
+    """Make sure nothing runs in a runner window before its stage leaves EXECUTING.
+
+    A stage that is FAILED or BLOCKED while its runner keeps working gets
+    its containers torn down underneath it, and a later exit is never read.
+    The wrapper's process group (shell, runner, Claude session) gets SIGTERM,
+    then SIGKILL after a grace period, and the window is closed; its output
+    is kept in the window's log file.
+    """
+    if not await tmux.is_window_alive(window) or await tmux.is_runner_idle(window):
+        return  # nothing runs there any more
+    pid = await tmux.get_pane_pid(window)
+    if pid is not None and _own_pane_group(pid, exit_file):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(20):
+            if not _group_alive(pid):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    await tmux.kill_window(window)
+    _log(
+        "RUNNER_KILLED",
+        f"Stopped runner in {window}: {reason}",
+        log_path,
+        audit_path,
+        window=window,
+        **audit,
+    )
+
+
+def _finish_runner(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    exit_code: int,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    """Record a runner exit on its stage: DONE for 0, FAILED otherwise."""
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    fname = run.name + stage.feature_suffix
+    if exit_code == 0:
+        _log(
+            "RUNNER_EXIT",
+            f"Runner {fname} exit 0",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+            exit_code=0,
+        )
+        # The runner's own quality gates passed; nothing to re-validate here.
+        stage.status = StageStatus.DONE
+        stage.completed_at = datetime.now(timezone.utc)
+        return
+    # Read captured pane output if available
+    fail_log = _runner_fail_log(storage, state.project_name, fname)
+    pane_output = ""
+    if fail_log.exists():
+        try:
+            pane_output = fail_log.read_text(errors="replace").strip()
+        except OSError:
+            pass
+    stage.last_exit_code = exit_code
+    stage.status = StageStatus.FAILED
+    _log(
+        "RUNNER_EXIT",
+        f"Runner {fname} exit {exit_code}"
+        + (f"\n--- last output ---\n{pane_output}" if pane_output else ""),
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+        exit_code=exit_code,
+    )
+
+
 async def monitor_runner(
     state: ConductorState,
     run_idx: int,
@@ -1550,112 +1708,102 @@ async def monitor_runner(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
+    window_name = _runner_window(run_idx, stage)
     exit_file = _runner_exit_file(storage, state.project_name, fname)
-    window_name = f"run{run_idx}:{stage.name}-exec"
 
-    if exit_file.exists():
-        try:
-            exit_code = int(exit_file.read_text().strip())
-        except (ValueError, OSError):
-            exit_code = 1
-
-        if exit_code == 0:
-            _log(
-                "RUNNER_EXIT",
-                f"Runner {fname} exit 0",
-                log_path,
-                audit_path,
-                run=run_idx,
-                stage=stage_idx,
-                exit_code=0,
+    exit_code = _runner_outcome(state, run_idx, stage_idx, storage)
+    if exit_code is not None:
+        if exit_code != 0:
+            # A synthetic exit (zombie) can leave the runner process alive.
+            await _stop_runner(
+                tmux, window_name, exit_file, f"exit {exit_code} recorded",
+                log_path, audit_path, run=run_idx, stage=stage_idx,
             )
-            # Runner already ran local CI before exiting 0 — skip redundant validation
-            stage.status = StageStatus.DONE
-            stage.completed_at = datetime.now(timezone.utc)
-        else:
-            # Read captured pane output if available
-            fail_log = _runner_fail_log(storage, state.project_name, fname)
-            pane_output = ""
-            if fail_log.exists():
-                try:
-                    pane_output = fail_log.read_text(errors="replace").strip()
-                except OSError:
-                    pass
-            stage.last_exit_code = exit_code
+        _finish_runner(state, run_idx, stage_idx, exit_code, storage, log_path, audit_path)
+        return
+
+    # Still running — check if window went idle (died without exit file)
+    # Grace period: don't check idle until runner has been running for at least 30s
+    elapsed = (
+        (datetime.now(timezone.utc) - stage.started_at).total_seconds()
+        if stage.started_at
+        else 0
+    )
+    if elapsed > 30:
+        is_idle = await tmux.is_runner_idle(window_name)
+        if is_idle:
             stage.status = StageStatus.FAILED
             _log(
-                "RUNNER_EXIT",
-                f"Runner {fname} exit {exit_code}"
-                + (f"\n--- last output ---\n{pane_output}" if pane_output else ""),
+                "RUNNER_DEAD",
+                f"Runner {fname} died without exit file (window idle)",
                 log_path,
                 audit_path,
                 run=run_idx,
                 stage=stage_idx,
-                exit_code=exit_code,
+                window=window_name,
             )
-    else:
-        # Still running — check if window went idle (died without exit file)
-        # Grace period: don't check idle until runner has been running for at least 30s
-        elapsed = (
-            (datetime.now(timezone.utc) - stage.started_at).total_seconds()
-            if stage.started_at
-            else 0
-        )
-        if elapsed > 30:
-            is_idle = await tmux.is_runner_idle(window_name)
-            if is_idle:
+        elif elapsed > 60 and not await tmux.has_active_children(window_name):
+            session_name = tmux._session_name
+            window_key = f"{session_name}:{window_name}"
+            _shallow_tree_counts[window_key] = (
+                _shallow_tree_counts.get(window_key, 0) + 1
+            )
+            if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
+                _shallow_tree_counts.pop(window_key, None)
+                stage.last_exit_code = 143
                 stage.status = StageStatus.FAILED
                 _log(
-                    "RUNNER_DEAD",
-                    f"Runner {fname} died without exit file (window idle)",
+                    "RUNNER_ZOMBIE",
+                    f"Runner {fname} alive but Claude process dead (no children, "
+                    f"{ZOMBIE_SHALLOW_THRESHOLD} consecutive checks)",
                     log_path,
                     audit_path,
                     run=run_idx,
                     stage=stage_idx,
                     window=window_name,
                 )
-            elif elapsed > 60 and not await tmux.has_active_children(window_name):
-                session_name = tmux._session_name
-                window_key = f"{session_name}:{window_name}"
-                _shallow_tree_counts[window_key] = (
-                    _shallow_tree_counts.get(window_key, 0) + 1
-                )
-                if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
-                    _shallow_tree_counts.pop(window_key, None)
-                    stage.last_exit_code = 143
-                    stage.status = StageStatus.FAILED
-                    _log(
-                        "RUNNER_ZOMBIE",
-                        f"Runner {fname} alive but Claude process dead (no children, "
-                        f"{ZOMBIE_SHALLOW_THRESHOLD} consecutive checks)",
-                        log_path,
-                        audit_path,
-                        run=run_idx,
-                        stage=stage_idx,
-                        window=window_name,
-                    )
-                else:
-                    _log(
-                        "RUNNER_SHALLOW_TREE",
-                        f"Runner {fname} shallow pstree (check "
-                        f"{_shallow_tree_counts[window_key]}/{ZOMBIE_SHALLOW_THRESHOLD}), "
-                        "waiting before declaring zombie",
-                        log_path,
-                        audit_path,
-                        run=run_idx,
-                        stage=stage_idx,
-                        window=window_name,
-                    )
-                    await check_stall(
-                        state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
-                    )
             else:
-                # Tree is healthy — reset any accumulated shallow count
-                window_key = f"{tmux._session_name}:{window_name}"
-                _shallow_tree_counts.pop(window_key, None)
+                _log(
+                    "RUNNER_SHALLOW_TREE",
+                    f"Runner {fname} shallow pstree (check "
+                    f"{_shallow_tree_counts[window_key]}/{ZOMBIE_SHALLOW_THRESHOLD}), "
+                    "waiting before declaring zombie",
+                    log_path,
+                    audit_path,
+                    run=run_idx,
+                    stage=stage_idx,
+                    window=window_name,
+                )
                 await check_stall(
                     state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
                 )
+        else:
+            # Tree is healthy — reset any accumulated shallow count
+            window_key = f"{tmux._session_name}:{window_name}"
+            _shallow_tree_counts.pop(window_key, None)
+            await check_stall(
+                state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
+            )
+
+    if stage.status == StageStatus.EXECUTING:
+        return
+    # Declared dead, zombie or stalled. The runner may have exited between
+    # the checks above: trust a recorded exit over the diagnosis.
+    late_exit = _runner_outcome(state, run_idx, stage_idx, storage)
+    if late_exit is not None:
+        stage.status = StageStatus.EXECUTING
+        stage.last_exit_code = None
+        if late_exit != 0:
+            await _stop_runner(
+                tmux, window_name, exit_file, f"exit {late_exit} recorded",
+                log_path, audit_path, run=run_idx, stage=stage_idx,
+            )
+        _finish_runner(state, run_idx, stage_idx, late_exit, storage, log_path, audit_path)
+        return
+    await _stop_runner(
+        tmux, window_name, exit_file, f"stage left EXECUTING ({stage.status})",
+        log_path, audit_path, run=run_idx, stage=stage_idx,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2410,6 +2558,22 @@ async def advance_run(
 
     # ----- blocked -----
     if status == StageStatus.BLOCKED:
+        if _runner_outcome(state, run_idx, stage_idx, storage) == 0:
+            # The runner finished after all; its result stands.
+            _finish_runner(state, run_idx, stage_idx, 0, storage, log_path, audit_path)
+            atomic_save(state, storage.conductor_state(state.project_name))
+            return
+        # BLOCKED means nothing runs: never tear containers down under a runner.
+        await _stop_runner(
+            tmux,
+            _runner_window(run_idx, stage),
+            _runner_exit_file(storage, state.project_name, run.name + stage.feature_suffix),
+            "stage blocked",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+        )
         run.status = RunStatus.BLOCKED
         _teardown_run_containers(run, preset, log_path, audit_path)
         atomic_save(state, storage.conductor_state(state.project_name))
@@ -2775,8 +2939,13 @@ async def _auto_resume_blocked_runs(
     storage: StorageResolver,
     log_path: Path | None,
     audit_path: Path | None,
+    tmux: _tmux_module.TmuxManager | None = None,
 ) -> None:
-    """Un-block any BLOCKED runs so they resume automatically on restart."""
+    """Un-block any BLOCKED runs so they resume automatically on restart.
+
+    A blocked stage whose runner has since exited 0 is DONE, and one whose
+    runner is still working is watched again; only the others restart.
+    """
     any_resumed = False
     for run_idx, run in enumerate(state.runs):
         if run.status != RunStatus.BLOCKED:
@@ -2803,6 +2972,42 @@ async def _auto_resume_blocked_runs(
                 log_path,
                 audit_path,
                 run=run_idx,
+            )
+            any_resumed = True
+            continue
+        si = run.current_stage
+        if _runner_outcome(state, run_idx, si, storage) == 0:
+            stage.status = StageStatus.EXECUTING
+            _finish_runner(state, run_idx, si, 0, storage, log_path, audit_path)
+            run.status = RunStatus.ACTIVE
+            _log(
+                "AUTO_RESUME",
+                f"Run {run.name} stage {stage.name}: runner finished with exit 0 "
+                "after the stage was blocked; keeping its result",
+                log_path,
+                audit_path,
+                run=run_idx,
+                stage=si,
+            )
+            any_resumed = True
+            continue
+        window = _runner_window(run_idx, stage)
+        if (
+            tmux is not None
+            and stage.started_at is not None
+            and await tmux.is_window_alive(window)
+            and not await tmux.is_runner_idle(window)
+        ):
+            stage.status = StageStatus.EXECUTING
+            run.status = RunStatus.ACTIVE
+            _log(
+                "AUTO_RESUME",
+                f"Run {run.name} stage {stage.name}: runner still running in "
+                f"{window}, watching it again",
+                log_path,
+                audit_path,
+                run=run_idx,
+                stage=si,
             )
             any_resumed = True
             continue
@@ -2887,7 +3092,7 @@ async def conductor_run_loop(
     )
 
     # Auto-resume any BLOCKED runs from a previous session
-    await _auto_resume_blocked_runs(state, storage, log_path, audit_path)
+    await _auto_resume_blocked_runs(state, storage, log_path, audit_path, tmux=tmux)
 
     exit_reason = "unknown"
     advance_errors: dict[int, int] = {}  # run index -> consecutive exceptions
