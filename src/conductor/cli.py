@@ -1464,16 +1464,9 @@ def main():
     p_validate.add_argument(
         "--fix", action="store_true", help="Enable self-healing loop"
     )
+    p_validate.add_argument("--smoke", action="store_true", help="Include smoke tests")
     p_validate.add_argument(
-        "--smoke",
-        action="store_true",
-        help="Include the smoke test (preset smoke_command, or a generated Playwright"
-        " test when the project has a Playwright setup)",
-    )
-    p_validate.add_argument(
-        "--integration",
-        action="store_true",
-        help="Include the conductor integration specs already in the project",
+        "--integration", action="store_true", help="Include integration tests"
     )
     p_validate.add_argument(
         "--max-attempts", type=int, default=3, help="Max self-healing attempts (default: 3)"
