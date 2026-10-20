@@ -674,6 +674,48 @@ def test_parse_manual_pass_requires_artifact_evidence():
     assert "evidence" in "; ".join(invalid.errors)
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "<note>looked fine</note>",
+        "<note></note>",
+        "<screenshot></screenshot><note>...</note>",
+        "<url>...</url><screenshot> … </screenshot>",
+    ],
+    ids=["note-only", "empty-note", "empty-screenshot", "placeholders"],
+)
+def test_pass_and_finding_need_evidence_beyond_notes(evidence):
+    passed = parse_manual_signal(
+        f"""<manual-result status="pass"><summary>Fine</summary><evidence>{evidence}</evidence></manual-result>
+<manual-pass/>"""
+    )
+    finding = parse_manual_signal(
+        FINDING_RESULT.replace("<screenshot>artifacts/screenshots/save.png</screenshot>", evidence)
+        + "\n<manual-finding/>"
+    )
+
+    assert passed.valid is False
+    assert "pass result requires evidence beyond notes" in "; ".join(passed.errors)
+    assert finding.valid is False
+    assert "finding requires evidence beyond notes" in "; ".join(finding.errors)
+
+
+def test_blocked_results_may_rest_on_notes():
+    blocked = parse_manual_signal(
+        """<manual-result status="blocked">
+  <reason>Payment provider sandbox is down for maintenance</reason>
+  <code_read>PaymentGateway::charge calls the sandbox API directly</code_read>
+  <data_attempts>Tried the admin UI and the seeded tenant</data_attempts>
+  <why_not_fixable_now>Third-party outage</why_not_fixable_now>
+  <evidence><note>Provider status page says maintenance until 18:00</note></evidence>
+</manual-result>
+<manual-blocked/>"""
+    )
+
+    assert blocked.errors == []
+    assert blocked.valid is True
+
+
 def test_parse_manual_finding_and_blocked_validation():
     finding = parse_manual_signal(
         """<manual-result status="finding">

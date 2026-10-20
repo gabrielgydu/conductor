@@ -783,30 +783,40 @@ def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "approved"}
 
 
+# Empty tags and the template's "..." placeholders are not evidence.
+_PLACEHOLDER_VALUE = re.compile(r"[.\s…]*")
+
+
+def _evidence_values(block: str, *tags: str) -> list[str]:
+    return [
+        value
+        for tag in tags
+        for value in _tag_values(block, tag)
+        if not _PLACEHOLDER_VALUE.fullmatch(value)
+    ]
+
+
 def _parse_evidence(block: str) -> ManualEvidence:
     evidence_block = _tag_value(block, "evidence") or _top_level(block)
     return ManualEvidence(
         summary=_tag_value(_top_level(block), "summary"),
-        urls=_tag_values(evidence_block, "url"),
-        screenshots=_tag_values(evidence_block, "screenshot"),
-        traces=_tag_values(evidence_block, "trace"),
-        mailhog_messages=(
-            _tag_values(evidence_block, "mailhog")
-            + _tag_values(evidence_block, "mailhog_message")
-        ),
-        console_errors=(
-            _tag_values(evidence_block, "console")
-            + _tag_values(evidence_block, "console_error")
-        ),
-        db_readbacks=(
-            _tag_values(evidence_block, "db")
-            + _tag_values(evidence_block, "db_readback")
-        ),
-        notes=_tag_values(evidence_block, "note"),
+        urls=_evidence_values(evidence_block, "url"),
+        screenshots=_evidence_values(evidence_block, "screenshot"),
+        traces=_evidence_values(evidence_block, "trace"),
+        mailhog_messages=_evidence_values(evidence_block, "mailhog", "mailhog_message"),
+        console_errors=_evidence_values(evidence_block, "console", "console_error"),
+        db_readbacks=_evidence_values(evidence_block, "db", "db_readback"),
+        notes=_evidence_values(evidence_block, "note"),
     )
 
 
-def _has_required_evidence(evidence: ManualEvidence | None) -> bool:
+def _has_required_evidence(evidence: ManualEvidence | None, *, notes_count: bool = True) -> bool:
+    """Whether *evidence* has something to show.
+
+    A pass or finding needs an observation (URL, screenshot, trace, mail,
+    console output or DB readback); a note alone is just a claim. A blocked
+    result may rest on notes (``notes_count``).
+    """
     if evidence is None:
         return False
     return any(
@@ -817,7 +827,7 @@ def _has_required_evidence(evidence: ManualEvidence | None) -> bool:
             evidence.mailhog_messages,
             evidence.console_errors,
             evidence.db_readbacks,
-            evidence.notes,
+            evidence.notes if notes_count else [],
         ]
     )
 
@@ -1316,8 +1326,11 @@ def parse_manual_signal(
         signal.errors.extend(_shortcut_errors(signal.shortcuts))
 
     if signal.kind == "pass":
-        if not _has_required_evidence(signal.evidence):
-            signal.errors.append("pass result requires at least one evidence item")
+        if not _has_required_evidence(signal.evidence, notes_count=False):
+            signal.errors.append(
+                "pass result requires evidence beyond notes "
+                "(url, screenshot, trace, mail, console or db_readback)"
+            )
 
     elif signal.kind == "finding":
         top = _top_level(block)
@@ -1343,8 +1356,11 @@ def parse_manual_signal(
             signal.errors.append("finding requires expected behavior")
         if not signal.actual.strip():
             signal.errors.append("finding requires actual behavior")
-        if not _has_required_evidence(signal.evidence):
-            signal.errors.append("finding requires evidence")
+        if not _has_required_evidence(signal.evidence, notes_count=False):
+            signal.errors.append(
+                "finding requires evidence beyond notes "
+                "(url, screenshot, trace, mail, console or db_readback)"
+            )
 
     elif signal.kind == "blocked":
         top = _top_level(block)
