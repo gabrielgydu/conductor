@@ -306,3 +306,19 @@ async def test_consecutive_rejections_stop_for_a_human(spec_dir, fake_claude):
     assert await _run(spec_dir, cont=True) == sc.EXIT_NEEDS_HUMAN
     assert len(fake_claude.prompts) == sc.MAX_REJECTED_COMPLETIONS, "no session after the cap"
     assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+
+
+# ---------------------------------------------------------------------------
+# Prompt selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["fullstack", "backend", "frontend", "testing"])
+def test_init_with_existing_domains_resumes_instead_of_starting_over(spec_dir, mode):
+    fresh = sc.build_spec_prompt(spec_dir, "feat", mode, "INIT", 1)
+    assert "First Iteration" in fresh and "Resuming Spec Work" not in fresh
+
+    _domain(spec_dir, "Half-written by an iteration that crashed.")
+    resumed = sc.build_spec_prompt(spec_dir, "feat", mode, "INIT", 2)
+    assert "Resuming Spec Work" in resumed and "First Iteration" not in resumed
+    assert "Half-written by an iteration that crashed." in resumed

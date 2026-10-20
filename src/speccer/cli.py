@@ -268,11 +268,13 @@ def build_spec_prompt(
     if not template_file.exists():
         _die(f"Prompt template not found: {template_file}")
 
-    # Conditions
-    is_init        = status == "INIT"
+    # Conditions. A first iteration that died after writing domain specs
+    # (crash, Claude error, no verdict) leaves STATUS at INIT; its "no specs
+    # exist yet" instructions would contradict the injected specs, so resume.
+    has_domains    = _has_domains(spec_dir)
+    is_init        = status == "INIT" and not has_domains
     is_needs_input = status == "NEEDS_INPUT"
     is_resume      = not is_init and not is_needs_input
-    has_domains    = _has_domains(spec_dir)
     has_constitution    = (spec_dir / "CONSTITUTION.md").exists()
     has_backend_context = (spec_dir / "BACKEND-CONTEXT.md").exists() and (spec_dir / "BACKEND-CONTEXT.md").stat().st_size > 0
     has_spec_context    = (spec_dir / "SPEC-CONTEXT.md").exists() and (spec_dir / "SPEC-CONTEXT.md").stat().st_size > 0
