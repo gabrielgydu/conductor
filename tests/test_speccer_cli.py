@@ -156,6 +156,15 @@ def test_final_message_falls_back_to_last_assistant_text_without_result():
     assert sc._final_message_text(out) == f"Final\n{NEEDS_INPUT}"
 
 
+def test_final_message_fallback_skips_subagent_text():
+    # A killed session: no result event, and a subagent spoke last.
+    out = _stream(
+        _text("Two questions left; waiting for the reviewer."),
+        _text(f"Reviewer: looks complete, {COMPLETE}", parent="toolu_1"),
+    )
+    assert sc._detect_promise(sc._final_message_text(out)) is None
+
+
 @pytest.mark.asyncio
 async def test_token_only_in_tool_input_does_not_complete_spec(spec_dir, fake_claude):
     fake_claude.outputs = [_stream(
@@ -275,6 +284,20 @@ async def test_rejection_reason_reaches_next_iteration_prompt(spec_dir, fake_cla
     assert await _run(spec_dir, cont=True) == 0
     assert "domains/01-core.md:2: [NEEDS CLARIFICATION: which auth scheme?]" in fake_claude.prompts[1]
     assert sc.read_rejected_completions(spec_dir) == 0, "an accepted verdict resets the count"
+
+
+@pytest.mark.asyncio
+async def test_rejection_count_survives_a_session_without_verdict(spec_dir, fake_claude):
+    _answered(spec_dir)
+    _domain(spec_dir, "Auth: [NEEDS CLARIFICATION: which auth scheme?]")
+    fake_claude.on_call = lambda n: n == 2 and _rewrite_progress_without_header(spec_dir)
+    fake_claude.outputs = [_complete(), _stream(_result("Ran out of budget."))]
+
+    assert await _run(spec_dir, cont=True) == 1
+    assert await _run(spec_dir, cont=True) == 1  # no verdict
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+    assert sc.read_rejected_completions(spec_dir) == 1
 
 
 @pytest.mark.asyncio
