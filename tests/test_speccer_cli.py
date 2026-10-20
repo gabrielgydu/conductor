@@ -401,3 +401,11 @@ def test_codex_review_is_one_foreground_attempt(spec_dir):
         assert "in the foreground (not `run_in_background`)" in prompt
         assert "single Codex attempt" in prompt
 
+
+@pytest.mark.parametrize("mode", ["fullstack", "backend", "frontend", "testing"])
+def test_generate_prompt_includes_the_constitution(spec_dir, mode):
+    (spec_dir / "CONSTITUTION.md").write_text(
+        "# Project Constitution\n\n- power() must keep native ** semantics\n", encoding="utf-8",
+    )
+    prompt = sc.build_generate_prompt(spec_dir, "feat", mode, False, "toy")
+    assert "- power() must keep native ** semantics" in prompt
