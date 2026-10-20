@@ -84,3 +84,31 @@ def test_brain_action_has_steer():
 
 def test_integration_status_has_conflict_resolving():
     assert IntegrationStatus.CONFLICT_RESOLVING in IntegrationStatus
+
+
+def test_enum_renders_as_value_in_strings():
+    # Log lines interpolate statuses directly; a (str, Enum) renders as
+    # 'StageStatus.GENERATED' on Python 3.12+.
+    assert f"{StageStatus.GENERATED}" == "generated"
+    assert str(RunStatus.DONE) == "done"
+    assert "{}".format(IntegrationStatus.NEEDS_FIX) == "needs_fix"
+
+
+def test_enum_members_assigned_after_validation_persist_as_values():
+    from conductor.core.models import ConductorState, IntegrationState, RunState, StageState
+
+    state = ConductorState(
+        project_name="p",
+        runs=[RunState(index=0, name="r", description="", stages=[StageState(name="b", spec_mode="backend")])],
+    )
+    # Assignment bypasses use_enum_values, so the members themselves get dumped.
+    state.runs[0].status = RunStatus.DONE
+    state.runs[0].stages[0].status = StageStatus.GENERATED
+    state.integration = IntegrationState(branch="x")
+    state.integration.status = IntegrationStatus.NEEDS_FIX
+
+    data = json.loads(state.model_dump_json())
+    assert data["runs"][0]["status"] == "done"
+    assert data["runs"][0]["stages"][0]["status"] == "generated"
+    assert data["integration"]["status"] == "needs_fix"
+    assert ConductorState.model_validate(data).runs[0].stages[0].status == StageStatus.GENERATED
