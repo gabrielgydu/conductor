@@ -74,10 +74,12 @@ def _gh(args: list[str], cwd: Path) -> str:
 
 
 def _gh_safe(args: list[str], cwd: Path, default: str = "") -> str:
-    """Run gh CLI and return stdout; return default on error."""
+    """Run gh CLI and return stdout; log the failure and return default on error."""
     try:
         return _gh(args, cwd)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip().splitlines()
+        warn(f"gh {' '.join(args[:2])} failed (exit {exc.returncode}): {detail[0] if detail else 'no output'}")
         return default
 
 
@@ -220,6 +222,45 @@ def _is_skip_check(name: str, skip_patterns: str) -> bool:
     return bool(re.search(skip_patterns, name))
 
 
+# `gh pr checks --json` fields. `bucket` is gh's own grouping of `state` into
+# pass / fail / pending / skipping / cancel; matching raw states by hand missed
+# TIMED_OUT, ERROR, WAITING and friends. (detailsUrl is not a field here — it
+# belongs to `gh pr view`'s statusCheckRollup — and made gh exit 1.)
+_CHECK_FIELDS = "name,state,bucket,link"
+
+
+def _pr_checks(pr_number: int, cwd: Path) -> list[dict]:
+    """Checks reported on the PR; empty when there are none or gh failed."""
+    result = subprocess.run(
+        ["gh", "pr", "checks", str(pr_number), "--json", _CHECK_FIELDS],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    # Exit 8 means "checks pending"; the JSON is still printed.
+    if result.returncode in (0, 8):
+        try:
+            checks = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            checks = None
+        if isinstance(checks, list):
+            return [c for c in checks if isinstance(c, dict)]
+    stderr = result.stderr.strip()
+    if "no checks reported" not in stderr:
+        warn(f"gh pr checks {pr_number} failed (exit {result.returncode}): {stderr[:300]}")
+    return []
+
+
+def _blocking_failures(checks: list[dict], skip_patterns: str) -> list[dict]:
+    """Failed checks that block the PR (one rule for waiting and for log gathering)."""
+    return [
+        c for c in checks
+        if c.get("bucket") == "fail" and not _is_skip_check(c.get("name", ""), skip_patterns)
+    ]
+
+
 def wait_for_ci(
     pr_number: int,
     cwd: Path,
@@ -238,27 +279,17 @@ def wait_for_ci(
     waited = _CI_INITIAL_WAIT
 
     while waited < max_wait:
-        raw = _gh_safe(
-            ["pr", "checks", str(pr_number), "--json", "state,name"],
-            cwd,
-            default="[]",
-        )
-        try:
-            checks = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            checks = []
+        checks = _pr_checks(pr_number, cwd)
 
         if checks:
-            states = {c.get("state", "UNKNOWN") for c in checks}
-            pending = any(s in ("PENDING", "IN_PROGRESS", "QUEUED") for s in states)
+            pending = any(c.get("bucket") == "pending" for c in checks)
 
             if not pending:
                 log(f"CI completed after {waited}s")
-                failed = [c["name"] for c in checks if c.get("state") == "FAILURE"]
-                blocking = [n for n in failed if not _is_skip_check(n, skip_patterns)]
+                blocking = _blocking_failures(checks, skip_patterns)
                 if blocking:
-                    for n in blocking:
-                        log(f"  BLOCKING: {n}")
+                    for c in blocking:
+                        log(f"  BLOCKING: {c.get('name')} ({c.get('state')})")
                     return "CI_FAILED"
                 return "CI_PASSED"
         else:
@@ -342,22 +373,8 @@ def resolve_thread(thread_id: str, cwd: Path) -> None:
 
 def get_ci_failure_logs(pr_number: int, owner: str, repo: str, cwd: Path, skip_patterns: str = "coverage|Coverage|codecov|Codecov") -> str:
     """Return CI failure annotation text, or empty string if none."""
-    raw = _gh_safe(
-        ["pr", "checks", str(pr_number), "--json", "state,name,detailsUrl"],
-        cwd,
-        default="[]",
-    )
-    try:
-        checks = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return ""
-
-    failed_names = [
-        c["name"]
-        for c in checks
-        if c.get("state") == "FAILURE" and not _is_skip_check(c.get("name", ""), skip_patterns)
-    ]
-    if not failed_names:
+    failed = _blocking_failures(_pr_checks(pr_number, cwd), skip_patterns)
+    if not failed:
         return ""
 
     # Get head SHA for annotations
@@ -367,8 +384,10 @@ def get_ci_failure_logs(pr_number: int, owner: str, repo: str, cwd: Path, skip_p
     )
 
     logs_parts: list[str] = []
-    for check_name in failed_names:
-        logs_parts.append(f"=== FAILED CHECK: {check_name} ===")
+    for check in failed:
+        check_name = check.get("name", "")
+        link = f" ({check['link']})" if check.get("link") else ""
+        logs_parts.append(f"=== FAILED CHECK: {check_name}{link} ===")
         if head_sha:
             annotations = _gh_safe(
                 [
@@ -724,6 +743,11 @@ async def run_fixer(cfg: FixerConfig) -> None:
     ci_logs = ""
     if ci_result == "CI_FAILED":
         ci_logs = get_ci_failure_logs(cfg.pr_number, owner, repo, cwd, cfg.skip_patterns)
+        if not ci_logs:
+            error("CI failed, but the failing checks could not be read")
+            if not threads:
+                write_fixer_status(status_file, "error", cfg.phase, cfg.adopted_phases, "CI failed but failure details unavailable")
+                return
 
     if not ci_logs and not threads:
         log("No issues found — CI passed and no review comments")
