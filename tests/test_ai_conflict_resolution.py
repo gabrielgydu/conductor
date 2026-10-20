@@ -229,6 +229,9 @@ async def test_prompt_includes_run_description(tmp_path):
         )
 
     assert "MY UNIQUE DESCRIPTION" in captured["prompt"]
+    # A merge Claude commits itself bypasses the marker check and the merge
+    # loop then records the run as an -X theirs overwrite.
+    assert "Do not stage, commit or abort the merge" in captured["prompt"]
 
 
 @pytest.mark.asyncio

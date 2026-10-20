@@ -327,7 +327,8 @@ async def resolve_conflicts_with_claude(
             "- A file modified on one side and deleted on the other: keep it (edited)"
             " or delete it, whichever preserves both sides' intent\n"
             "- Preserve the intent of both sides where possible\n"
-            "- If unclear, prefer the incoming changes (theirs)"
+            "- If unclear, prefer the incoming changes (theirs)\n"
+            "- Do not stage, commit or abort the merge; only edit the files"
         )
 
         result = await run_claude(
