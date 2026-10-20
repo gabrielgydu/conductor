@@ -279,3 +279,95 @@ async def test_integration_failure_handled(tmp_path):
     assert result.integration is not None
     assert result.integration.status == "failed"
     assert result.integration.branch == ""
+
+
+# ---------------------------------------------------------------------------
+# Re-integration across sessions
+# ---------------------------------------------------------------------------
+
+
+def _with_branch(run):
+    run.stages[-1].branch = f"conductor/test-proj/{run.name}/{run.stages[-1].name}"
+    return run
+
+
+async def _session(state, merge_result=None, merge_error=None, pr_url="https://x/pr/1"):
+    """One `conductor run` over *state*; returns (state, merge mock, push mock)."""
+    import conductor.core.orchestrator as orch
+
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=5)
+    with (
+        _patch_tmux(),
+        _patch_post_run(),
+        _patch_brain(),
+        patch.object(orch, "_push_and_pr_for_branch", new_callable=AsyncMock,
+                     return_value=pr_url) as push,
+        patch("conductor.integration.merge.run_integration_merge", new_callable=AsyncMock,
+              return_value=merge_result, side_effect=merge_error) as merge,
+    ):
+        state = await conductor_run_loop(state, config)
+    return state, merge, push
+
+
+@pytest.mark.asyncio
+async def test_run_finished_in_a_later_session_is_integrated(tmp_path):
+    """A DONE + B BLOCKED gives A a PR; once B is DONE, both are integrated."""
+    state = _make_state(_with_branch(_done_run(0, "feat-a")), _blocked_run(1, "feat-b"))
+    with _patch_storage(tmp_path), _patch_create_worktree(tmp_path):
+        state, merge, push = await _session(state)
+    push.assert_awaited_once()
+    merge.assert_not_called()
+    assert state.integration.considered_runs == [0]
+
+    # Next morning: B is resumed and finishes. State comes back from disk.
+    state = ConductorState.model_validate_json(state.model_dump_json())
+    b = state.runs[1]
+    b.status = RunStatus.DONE
+    b.stages[-1].status = StageStatus.DONE
+    _with_branch(b)
+    merged = IntegrationState(
+        status="done", branch="integration/test-proj", merged_runs=[0, 1], pr_url="https://x/pr/2"
+    )
+    with _patch_storage(tmp_path), _patch_create_worktree(tmp_path):
+        state, merge, push = await _session(state, merge_result=merged)
+
+    merge.assert_awaited_once()
+    push.assert_not_called()
+    assert state.integration.merged_runs == [0, 1]
+    assert state.integration.considered_runs == [0, 1]
+    log = (tmp_path / "storage" / "conductor" / "test-proj" / "CONDUCTOR-LOG.md").read_text()
+    assert "https://x/pr/1 is superseded" in log
+
+
+@pytest.mark.asyncio
+async def test_integration_that_failed_before_merging_is_retried(tmp_path):
+    state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
+    with _patch_storage(tmp_path), _patch_create_worktree(tmp_path):
+        state, merge, _ = await _session(state, merge_error=RuntimeError("no network"))
+        assert state.integration.status == "failed"
+        state, merge, _ = await _session(
+            state, merge_result=IntegrationState(status="done", branch="integration/test-proj")
+        )
+
+    merge.assert_awaited_once()
+    assert state.integration.status == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "previous",
+    [
+        IntegrationState(status="partial", branch="integration/test-proj",
+                         merged_runs=[0], considered_runs=[0, 1]),
+        # written before considered_runs existed
+        IntegrationState(status="done", branch="integration/test-proj", merged_runs=[0, 1]),
+    ],
+)
+async def test_finished_integration_is_not_repeated(tmp_path, previous):
+    state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
+    state.integration = previous
+    with _patch_storage(tmp_path), _patch_create_worktree(tmp_path):
+        state, merge, push = await _session(state)
+
+    merge.assert_not_called()
+    push.assert_not_called()

@@ -19,7 +19,7 @@ from pathlib import Path
 import conductor.core.tmux as _tmux_module
 from conductor.core import brain
 from conductor.core.claude import resolve_model
-from conductor.core.enums import RunStatus, StageStatus
+from conductor.core.enums import IntegrationStatus, RunStatus, StageStatus
 from conductor.core.logging import live_log
 from conductor.core.models import ConductorState, RunState, StageState, atomic_save
 from conductor.core.presets import Preset, PresetConfig, load_preset
@@ -121,6 +121,89 @@ async def _push_and_pr_for_branch(
         if attempt < 2:
             await asyncio.sleep(5)
     raise RuntimeError(f"gh pr create failed after 3 attempts: {error[-500:]}")
+
+
+def _integration_due(state: ConductorState) -> tuple[list[int], str] | None:
+    """The DONE runs to integrate now and why, or None if integration is current.
+
+    Integration is due when runs finished since the last attempt (for
+    example BLOCKED runs resumed in a later session) or when the last
+    attempt failed before it could merge anything. Any other finished
+    attempt, PARTIAL and NEEDS_FIX included, is not repeated: each one
+    rebuilds the integration branch and can spend Claude calls on the same
+    conflicts.
+    """
+    done = [r.index for r in state.runs if r.status == RunStatus.DONE]
+    if not done:
+        return None
+    previous = state.integration
+    if previous is None:
+        return done, "first integration"
+    covered = set(previous.considered_runs or previous.merged_runs)
+    new = [i for i in done if i not in covered]
+    if not new:
+        return None
+    if not covered:
+        return done, f"previous attempt {previous.status} before merging"
+    names = ", ".join(r.name for r in state.runs if r.index in new)
+    return done, f"finished since the last integration: {names}"
+
+
+async def _integrate(
+    state: ConductorState,
+    done: list[int],
+    reason: str,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> bool:
+    """Deliver the DONE runs: one run gets a PR from its branch, several are
+    merged into the integration branch. Returns False if there was nothing
+    to deliver (a single run without a branch)."""
+    from conductor.core.models import IntegrationState
+
+    previous = state.integration
+    if len(done) == 1:
+        run = next(r for r in state.runs if r.index == done[0])
+        branch = run.stages[-1].branch if run.stages else None
+        if not branch:
+            return False
+        try:
+            pr_url = await _push_and_pr_for_branch(
+                branch, state.base_branch, state.project_name, run, storage
+            )
+        except Exception as exc:
+            state.integration = IntegrationState(status=IntegrationStatus.FAILED, branch=branch)
+            message = f"Single-run push/PR failed: {exc}"
+        else:
+            state.integration = IntegrationState(
+                status=IntegrationStatus.DONE,
+                branch=branch,
+                merged_runs=done,
+                considered_runs=done,
+                pr_url=pr_url,
+            )
+            message = f"Single-run PR: {pr_url}"
+    else:
+        from conductor.integration.merge import run_integration_merge
+
+        # Each attempt rebuilds the integration branch from all DONE runs;
+        # merge.py sees it as a first integration.
+        state.integration = None
+        try:
+            result = await run_integration_merge(state, storage)
+        except Exception as exc:
+            state.integration = IntegrationState(status=IntegrationStatus.FAILED, branch="")
+            message = f"Integration merge failed: {exc}"
+        else:
+            result.considered_runs = done
+            state.integration = result
+            message = f"Integration merge status={result.status}"
+            if previous is not None and previous.pr_url and previous.pr_url != result.pr_url:
+                message += f"; the earlier PR {previous.pr_url} is superseded but still open"
+    atomic_save(state, storage.conductor_state(state.project_name))
+    _log("CONDUCTOR_EXIT", f"{message} ({reason})", log_path, audit_path)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3494,88 +3577,20 @@ async def conductor_run_loop(
         all_terminal = all(
             r.status in (RunStatus.DONE, RunStatus.BLOCKED) for r in state.runs
         )
-        done_count = sum(1 for r in state.runs if r.status == RunStatus.DONE)
-
-        # Single-run case: push the feature branch and create a PR directly
-        if all_terminal and done_count == 1 and state.integration is None:
-            done_run = next(r for r in state.runs if r.status == RunStatus.DONE)
-            last_stage = done_run.stages[-1] if done_run.stages else None
-            if last_stage and last_stage.branch:
-                try:
-                    pr_url = await _push_and_pr_for_branch(
-                        last_stage.branch,
-                        state.base_branch,
-                        state.project_name,
-                        done_run,
-                        storage,
-                    )
-                    from conductor.core.models import IntegrationState, IntegrationStatus
-
-                    state.integration = IntegrationState(
-                        status=IntegrationStatus.DONE,
-                        branch=last_stage.branch,
-                        merged_runs=[done_run.index],
-                        pr_url=pr_url,
-                    )
-                    atomic_save(state, storage.conductor_state(state.project_name))
-                    _log(
-                        "CONDUCTOR_EXIT",
-                        f"Single-run PR: {pr_url}",
-                        log_path,
-                        audit_path,
-                    )
-                except Exception as exc:
-                    from conductor.core.models import IntegrationState
-
-                    state.integration = IntegrationState(
-                        status="failed", branch=last_stage.branch or ""
-                    )
-                    atomic_save(state, storage.conductor_state(state.project_name))
-                    _log(
-                        "CONDUCTOR_EXIT",
-                        f"Single-run push/PR failed: {exc}",
-                        log_path,
-                        audit_path,
-                    )
-            exit_reason = "all_done"
-            break
-
-        # Multi-run integration merge trigger: check whenever all runs are terminal with 2+ done
-        if all_terminal and done_count >= 2 and state.integration is None:
-            try:
-                from conductor.integration.merge import run_integration_merge
-
-                state.integration = await run_integration_merge(state, storage)
-                atomic_save(state, storage.conductor_state(state.project_name))
-                _log(
-                    "CONDUCTOR_EXIT",
-                    f"Integration merge status={state.integration.status}",
-                    log_path,
-                    audit_path,
-                )
-            except Exception as exc:
-                from conductor.core.models import IntegrationState
-
-                state.integration = IntegrationState(status="failed", branch="")
-                atomic_save(state, storage.conductor_state(state.project_name))
-                _log(
-                    "CONDUCTOR_EXIT",
-                    f"Integration merge failed: {exc}",
-                    log_path,
-                    audit_path,
-                )
-            exit_reason = "all_done"
-            break
 
         if all_terminal:
-            _log(
-                "CONDUCTOR_EXIT",
-                "All runs complete",
-                log_path,
-                audit_path,
-                reason="all_done",
-                exit_code=0,
-            )
+            due = _integration_due(state)
+            if due is None or not await _integrate(
+                state, due[0], due[1], storage, log_path, audit_path
+            ):
+                _log(
+                    "CONDUCTOR_EXIT",
+                    "All runs complete",
+                    log_path,
+                    audit_path,
+                    reason="all_done",
+                    exit_code=0,
+                )
             exit_reason = "all_done"
             break
 

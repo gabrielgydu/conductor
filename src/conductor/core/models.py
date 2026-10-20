@@ -133,6 +133,10 @@ class IntegrationState(BaseModel):
     status: IntegrationStatus = IntegrationStatus.PENDING
     branch: str
     merged_runs: list[int] = []
+    # DONE runs when this integration was attempted. A run DONE later is not
+    # in it and triggers a new integration; an attempt that failed before it
+    # could merge anything leaves it empty, so it is retried on the next start.
+    considered_runs: list[int] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     e2e: Optional[E2ETestState] = None
