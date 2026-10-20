@@ -503,17 +503,23 @@ def _record_rejection(spec_dir: Path, iteration: int, markers: list[str], reject
     """
     note = [
         "",
-        f"## SPEC_COMPLETE rejected (iteration {iteration}; "
-        f"{rejected} of {MAX_REJECTED_COMPLETIONS} rejections in a row)",
+        (
+            f"## SPEC_COMPLETE rejected (iteration {iteration}; "
+            f"{rejected} of {MAX_REJECTED_COMPLETIONS} rejections in a row)"
+        ),
         "",
-        "The CLI rejected this iteration's SPEC_COMPLETE because these clarification "
-        "markers are still in the domain specs:",
+        (
+            "The CLI rejected this iteration's SPEC_COMPLETE because these clarification "
+            "markers are still in the domain specs:"
+        ),
         "",
         *(f"- {m}" for m in markers),
         "",
-        "Replace each marker with the resolved spec content, or move its question to "
-        "QUESTIONS.md and emit SPEC_NEEDS_INPUT. Emit SPEC_COMPLETE only when none remain. "
-        f"After {MAX_REJECTED_COMPLETIONS} rejections in a row the spec loop stops for a human.",
+        (
+            "Replace each marker with the resolved spec content, or move its question to "
+            "QUESTIONS.md and emit SPEC_NEEDS_INPUT. Emit SPEC_COMPLETE only when none remain. "
+            f"After {MAX_REJECTED_COMPLETIONS} rejections in a row the spec loop stops for a human."
+        ),
         "",
     ]
     handoff = spec_dir / "HANDOFF.md"
