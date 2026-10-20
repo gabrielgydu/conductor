@@ -12,6 +12,7 @@ from typing import AsyncIterator, Callable
 
 # Re-exported: callers resolve aliases through conductor.core.claude.
 from conductor.core.model_catalog import resolve_model as resolve_model
+from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -162,39 +163,60 @@ def progress_on_event(event: dict) -> None:
 @dataclass
 class ClaudeResult:
     exit_code: int
-    output: str
+    output: str  # raw stdout: the stream-json lines
     tokens_used: dict[str, int] | None
-    cost: float | None
+    cost: float | None  # the CLI's own total_cost_usd; None if it reported none
     duration: float
+    # The stream-json `result` event (the last one), or None if none arrived.
+    result_event: dict | None = None
+
+    @property
+    def is_error(self) -> bool:
+        """True when the CLI flagged its result as an error.
+
+        Not logged in, an unknown model and error_max_turns all set it. The CLI
+        exits 1 for those too, but `failed` checks both rather than rely on that.
+        """
+        return bool(self.result_event and self.result_event.get("is_error"))
+
+    @property
+    def failed(self) -> bool:
+        """True when the run did not succeed: a non-zero exit or an error result."""
+        return self.exit_code != 0 or self.is_error
+
+    @property
+    def subtype(self) -> str | None:
+        """The result subtype: "success", "error_max_turns", ..."""
+        return self.result_event.get("subtype") if self.result_event else None
+
+    @property
+    def num_turns(self) -> int | None:
+        return self.result_event.get("num_turns") if self.result_event else None
+
+    @property
+    def result_text(self) -> str | None:
+        """The session's final text; for an error result, the CLI's error message."""
+        text = self.result_event.get("result") if self.result_event else None
+        return text if isinstance(text, str) else None
+
+    @property
+    def model_usage(self) -> dict[str, dict]:
+        """Per-model token counts and costUSD (`modelUsage`), keyed by model ID."""
+        usage = self.result_event.get("modelUsage") if self.result_event else None
+        return usage if isinstance(usage, dict) else {}
 
 
-def _extract_tokens_from_stdout(stdout_text: str) -> dict[str, int] | None:
-    """Parse stream-json stdout and return token usage from the result event."""
-    for line in stdout_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "result":
-            # usage may be top-level on the result event or nested under result
-            usage = event.get("usage")
-            if not isinstance(usage, dict):
-                result_val = event.get("result", {})
-                if isinstance(result_val, dict):
-                    usage = result_val.get("usage")
-            if isinstance(usage, dict):
-                return {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-                }
-    return None
+def _tokens_used(result_event: dict | None) -> dict[str, int] | None:
+    """ClaudeResult.tokens_used from a result event; None if it carries no usage."""
+    if not result_event or not isinstance(result_event.get("usage"), dict):
+        return None
+    tokens = result_token_stats(result_event)
+    return {
+        "input_tokens": tokens.input,
+        "output_tokens": tokens.output,
+        "cache_read_input_tokens": tokens.cache_read,
+        "cache_creation_input_tokens": tokens.cache_write,
+    }
 
 
 async def run_claude(
@@ -290,14 +312,15 @@ async def run_claude(
         duration = time.monotonic() - start
         stdout_text = "".join(lines)
 
-    tokens = _extract_tokens_from_stdout(stdout_text)
+    result_event = find_result_event(stdout_text)
 
     return ClaudeResult(
         exit_code=proc.returncode or 0,
         output=stdout_text,
-        tokens_used=tokens,
-        cost=None,
+        tokens_used=_tokens_used(result_event),
+        cost=result_cost_usd(result_event),
         duration=duration,
+        result_event=result_event,
     )
 
 

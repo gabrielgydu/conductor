@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,12 +15,21 @@ from conductor.core.claude import ClaudeResult, run_claude, run_claude_steerable
 # Fixtures
 # ---------------------------------------------------------------------------
 
-SAMPLE_STREAM_JSON_LINES = [
-    b'{"type":"assistant","content":"Hello"}\n',
-    b'{"type":"result","result":{"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":100}}}\n',
-]
+# Real stream-json transcripts (Claude Code CLI 2.1.304, claude-haiku-5-5),
+# captured with `claude -p - --output-format stream-json --verbose` and
+# scrubbed of local paths and IDs.
+STREAM_JSON_FIXTURES = Path(__file__).parent / "fixtures" / "stream_json"
 
-SAMPLE_STREAM_JSON_OUTPUT = b"".join(SAMPLE_STREAM_JSON_LINES)
+
+def load_stream_json(name: str) -> bytes:
+    return (STREAM_JSON_FIXTURES / f"{name}.jsonl").read_bytes()
+
+
+# A Read tool call and a final answer: system init, assistant, user,
+# rate_limit_event, assistant, result (subtype success).
+SAMPLE_STREAM_JSON_OUTPUT = load_stream_json("success")
+SAMPLE_STREAM_JSON_LINES = SAMPLE_STREAM_JSON_OUTPUT.splitlines(keepends=True)
+SAMPLE_EVENT_TYPES = ["system", "assistant", "user", "rate_limit_event", "assistant", "result"]
 
 
 def make_mock_proc(
@@ -81,9 +92,12 @@ async def test_run_claude_basic():
     assert isinstance(result, ClaudeResult)
     assert result.exit_code == 0
     assert result.output == SAMPLE_STREAM_JSON_OUTPUT.decode()
-    assert result.tokens_used is not None
-    assert result.tokens_used["input_tokens"] == 1000
-    assert result.tokens_used["output_tokens"] == 500
+    assert result.tokens_used == {
+        "input_tokens": 4,
+        "output_tokens": 149,
+        "cache_read_input_tokens": 28539,
+        "cache_creation_input_tokens": 5815,
+    }
 
 
 @pytest.mark.asyncio
@@ -96,14 +110,13 @@ async def test_run_claude_without_streaming():
     proc.stdin.write.assert_not_called()
     assert result.exit_code == 0
     assert result.output == SAMPLE_STREAM_JSON_OUTPUT.decode()
-    assert result.tokens_used["input_tokens"] == 1000
-    assert result.tokens_used["output_tokens"] == 500
+    assert result.tokens_used["input_tokens"] == 4
+    assert result.tokens_used["output_tokens"] == 149
 
 
 @pytest.mark.asyncio
 async def test_run_claude_streams_events_to_callback():
     lines = [
-        b'{"type":"system","subtype":"init","model":"claude-opus-4-8"}\n',
         b"not-json\n",
         b"\n",
         b'["not", "a", "dict"]\n',
@@ -114,10 +127,10 @@ async def test_run_claude_streams_events_to_callback():
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_claude("hi", on_event=events.append)
     # only JSON objects reach the callback, in stream order
-    assert [e["type"] for e in events] == ["system", "assistant", "result"]
+    assert [e["type"] for e in events] == SAMPLE_EVENT_TYPES
     # raw output keeps every line, including the ones that were not events
     assert result.output == b"".join(lines).decode()
-    assert result.tokens_used["output_tokens"] == 500
+    assert result.tokens_used["output_tokens"] == 149
 
 
 @pytest.mark.asyncio
@@ -130,6 +143,58 @@ async def test_run_claude_default_prints_progress(capsys):
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         await run_claude("hi")
     assert "Bash: ls -la" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_run_claude_reports_cli_cost_and_result():
+    proc = make_mock_proc()
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=None)
+    assert result.cost == 0.00152329  # total_cost_usd, not a table estimate
+    assert result.result_event["type"] == "result"
+    assert result.subtype == "success"
+    assert not result.is_error and not result.failed
+    assert result.num_turns == 2
+    assert result.result_text == "first line of hello\nDONE"
+    assert result.model_usage["claude-haiku-5-5"]["costUSD"] == 0.00152329
+
+
+@pytest.mark.asyncio
+async def test_run_claude_max_turns_is_an_error_result():
+    proc = make_mock_proc(stdout_bytes=load_stream_json("error_max_turns"), returncode=1)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=None)
+    assert result.exit_code == 1
+    assert result.is_error and result.failed
+    assert result.subtype == "error_max_turns"
+    assert result.result_text is None  # the CLI sends `errors` instead
+    assert result.cost == 0.00024006
+    assert result.tokens_used["output_tokens"] == 138
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [1, 0])
+async def test_run_claude_error_result_fails_whatever_the_exit_code(returncode):
+    """Not logged in / unknown model arrive as an is_error result with the
+    message as result text; treat it as a failure even with exit code 0."""
+    proc = make_mock_proc(stdout_bytes=load_stream_json("model_not_found"), returncode=returncode)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=None)
+    assert result.is_error and result.failed
+    assert result.result_text.startswith("There's an issue with the selected model")
+    assert result.cost == 0.0
+    assert result.model_usage == {}
+
+
+@pytest.mark.asyncio
+async def test_run_claude_without_result_event():
+    proc = make_mock_proc(stdout_bytes=b'{"type":"assistant","message":{"content":[]}}\n')
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=None)
+    assert result.result_event is None
+    assert result.tokens_used is None and result.cost is None
+    assert result.subtype is None and result.num_turns is None and result.result_text is None
+    assert not result.failed
 
 
 @pytest.mark.asyncio
