@@ -24,8 +24,8 @@ from conductor.core.models import (
 )
 from conductor.core.storage import StorageResolver
 from conductor.core.claude import run_claude, run_claude_steerable, SteerableSession, ClaudeResult
+from conductor.core.model_catalog import resolve_model
 from conductor.core.stats import (
-    resolve_model,
     get_pricing,
     extract_stats,
     calculate_cost,
@@ -61,8 +61,10 @@ __all__ = [
     "StorageResolver",
     # claude
     "run_claude", "run_claude_steerable", "SteerableSession", "ClaudeResult",
+    # model catalog
+    "resolve_model",
     # stats
-    "resolve_model", "get_pricing", "extract_stats", "calculate_cost", "record_stats",
+    "get_pricing", "extract_stats", "calculate_cost", "record_stats",
     "format_tokens", "format_duration", "ModelPricing", "TokenStats", "StatsEntry",
     # logging
     "live_log", "header", "error", "die",

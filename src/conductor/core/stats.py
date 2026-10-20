@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
+
+# Re-exported: the runner resolves phase models through conductor.core.stats.
+from conductor.core.model_catalog import resolve_model as resolve_model
 
 
 @dataclass(frozen=True)
@@ -41,17 +44,6 @@ _PRICING_TABLE: list[tuple[str, ModelPricing]] = [
     ("haiku", ModelPricing(0.80, 4.00, 0.08, 1.00)),
 ]
 _DEFAULT_PRICING = ModelPricing(3.00, 15.00, 0.30, 3.75)
-
-_MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-}
-
-
-def resolve_model(alias: str) -> str:
-    """Resolve short alias to full model name, or passthrough if not an alias."""
-    return _MODEL_ALIASES.get(alias.lower(), alias)
 
 
 def get_pricing(model: str) -> ModelPricing:

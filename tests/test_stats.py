@@ -33,7 +33,12 @@ SAMPLE_STREAM_JSON = "\n".join(
 
 
 def test_resolve_model_opus():
-    assert resolve_model("opus") == "claude-opus-4-8"
+    # Same 1M-context Opus that fix sessions and the orchestrator get.
+    assert resolve_model("opus") == "claude-opus-4-8[1m]"
+
+
+def test_resolve_model_opus_200k():
+    assert resolve_model("opus-200k") == "claude-opus-4-8"
 
 
 def test_resolve_model_sonnet():
@@ -41,7 +46,7 @@ def test_resolve_model_sonnet():
 
 
 def test_resolve_model_haiku():
-    assert resolve_model("haiku") == "claude-haiku-4-5-20251001"
+    assert resolve_model("haiku") == "claude-haiku-4-5"
 
 
 def test_resolve_model_passthrough():

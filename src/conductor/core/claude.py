@@ -6,9 +6,12 @@ import json
 import sys
 import time
 from asyncio.subprocess import PIPE
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Callable
+
+# Re-exported: callers resolve aliases through conductor.core.claude.
+from conductor.core.model_catalog import resolve_model as resolve_model
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -470,17 +473,6 @@ async def run_claude_steerable(
     await proc.stdin.drain()
 
     return SteerableSession(proc, start)
-
-
-def resolve_model(name: str) -> str:
-    """Resolve short model names to full Claude model IDs."""
-    _MODEL_MAP = {
-        "opus": "claude-opus-4-8[1m]",
-        "opus-200k": "claude-opus-4-8",
-        "sonnet": "claude-sonnet-4-6",
-        "haiku": "claude-haiku-4-5",
-    }
-    return _MODEL_MAP.get(name, name)
 
 
 def calculate_cost(tokens: dict[str, int] | None) -> float | None:
