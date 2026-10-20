@@ -15,7 +15,7 @@ import conductor.core.brain as brain
 import conductor.core.orchestrator as orch
 from conductor.core.claude import ClaudeResult
 from conductor.core.enums import RunStatus, StageStatus
-from conductor.core.models import ConductorState, RunState, StageState
+from conductor.core.models import ConductorState, IntegrationState, RunState, StageState
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -110,6 +110,26 @@ async def test_unchanged_learnings_are_reviewed_once(project, monkeypatch):
 
     assert len(fake.prompts) == 1
     assert (project.wt / "CLAUDE.md").read_text().count("- A rule.") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("integrated", "expected"),
+    [([], "they go out with the run's PR"), ([0], "push or merge it by hand")],
+)
+async def test_learnings_message_says_whether_the_commit_still_goes_out(
+    project, monkeypatch, capsys, integrated, expected
+):
+    project.state.integration = IntegrationState(
+        status="done", branch="conductor/p/feat/s0", considered_runs=integrated
+    )
+    monkeypatch.setattr(
+        brain, "run_claude", _FakeClaude("<<<FILE: CLAUDE.md>>>\n- A rule.\n<<<END>>>")
+    )
+
+    await orch._review_learnings(project.state, project.storage)
+
+    assert expected in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

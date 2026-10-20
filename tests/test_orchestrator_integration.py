@@ -340,6 +340,34 @@ async def test_run_finished_in_a_later_session_is_integrated(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_learnings_are_reviewed_before_the_runs_are_merged(tmp_path):
+    """Learnings committed on a run branch after the merge would miss the PR."""
+    import conductor.core.orchestrator as orch
+
+    order: list[str] = []
+
+    async def review(*args, **kwargs):
+        order.append("review")
+
+    async def merge(*args, **kwargs):
+        order.append("merge")
+        return IntegrationState(status="done", branch="integration/test-proj", merged_runs=[0, 1])
+
+    state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
+    with (
+        _patch_storage(tmp_path),
+        _patch_tmux(),
+        _patch_post_run(),
+        _patch_create_worktree(tmp_path),
+        patch.object(orch, "_review_learnings", side_effect=review),
+        patch("conductor.integration.merge.run_integration_merge", side_effect=merge),
+    ):
+        await conductor_run_loop(state, ConductorConfig(check_interval_s=0.0, max_iterations=5))
+
+    assert order == ["review", "merge"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "first_attempt",
     [

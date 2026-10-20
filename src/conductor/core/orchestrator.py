@@ -3180,15 +3180,7 @@ async def conductor_post_run(
         reason=exit_reason,
     )
 
-    try:
-        await _review_learnings(state, storage, log_path, audit_path)
-    except Exception as exc:
-        _log(
-            "POST_RUN",
-            f"Learnings review failed (non-fatal): {exc}",
-            log_path,
-            audit_path,
-        )
+    await _review_learnings_nonfatal(state, storage, log_path, audit_path)
 
     try:
         await _generate_audit_report(state, storage, log_path, audit_path)
@@ -3275,6 +3267,23 @@ def _learnings_target(state: ConductorState) -> tuple[RunState, Path] | None:
     min_ts = datetime.min.replace(tzinfo=timezone.utc)
     run = max(done, key=lambda r: r.stages[-1].completed_at or min_ts)
     return run, Path(run.stages[-1].worktree)
+
+
+async def _review_learnings_nonfatal(
+    state: ConductorState,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    try:
+        await _review_learnings(state, storage, log_path, audit_path)
+    except Exception as exc:
+        _log(
+            "POST_RUN",
+            f"Learnings review failed (non-fatal): {exc}",
+            log_path,
+            audit_path,
+        )
 
 
 async def _review_learnings(
@@ -3376,14 +3385,25 @@ async def _review_learnings(
     rels = [str(p.relative_to(root)) for p in changed]
     branch = target_run.stages[-1].branch or "(detached)"
     committed = _commit_paths(root, rels, "Record conductor learnings in CLAUDE.md")
+    previous = state.integration
+    delivered = previous is not None and target_run.index in (
+        previous.considered_runs or previous.merged_runs
+    )
+    if not committed:
+        message = f"Learnings written to {', '.join(rels)} in {root} but not committed"
+    elif delivered:
+        message = (
+            f"Learnings committed on {branch} ({', '.join(rels)}) in {root} after "
+            "the branch was delivered; push or merge it by hand"
+        )
+    else:
+        message = (
+            f"Learnings committed on {branch} ({', '.join(rels)}) in {root}; they "
+            "go out with the run's PR or the integration"
+        )
     _log(
         "POST_RUN",
-        (
-            f"Learnings committed on {branch} ({', '.join(rels)}) in {root}; "
-            "push the branch to add them to its PR"
-            if committed
-            else f"Learnings written to {', '.join(rels)} in {root} but not committed"
-        ),
+        message,
         log_path,
         audit_path,
         files=rels,
@@ -3728,6 +3748,10 @@ async def _conductor_run_loop(
 
         if all_terminal:
             due = _integration_due(state)
+            if due is not None:
+                # Commit learnings on the run branch before it is pushed or
+                # merged, so they reach the PR; post-run finds them reviewed.
+                await _review_learnings_nonfatal(state, storage, log_path, audit_path)
             if due is None or not await _integrate(
                 state, due[0], due[1], storage, log_path, audit_path
             ):
