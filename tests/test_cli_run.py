@@ -175,3 +175,22 @@ def test_go_turns_quick_on_for_a_project_it_plans(repo, loop_calls, fake_plan, f
 
     assert code == 0
     assert loop_calls[0][0].quick is expected
+
+
+def test_deprecated_overnight_flag_is_accepted_as_a_no_op(repo, loop_calls):
+    _seed_state(repo)
+
+    _, err, code = _run_main(_inside(repo, "--overnight"))
+
+    assert code == 0
+    assert "deprecated" in err
+    state, config = loop_calls[0]
+    assert state.overnight is True and config.overnight is True
+
+
+def test_no_overnight_wins_over_deprecated_overnight(repo, loop_calls):
+    _seed_state(repo)
+
+    _run_main(_inside(repo, "--overnight", "--no-overnight"))
+
+    assert loop_calls[0][1].overnight is False

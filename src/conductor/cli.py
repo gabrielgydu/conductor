@@ -1386,6 +1386,7 @@ def main():
     p_go.add_argument("--preset", default="base", help="Preset name (default: base, auto-detected)")
     p_go.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_go.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
+    p_go.add_argument("--overnight", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op
     p_go.add_argument(
         "--quick", action=argparse.BooleanOptionalAction, default=None,
         help="Quality gate only between phases; full CI+review at end "
@@ -1398,6 +1399,7 @@ def main():
     p_run = subparsers.add_parser("run", help="Execute the orchestration loop")
     _add_common(p_run)
     p_run.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
+    p_run.add_argument("--overnight", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op
     p_run.add_argument(
         "--quick", action=argparse.BooleanOptionalAction, default=None,
         help="Quality gate only between phases; full CI+review at end of run (default: the saved setting, off for a new project)",
@@ -1487,6 +1489,14 @@ def main():
     if args.subcommand is None:
         parser.print_help()
         sys.exit(1)
+
+    if getattr(args, "overnight", False):
+        # Older docs passed --overnight; it was replaced by the default-on mode.
+        print(
+            "Note: --overnight is deprecated and has no effect: overnight mode is "
+            "the default (pass --no-overnight to answer speccer questions yourself).",
+            file=sys.stderr,
+        )
 
     handlers[args.subcommand](args)
 

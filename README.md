@@ -19,11 +19,11 @@ cd /path/to/your/project
 # Generate a plan (uses Claude Opus)
 /path/to/conductor/conductor plan --name my-feature --project-dir .
 
-# Execute the plan
+# Execute the plan (overnight mode: speccer questions are auto-answered)
 /path/to/conductor/conductor run --name my-feature --project-dir .
 
-# Or run overnight (auto-answers speccer questions)
-/path/to/conductor/conductor run --name my-feature --project-dir . --overnight
+# Or answer speccer questions yourself
+/path/to/conductor/conductor run --name my-feature --project-dir . --no-overnight
 ```
 
 No manual venv setup needed — the `./conductor` and `./speccer` wrapper scripts auto-create a venv and install dependencies on first run.
@@ -79,7 +79,7 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 |---------|-------------|
 | `conductor init --name <name>` | Create a project with feature brief template |
 | `conductor plan --name <name>` | Generate run plan via Claude Opus |
-| `conductor run --name <name> [--overnight]` | Execute the orchestration loop |
+| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N]` | Execute the orchestration loop |
 | `conductor status --name <name>` | Show run/stage status table |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |
 | `conductor cleanup --name <name>` | Remove worktrees and branches |
