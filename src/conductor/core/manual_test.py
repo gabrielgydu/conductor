@@ -281,13 +281,24 @@ def ensure_manual_test_layout(conductor_dir: Path) -> None:
 
 
 def _split_table_cells(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    """Cells of a markdown table row; ``\\|`` inside a cell is a literal pipe."""
+    row = line.strip()
+    row = row[1:] if row.startswith("|") else row
+    row = row[:-1] if row.endswith("|") and not row.endswith("\\|") else row
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", row)]
+
+
+def _table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
 
 
 def _is_table_separator(cells: list[str]) -> bool:
     if not cells:
         return False
-    return all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+    return all(re.fullmatch(r":?-+:?", cell.replace(" ", "")) for cell in cells)
+
+
+_EVIDENCE_TARGET_PREFIX = "Primary evidence target: "
 
 
 def _clean_cell(value: str) -> str:
@@ -371,8 +382,12 @@ def _parse_table_scenarios(markdown_text: str) -> list[ManualScenario]:
                     "[!]": "failed",
                 }.get(status, status)
 
+            # The rendered matrix stores the description (with this prefix)
+            # in its Evidence Target column; do not stack the prefix again.
+            while evidence_target.startswith(_EVIDENCE_TARGET_PREFIX):
+                evidence_target = evidence_target[len(_EVIDENCE_TARGET_PREFIX):].strip()
             description = (
-                f"Primary evidence target: {evidence_target}"
+                f"{_EVIDENCE_TARGET_PREFIX}{evidence_target}"
                 if evidence_target
                 else name
             )
@@ -433,11 +448,11 @@ def render_scenarios_markdown(state: ManualTestState) -> str:
     rows = []
     for scenario in state.scenarios:
         findings = ", ".join(scenario.findings) if scenario.findings else ""
-        description = scenario.description.replace("|", "\\|").replace("\n", " ")
         rows.append(
             "| "
             f"{scenario.index} | {scenario.status} | {scenario.priority} | "
-            f"{scenario.area} | {scenario.name} | {description} | {findings} |"
+            f"{_table_cell(scenario.area)} | {_table_cell(scenario.name)} | "
+            f"{_table_cell(scenario.description)} | {findings} |"
         )
 
     body = "\n".join(rows) if rows else "| | | | | | | |"

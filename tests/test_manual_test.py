@@ -1670,6 +1670,27 @@ async def test_fixer_is_told_the_project_rules_it_is_checked_against(tmp_path, m
     assert "NEVER change them via SQL" in prompts[0]
 
 
+def test_scenario_matrix_survives_render_and_reparse(tmp_path):
+    _, _, state = _new_state(tmp_path)
+    state.scenarios[0].area = "Admin | rollout"
+    state.scenarios[0].name = "Toggle a|b flag"
+    original = [(s.area, s.name, s.description, s.priority) for s in state.scenarios]
+
+    for _ in range(3):  # coverage re-parses the matrix the renderer wrote, every run
+        state.scenarios = parse_scenarios_from_markdown(manual_test.render_scenarios_markdown(state))
+
+    assert [(s.area, s.name, s.description, s.priority) for s in state.scenarios] == original
+    assert state.scenarios[0].description == "Primary evidence target: Admin screenshot, config readback"
+
+
+def test_scenario_table_accepts_short_separators():
+    scenarios = parse_scenarios_from_markdown(
+        "| Area | Scenario |\n|-|:-:|\n| Checkout | Pay with card |\n"
+    )
+
+    assert [(s.area, s.name) for s in scenarios] == [("Checkout", "Pay with card")]
+
+
 def test_git_changed_files_includes_staged_files(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
