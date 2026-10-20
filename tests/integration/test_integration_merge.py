@@ -676,3 +676,58 @@ async def test_unresolved_conflicts_are_left_out_not_committed(
     assert _show(real_merge_repo, f"{branch}:other.txt") == "other, edited\n"
     log = _show(real_merge_repo, branch)
     assert "Partial merge" not in log
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Failing git hooks cannot leave a merge open or drop a run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failing_hooks_do_not_drop_a_resolved_run(real_merge_repo, tmp_path):
+    """Hooks that fail in the fresh worktree (husky without node_modules) must not
+    leave run d's resolved merge open for run e's merge to abort."""
+    from conductor.core.claude import ClaudeResult
+
+    _modify_delete_conflict(real_merge_repo)
+    real_merge_repo.create_branch("md-e", {"e.txt": "e\n"})
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    for hook in ("pre-commit", "pre-merge-commit", "commit-msg"):
+        (hooks / hook).write_text("#!/bin/sh\nexit 1\n")
+        (hooks / hook).chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(real_merge_repo.path), "config", "core.hooksPath", str(hooks)],
+        check=True,
+    )
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "md-a"),
+        _done_run_with_branch(1, "feat-d", "md-d"),
+        _done_run_with_branch(2, "feat-e", "md-e"),
+    )
+    state.runs[2].depends_on = [1]  # merge order a, d, e
+
+    async def claude_resolves(prompt, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        (cwd / "app.txt").write_text("l1\nA+D\nl3\n")
+        (cwd / "other.txt").unlink()
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    with patch("conductor.integration.merge.run_claude", side_effect=claude_resolves):
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert result.merged_runs == [0, 1, 2]
+    assert sorted(c.file for c in result.conflicts_resolved) == ["app.txt", "other.txt"]
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:app.txt") == "l1\nA+D\nl3\n"
+    assert _show(real_merge_repo, f"{branch}:e.txt") == "e\n"
+    files = _show(real_merge_repo, f"{branch}:").split()
+    assert "other.txt" not in files

@@ -329,6 +329,8 @@ async def test_claude_resolution_fallback(storage, tmp_path):
             and ("feature/run-" in args_str)
         ):
             proc.returncode = 1
+        elif "MERGE_HEAD" in args_str:
+            proc.returncode = 1  # the resolution commit concluded the merge
         else:
             proc.returncode = 0
         proc.communicate = AsyncMock(return_value=(b"", b""))
@@ -675,6 +677,8 @@ async def test_mixed_conflicts(storage):
         conflicted = "feature/run-1" in args_str or "feature/run-2" in args_str
         if "merge" in args_str and conflicted and "-X" not in args_str:
             proc.returncode = 1
+        elif "MERGE_HEAD" in args_str:
+            proc.returncode = 1  # the resolution commit concluded the merge
         else:
             proc.returncode = 0
         proc.communicate = AsyncMock(return_value=(b"", b""))

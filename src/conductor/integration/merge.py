@@ -150,6 +150,24 @@ async def _runs_touching(path: str, runs: list[RunState], start: str, cwd: Path)
     return names
 
 
+# Merge commits skip hooks, like every commit conductor makes outside the
+# runner: in the fresh integration worktree a hook can fail for reasons that
+# have nothing to do with the code (husky without node_modules) and leave the
+# merge open. Post-merge validation runs the project's checks afterwards.
+_MERGE = ["merge", "--no-verify", "--no-edit"]
+
+
+async def _conclude_merge(cwd: Path) -> bool:
+    """Commit the resolved merge; True once it is concluded (no MERGE_HEAD)."""
+    await _run_git(["add", "-A"], cwd)
+    rc, out, err = await _run_git(["commit", "--no-verify", "--no-edit"], cwd)
+    if rc != 0:
+        logger.warning("Merge commit in %s failed: %s", cwd, (err or out).strip())
+        return False
+    rc, _, _ = await _run_git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd)
+    return rc != 0
+
+
 async def _abort_merge(cwd: Path) -> None:
     """Abort the merge in progress and drop untracked files the attempt left
     (Claude's scratch files), so the next merge starts from a clean tree."""
@@ -382,7 +400,7 @@ async def _integrate(
             continue
 
         # Try clean merge
-        rc, out, err = await _run_git(["merge", branch, "--no-edit"], wt)
+        rc, out, err = await _run_git([*_MERGE, branch], wt)
         if rc == 0:
             _print(f"  ✓ Clean merge")
             merged_runs.append(run)
@@ -405,9 +423,9 @@ async def _integrate(
             conflicting, run_description, wt
         )
 
-        if claude_ok:
-            await _run_git(["add", "."], wt)
-            await _run_git(["commit", "--no-edit"], wt)
+        # A merge left open would be aborted by the next run's merge, silently
+        # dropping this run, so only a concluded merge counts.
+        if claude_ok and await _conclude_merge(wt):
             _print("  ✓ Resolved by Claude")
             for f in conflicting:
                 conflicts_resolved.append(
@@ -425,7 +443,7 @@ async def _integrate(
         # hunk and drops the integration branch's (the earlier runs') side.
         # Recorded as unresolved so the status and PR cannot claim a clean merge.
         await _abort_merge(wt)
-        rc, _, _ = await _run_git(["merge", "-X", "theirs", branch, "--no-edit"], wt)
+        rc, _, _ = await _run_git([*_MERGE, "-X", "theirs", branch], wt)
         if rc == 0:
             _print(f"  ! Claude could not resolve; -X theirs overwrote: {', '.join(conflicting)}")
             for f in conflicting:
