@@ -1900,6 +1900,8 @@ async def advance_run(
                 project_dir=Path(last_wt),
                 stage="post-run",
                 feature_name=run.name,
+                state=state,
+                preset=preset,
             )
             vresult = await validate_and_fix(vctx, max_attempts=2)
             # Integration and the single-run PR use the stage branch, not the

@@ -18,6 +18,7 @@ from conductor.core.models import (
     IntegrationState,
     RunState,
 )
+from conductor.core.presets import Preset, load_preset
 from conductor.core.validation import (
     ValidationContext,
     ValidationResult,
@@ -360,8 +361,16 @@ async def run_integration_merge(
                 branch=branch_name,
             )
 
+    # From the repo root, like the runs: an uncommitted .conductor/preset.toml
+    # is not in the worktree.
     try:
-        return await _integrate(state, worktree_path, branch_name, eligible_runs)
+        preset = load_preset(state.preset, repo_root)
+    except ValueError as exc:
+        logger.warning("Preset %r not loadable (%s) — using base validation", state.preset, exc)
+        preset = None
+
+    try:
+        return await _integrate(state, worktree_path, branch_name, eligible_runs, preset)
     finally:
         await _remove_worktree(worktree_path, repo_root)
 
@@ -371,6 +380,7 @@ async def _integrate(
     wt: Path,
     branch_name: str,
     eligible_runs: list[RunState],
+    preset: Preset | None,
 ) -> IntegrationState:
     """Merge, validate, commit, push and open the PR inside worktree *wt*."""
     merged_runs: list[RunState] = []
@@ -505,6 +515,7 @@ async def _integrate(
         stage="integration",
         feature_name=state.project_name,
         state=state,
+        preset=preset,
     )
     try:
         vresult = await validate_and_fix(vctx, max_attempts=3)

@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from conductor.core.claude import run_claude
-from conductor.core.presets import CommandSpec, ValidationSettings, load_preset
+from conductor.core.presets import CommandSpec, Preset, ValidationSettings, load_preset
 
 if TYPE_CHECKING:
     from conductor.core.models import ConductorState, E2ETestState
@@ -34,6 +34,10 @@ class ValidationContext:
     stage: str  # "post-runner" | "post-run" | "integration"
     feature_name: str
     state: ConductorState | None = None
+    # The project's preset, loaded by the caller from the repo root. Without it
+    # the preset is loaded by state.preset from project_dir, a worktree that may
+    # lack an uncommitted .conductor/preset.toml.
+    preset: Preset | None = None
 
 
 @dataclass
@@ -172,6 +176,8 @@ async def commit_validation_fixes(
 
 def _preset_validation(ctx: ValidationContext) -> ValidationSettings:
     """Validation hooks from the project's preset (base defaults when unavailable)."""
+    if ctx.preset is not None:
+        return ctx.preset.validation
     name = ctx.state.preset if ctx.state else None
     try:
         return load_preset(name, ctx.project_dir).validation
@@ -453,14 +459,16 @@ async def run_validation(
 async def validate_and_fix(
     ctx: ValidationContext,
     max_attempts: int = 3,
+    checks: list[str] | None = None,
 ) -> ValidationResult:
     """Run validation, and if it fails, ask Claude to fix the code, then retry.
 
-    Loops up to *max_attempts* times. Returns the final ValidationResult. The
-    fixes are left uncommitted; callers commit them with
-    commit_validation_fixes when result.fix_attempts > 0.
+    Loops up to *max_attempts* times; every attempt runs *checks* (default:
+    detect_checks). Returns the final ValidationResult. The fixes are left
+    uncommitted; callers commit them with commit_validation_fixes when
+    result.fix_attempts > 0.
     """
-    result = await run_validation(ctx)
+    result = await run_validation(ctx, checks)
     fix_attempts = 0
     untracked_before: frozenset[str] = frozenset()
 
@@ -512,7 +520,7 @@ async def validate_and_fix(
         )
         fix_attempts += 1
 
-        result = await run_validation(ctx)
+        result = await run_validation(ctx, checks)
 
     result.fix_attempts = fix_attempts
     result.untracked_before_fix = untracked_before

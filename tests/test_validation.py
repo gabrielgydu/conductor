@@ -260,3 +260,39 @@ async def test_post_run_validation_fixes_reach_the_stage_branch(repo, monkeypatc
     assert _git(repo, "show", "feat:app.txt") == "fixed\n"
     assert _git(repo, "show", "feat:helper.txt") == "new module\n"
     assert _git(repo, "status", "--porcelain") == ""
+
+
+@pytest.mark.asyncio
+async def test_post_run_validation_uses_the_runs_preset(repo, tmp_path):
+    """advance_run built the post-run context without state or preset, so preset
+    checks never ran and exec_wrapper was not applied."""
+    from conductor.core.orchestrator import advance_run
+    from conductor.core.presets import ConfigPreset
+
+    (repo / "vendor" / "bin").mkdir(parents=True)
+    (repo / "vendor" / "bin" / "phpunit").write_text("#!/bin/sh\nexit 1\n")
+    preset_file = tmp_path / "proj.toml"
+    preset_file.write_text(
+        "[validation]\n"
+        'exec_wrapper = ["sh", "-c", \'touch wrapped; exit 0\', "wrapper"]\n\n'
+        "[[validation.checks]]\n"
+        'name = "api-tests"\n'
+        'command = ["touch", "api-tests-ran"]\n',
+        encoding="utf-8",
+    )
+    preset = ConfigPreset.from_file(preset_file, name="proj")
+    stage = StageState(
+        name="impl", spec_mode="full", status=StageStatus.DONE, branch="feat", worktree=str(repo)
+    )
+    run = RunState(
+        index=0, name="run-0", description="d", stages=[stage],
+        status=RunStatus.ACTIVE, current_stage=1,
+    )
+    # A preset name the worktree cannot resolve: the loaded preset must be used.
+    state = ConductorState(project_name="proj", base_branch="main", runs=[run], preset="proj")
+
+    await advance_run(state, 0, MagicMock(), MagicMock(), MagicMock(), preset=preset)
+
+    assert run.status == RunStatus.DONE
+    assert (repo / "api-tests-ran").exists()
+    assert (repo / "wrapped").exists()  # phpunit ran through exec_wrapper

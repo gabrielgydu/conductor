@@ -807,3 +807,41 @@ async def test_integration_specs_generated_once_and_results_recorded(
     assert [r.name for r in runs] == ["feat-a", "feat-b"]  # not the unmerged run
     assert conflicts == []
     assert result.e2e == counts
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Post-merge validation uses the preset from the repo root
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_gets_the_uncommitted_project_preset(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    """An uncommitted .conductor/preset.toml is not in the integration worktree, so
+    loading the preset there fell back to base validation."""
+    preset_file = real_merge_repo.path / ".conductor" / "preset.toml"
+    preset_file.parent.mkdir()
+    preset_file.write_text(
+        '[[validation.checks]]\nname = "api-tests"\ncommand = "make test-api"\n'
+    )
+    real_merge_repo.create_branch("pr-a", {"pr_a.txt": "a\n"})
+    real_merge_repo.create_branch("pr-b", {"pr_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "pr-a"),
+        _done_run_with_branch(1, "feat-b", "pr-b"),
+    )
+    state.preset = "project"
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    files = _show(real_merge_repo, f"integration/{_project_name(tmp_path)}:").split()
+    assert ".conductor/" not in files  # the worktree never had the preset
+    ctx = hermetic_merge.validate.await_args.args[0]
+    assert [c.name for c in ctx.preset.validation.checks] == ["api-tests"]
