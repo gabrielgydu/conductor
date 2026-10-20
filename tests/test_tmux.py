@@ -179,3 +179,10 @@ async def test_wait_without_exit_file_uses_dead_pane_status(recorder):
     recorder.pane_states = ["1 3"]
 
     assert await TmuxManager("conductor-x").spawn_in_window_and_wait("w", "exit 3") == 3
+
+
+def test_pstree_depth_without_pstree_is_the_documented_fallback(monkeypatch, tmp_path):
+    """Without psmisc, subprocess raised FileNotFoundError into the loop's and orchestrator's monitors."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert tmux_module.check_pstree_depth(1) is True

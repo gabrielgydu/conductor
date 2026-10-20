@@ -20,10 +20,13 @@ def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
 
     Returns True if pstree is not available (safe fallback).
     """
-    r = subprocess.run(
-        ["pstree", "-p", str(pid)],
-        capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["pstree", "-p", str(pid)],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:  # psmisc not installed
+        return True
     if r.returncode != 0:
         return True
     pids = re.findall(r"\((\d+)\)", r.stdout)
