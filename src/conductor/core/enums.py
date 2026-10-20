@@ -1,14 +1,16 @@
-from enum import Enum
+# StrEnum (not `str, Enum`) so str() and f-strings render the value, e.g. in log
+# lines, instead of 'StageStatus.GENERATED'.
+from enum import StrEnum
 
 
-class RunStatus(str, Enum):
+class RunStatus(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
     DONE = "done"
     BLOCKED = "blocked"
 
 
-class StageStatus(str, Enum):
+class StageStatus(StrEnum):
     PENDING = "pending"
     SPEC_INIT = "spec_init"
     SPEC_RUNNING = "spec_running"
@@ -22,7 +24,7 @@ class StageStatus(str, Enum):
     BLOCKED = "blocked"
 
 
-class SpeccerStatus(str, Enum):
+class SpeccerStatus(StrEnum):
     INIT = "init"
     EXPLORING = "exploring"
     NEEDS_INPUT = "needs_input"
@@ -31,7 +33,7 @@ class SpeccerStatus(str, Enum):
     GENERATED = "generated"
 
 
-class IntegrationStatus(str, Enum):
+class IntegrationStatus(StrEnum):
     PENDING = "pending"
     MERGING = "merging"
     CONFLICT_RESOLVING = "conflict_resolving"
@@ -41,7 +43,7 @@ class IntegrationStatus(str, Enum):
     NEEDS_FIX = "needs_fix"
 
 
-class BrainAction(str, Enum):
+class BrainAction(StrEnum):
     RETRY = "retry"
     BLOCK = "block"
     STEER = "steer"
@@ -49,7 +51,7 @@ class BrainAction(str, Enum):
     IGNORE = "ignore"
 
 
-class FixerStatus(str, Enum):
+class FixerStatus(StrEnum):
     WAITING_CI = "waiting_ci"
     FIXING_CONFLICT = "fixing_conflict"
     FIXING = "fixing"

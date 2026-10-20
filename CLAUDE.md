@@ -14,7 +14,7 @@ tmux new-session -d -s conductor-<project> -n conductor
 
 # 2. Send command with --inside-tmux flag
 tmux send-keys -t conductor-<project>:conductor \
-  "conductor run --inside-tmux --name <project> --project-dir <path> --overnight" Enter
+  "conductor run --inside-tmux --name <project> --project-dir <path>" Enter
 
 # 3. Monitor
 tmux capture-pane -t conductor-<project>:conductor -p 2>&1 | tail -20
@@ -24,7 +24,7 @@ conductor status --name <project> --project-dir <path>
 
 Key flags:
 - `--inside-tmux`: run the loop directly without creating a new tmux session
-- `--overnight`: auto-answer speccer questions via brain (no human input needed)
+- `--no-overnight`: answer speccer questions yourself (by default, overnight mode, the brain auto-answers them)
 
 ## Go Mode (One-Shot)
 
@@ -63,19 +63,20 @@ conductor status --name <name> --project-dir <path>
 | Condition | Phases executed |
 |---|---|
 | No state | init → copy brief → plan → run |
-| State exists, brief is placeholder | copy brief → plan → run |
-| State exists, brief populated, no runs | plan → run |
-| State exists, runs populated | run only |
+| State exists, no runs, `--plan` given | copy brief (replacing the old one) → plan → run |
+| State exists, no runs, brief populated | plan → run |
+| State exists, runs populated | run only (a different `--plan` is ignored with a warning) |
 
 ### Key flags
 
 - `--plan`: path to brief file (required on first run when brief is empty)
-- `--preset`: preset name (default: base, auto-detected)
+- `--preset`: preset name (auto-detected if omitted; `--preset base` opts out of a detected preset)
 - `--base-branch`: base branch (auto-detected if omitted)
-- `--quick`: enabled by default (use `--no-quick` to disable)
-- `--max-parallel`: default 1 (sequential runs)
+- `--quick` / `--no-quick`: quick mode is turned on when `go` plans the project; on resume the saved setting is kept unless one of these flags is given
+- `--max-parallel`: the saved setting, 1 (sequential runs) for a new project
 - `--worktrees-base`: base directory for worktrees (also used for integration merge worktree; defaults to `/tmp` if unset)
-- All `run` flags: `--no-overnight`, `--no-quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
+- All `run` flags: `--no-overnight`, `--quick`/`--no-quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
+- Settings saved by an earlier run (quick, max parallel, worktrees base) are kept when the flag is left out; `--no-overnight` applies only to the invocation that passes it
 
 ## Loop Mode
 
@@ -156,7 +157,7 @@ Pane logs are in the conductor dir's `logs/`; the per-session prompt and output 
 - `src/speccer/` — spec generation loop
 - `src/runner/` — code execution runner
   - `src/runner/steer_inbox.py` — file-based steering IPC (polls `.msg` files from orchestrator)
-- `conductor`, `speccer`, `runner` — bash wrapper scripts (auto-bootstrap venv)
+- `conductor`, `speccer`, `runner` — bash wrapper scripts; `scripts/venv-run` creates, repairs and runs `.venv`
 
 ## Steering
 

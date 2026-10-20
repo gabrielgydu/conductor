@@ -1,0 +1,76 @@
+#!/bin/bash
+# Run `python -m <module>` from this checkout's .venv, creating or repairing
+# the venv first when needed. Used by the ./conductor, ./speccer and ./runner
+# wrappers:  scripts/venv-run <module> [args...]
+#
+# The venv counts as ready when .venv/.bootstrap-stamp matches the current
+# pyproject.toml and interpreter. Otherwise, under a lock (the orchestrator
+# starts several speccer/runner windows at once), the venv is recreated if its
+# interpreter no longer works (e.g. after a Python minor upgrade), the
+# package is (re)installed, and the stamp is written only once that worked,
+# so an interrupted or failed setup is retried on the next call.
+#
+# CONDUCTOR_PYTHON selects the interpreter used to create the venv.
+
+set -euo pipefail
+
+MODULE="$1"
+shift
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+VENV="$ROOT/.venv"
+STAMP="$VENV/.bootstrap-stamp"
+
+wanted_stamp() {
+    printf 'pyproject %s\npython %s\n' \
+        "$(sha256sum "$ROOT/pyproject.toml" | cut -d' ' -f1)" \
+        "$(readlink -f "$VENV/bin/python" 2>/dev/null || true)"
+}
+
+ready() {
+    [[ -x "$VENV/bin/python" && -f "$STAMP" && "$(<"$STAMP")" == "$(wanted_stamp)" ]]
+}
+
+fail() {
+    echo "conductor setup: $*" >&2
+    exit 1
+}
+
+pick_python() {
+    local candidates=(python3 python)
+    [[ -n "${CONDUCTOR_PYTHON:-}" ]] && candidates=("$CONDUCTOR_PYTHON")
+    local py
+    for py in "${candidates[@]}"; do
+        if command -v "$py" >/dev/null 2>&1 &&
+            "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+            echo "$py"
+            return 0
+        fi
+    done
+    fail "no Python >= 3.11 found (tried: ${candidates[*]}); set CONDUCTOR_PYTHON"
+}
+
+bootstrap() {
+    rm -f "$STAMP"
+    if ! "$VENV/bin/python" -c 'import sys, pip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+        local py
+        py="$(pick_python)" || exit 1
+        echo "conductor setup: creating $VENV with $py ..." >&2
+        "$py" -m venv --clear "$VENV" >&2 || fail "could not create $VENV"
+    fi
+    echo "conductor setup: installing conductor into $VENV ..." >&2
+    "$VENV/bin/python" -m pip install -q -e "$ROOT[dev]" >&2 ||
+        fail "pip install failed; fix the error above and run the command again"
+    "$VENV/bin/python" -c 'import conductor, speccer, runner' >&2 ||
+        fail "installed, but the conductor packages still do not import"
+    wanted_stamp >"$STAMP"
+    echo "conductor setup: done." >&2
+}
+
+if ! ready; then
+    exec 9>"$ROOT/.venv.lock"
+    flock 9
+    ready || bootstrap # another process may have finished it while we waited
+    exec 9>&-
+fi
+
+exec "$VENV/bin/python" -m "$MODULE" "$@"

@@ -19,14 +19,18 @@ cd /path/to/your/project
 # Generate a plan (uses Claude Opus)
 /path/to/conductor/conductor plan --name my-feature --project-dir .
 
-# Execute the plan
+# Execute the plan (overnight mode: speccer questions are auto-answered)
 /path/to/conductor/conductor run --name my-feature --project-dir .
 
-# Or run overnight (auto-answers speccer questions)
-/path/to/conductor/conductor run --name my-feature --project-dir . --overnight
+# Or answer speccer questions yourself
+/path/to/conductor/conductor run --name my-feature --project-dir . --no-overnight
 ```
 
-No manual venv setup needed — the `./conductor` and `./speccer` wrapper scripts auto-create a venv and install dependencies on first run.
+No manual venv setup needed: the `./conductor`, `./speccer` and `./runner` wrappers create `.venv` and install conductor into it on first run.
+
+They also repair it: a failed or interrupted install is retried on the next call, a changed `pyproject.toml` is reinstalled, and the venv is rebuilt when a Python upgrade breaks it.
+
+The venv is built with the first `python3` or `python` that is at least 3.11; set `CONDUCTOR_PYTHON` to choose another.
 
 ## Requirements
 
@@ -78,11 +82,11 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 | Command | Description |
 |---------|-------------|
 | `conductor init --name <name>` | Create a project with feature brief template |
-| `conductor plan --name <name>` | Generate run plan via Claude Opus |
-| `conductor run --name <name> [--overnight]` | Execute the orchestration loop |
+| `conductor plan --name <name> [--force]` | Generate run plan via Claude Opus (`--force` re-plans a project whose runs have started) |
+| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N]` | Execute the orchestration loop |
 | `conductor status --name <name>` | Show run/stage status table |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |
-| `conductor cleanup --name <name>` | Remove worktrees and branches |
+| `conductor cleanup --name <name> [--force]` | Remove worktrees and branches; keeps uncommitted, unpushed or unmerged work unless `--force` |
 
 **Stage State Machine:**
 
@@ -172,6 +176,7 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
 ├── conductor/
 │   └── <project-name>/
 │       ├── CONDUCTOR-STATE.json      # DAG state, run/stage status
+│       ├── conductor.lock            # Single-instance lock (run/go/plan/loop/manual-test/cleanup)
 │       ├── CONDUCTOR-LOG.md          # Human-readable event log
 │       ├── CONDUCTOR-AUDIT.jsonl     # Machine-readable audit trail
 │       ├── STATS.json                # Token usage and cost tracking
