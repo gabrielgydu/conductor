@@ -87,6 +87,25 @@ def _patch_tmux():
     )
 
 
+def _patch_brain():
+    """Answer brain calls (failure diagnosis of the non-DONE run) with BLOCK."""
+    import json
+
+    from conductor.core.claude import ClaudeResult
+
+    reply = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "ACTION: BLOCK\nTest double.",
+    })
+    return patch(
+        "conductor.core.brain.run_claude",
+        new_callable=AsyncMock,
+        return_value=ClaudeResult(
+            exit_code=0, output=reply, tokens_used=None, cost=None, duration=0.0
+        ),
+    )
+
+
 def _patch_post_run():
     """Return a context manager that prevents conductor_post_run from calling Claude."""
     return patch(
@@ -137,6 +156,7 @@ async def test_integration_not_triggered_when_active_runs(tmp_path):
         _patch_tmux(),
         _patch_post_run(),
         _patch_create_worktree(tmp_path),
+        _patch_brain(),
     ):
         with patch(
             "conductor.integration.merge.run_integration_merge",
@@ -158,6 +178,7 @@ async def test_integration_not_triggered_fewer_than_two_done(tmp_path):
         _patch_tmux(),
         _patch_post_run(),
         _patch_create_worktree(tmp_path),
+        _patch_brain(),
     ):
         with patch(
             "conductor.integration.merge.run_integration_merge",
