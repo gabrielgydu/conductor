@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -190,6 +191,98 @@ def _speccer_exit_file(storage: StorageResolver, project_name: str, fname: str) 
 # ---------------------------------------------------------------------------
 
 
+def _worktree_branch(path: Path) -> str | None:
+    """Branch checked out in the worktree at *path*, or None if it is not one."""
+    if not (path / ".git").exists():
+        return None
+    r = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _registered_worktrees(project_dir: Path) -> list[dict[str, str]]:
+    """Parse ``git worktree list --porcelain`` into one dict per worktree."""
+    r = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return []
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            if current:
+                entries.append(current)
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        entries.append(current)
+    return entries
+
+
+def _release_stale_worktrees(
+    project_dir: Path,
+    wt_path: Path,
+    branch: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> Path | None:
+    """Clear git worktree registrations that would make ``git worktree add`` fail.
+
+    git refuses to add a worktree at a path, or for a branch, that is still
+    registered to a worktree whose directory is gone ("missing but already
+    registered worktree", "'<branch>' is already used by worktree at ..."):
+    the directory was deleted by hand or lived on a tmpfs that a reboot
+    cleared. Only those registrations, for this path or this branch, are
+    removed (other worktrees, e.g. on an unmounted disk, are left alone).
+
+    If *branch* is checked out in a worktree that does exist at another path,
+    that worktree is returned so the caller reuses it instead.
+    """
+    target = wt_path.resolve()
+    ref = f"refs/heads/{branch}"
+    for entry in _registered_worktrees(project_dir):
+        path = Path(entry.get("worktree", ""))
+        if path.resolve() != target and entry.get("branch") != ref:
+            continue
+        if path.exists():
+            if entry.get("branch") == ref and path.resolve() != target:
+                _log(
+                    "WORKTREE_CREATE",
+                    f"{branch} is already checked out at {path} — reusing it",
+                    log_path,
+                    audit_path,
+                    branch=branch,
+                    worktree=str(path),
+                )
+                return path
+            continue
+        r = subprocess.run(
+            ["git", "worktree", "remove", str(path)],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+        _log(
+            "WORKTREE_CREATE",
+            f"Dropped stale worktree registration {path} (directory missing)"
+            + ("" if r.returncode == 0 else f" — failed: {r.stderr.strip()}"),
+            log_path,
+            audit_path,
+            branch=entry.get("branch"),
+            worktree=str(path),
+        )
+    return None
+
 
 def create_worktree(
     state: ConductorState,
@@ -231,9 +324,15 @@ def create_worktree(
     # with the base branch (which may share the project_name prefix)
     branch = f"conductor/{state.project_name}/{run.name}/{stage.name}"
 
-    # Worktree path: worktrees_base / {run}-{stage}
-    wt_name = f"{run.name}-{stage.name}"
-    wt_candidate = wt_base / wt_name
+    # Worktree path: worktrees_base / {project}-{run}-{stage}. The project
+    # prefix keeps two conductor projects on one repo (same run and stage
+    # names, e.g. after starting a new project for the same feature) out of
+    # each other's worktrees.
+    wt_candidate = wt_base / f"{state.project_name}-{run.name}-{stage.name}"
+    # A stage that already has a worktree keeps it, even if worktrees_base or
+    # the naming scheme changed since it was created.
+    if stage.worktree and _worktree_branch(Path(stage.worktree)) == branch:
+        wt_candidate = Path(stage.worktree)
 
     # Determine base ref
     if stage_idx > 0:
@@ -246,19 +345,12 @@ def create_worktree(
         base_ref = state.base_branch
 
     # Reuse existing worktree if it's valid and on the right branch
-    wt_ready = False
     if wt_candidate.exists() and (wt_candidate / ".git").exists():
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(wt_candidate),
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip() == branch:
-            wt_ready = True
-        else:
+        current = _worktree_branch(wt_candidate)
+        if current != branch:
             raise RuntimeError(
                 f"Worktree {wt_candidate} exists but on wrong branch "
-                f"({result.stdout.strip()}), expected {branch}"
+                f"({current}), expected {branch}"
             )
     else:
         # Remove stale leftover dir (not a valid worktree)
@@ -267,24 +359,33 @@ def create_worktree(
             if wt_candidate.exists():
                 subprocess.run(["sudo", "rm", "-rf", str(wt_candidate)], capture_output=True)
 
-        branch_exists = subprocess.run(
-            ["git", "rev-parse", "--verify", branch],
-            cwd=str(project_dir),
-            capture_output=True,
-        ).returncode == 0
-
-        wt_candidate.parent.mkdir(parents=True, exist_ok=True)
-        if branch_exists:
-            subprocess.run(
-                ["git", "worktree", "add", str(wt_candidate), branch],
-                cwd=str(project_dir), check=True, capture_output=True,
-            )
+        adopted = _release_stale_worktrees(
+            project_dir, wt_candidate, branch, log_path, audit_path
+        )
+        if adopted is not None:
+            wt_candidate = adopted
         else:
-            subprocess.run(
-                ["git", "worktree", "add", "-b", branch, str(wt_candidate), base_ref],
-                cwd=str(project_dir), check=True, capture_output=True,
+            branch_exists = subprocess.run(
+                ["git", "rev-parse", "--verify", branch],
+                cwd=str(project_dir),
+                capture_output=True,
+            ).returncode == 0
+
+            wt_candidate.parent.mkdir(parents=True, exist_ok=True)
+            if branch_exists:
+                add_args = ["git", "worktree", "add", str(wt_candidate), branch]
+            else:
+                add_args = [
+                    "git", "worktree", "add", "-b", branch, str(wt_candidate), base_ref,
+                ]
+            r = subprocess.run(
+                add_args, cwd=str(project_dir), capture_output=True, text=True
             )
-        wt_ready = True
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"git worktree add {wt_candidate} failed (rc={r.returncode}): "
+                    f"{r.stderr.strip()}"
+                )
 
     stage.branch = branch
     stage.worktree = str(wt_candidate)
@@ -1648,6 +1749,11 @@ async def handle_failure(
             "## Activity Log (last 100 lines)\n" + "\n".join(lines[-100:])
         )
 
+    if stage.last_error:
+        context_parts.append(
+            "## Orchestrator Error\nConductor itself raised while advancing this "
+            f"stage:\n{stage.last_error}"
+        )
     context_parts.append(
         "## Stage Config\n" + _json.dumps(stage.model_dump(), indent=2, default=str)
     )
@@ -1732,6 +1838,7 @@ async def restart_stage(
     fname = run.name + stage.feature_suffix
     current_status = stage.status
     stage.last_exit_code = None
+    stage.last_error = None
 
     if current_status in (StageStatus.FAILED, StageStatus.BLOCKED):
         # Determine where to restart based on how far the stage got on disk.
@@ -2104,6 +2211,76 @@ async def advance_run(
         return
 
 
+# Consecutive advance_run exceptions tolerated on an EXECUTING stage before
+# the orchestrator stops trusting its monitoring of that runner.
+MAX_MONITOR_ERRORS = 3
+
+
+def _record_advance_error(
+    state: ConductorState,
+    run_idx: int,
+    exc: BaseException,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+    *,
+    consecutive: int,
+) -> None:
+    """Turn an exception out of advance_run into a failed stage, not a dead loop.
+
+    The stage goes to FAILED with the error recorded, so handle_failure's
+    normal retry/BLOCK budget applies (a git or CLI error raised from one run
+    must not stop the orchestration of every run, and must not re-raise on
+    every resume). If the stage was already FAILED or STALLED, handle_failure
+    itself raised: the stage is BLOCKED directly, otherwise the loop would
+    retry the same crash without ever spending a retry. An EXECUTING stage
+    keeps its runner (it lives in its own tmux window and reports through its
+    exit file) until monitoring has failed MAX_MONITOR_ERRORS times in a row.
+    """
+    run = state.runs[run_idx]
+    error = f"{type(exc).__name__}: {exc}"
+    tb = "".join(traceback.format_exception(exc))
+    stage_idx = run.current_stage
+    stage = run.stages[stage_idx] if stage_idx < len(run.stages) else None
+
+    if stage is None:
+        # Post-run step of a finished run raised. Block the run; auto-resume
+        # on the next start re-activates it to repeat the post-run step.
+        run.status = RunStatus.BLOCKED
+        outcome = "run blocked"
+    elif stage.status == StageStatus.EXECUTING and consecutive < MAX_MONITOR_ERRORS:
+        outcome = f"still executing (monitor error {consecutive}/{MAX_MONITOR_ERRORS})"
+    elif stage.status in (StageStatus.FAILED, StageStatus.STALLED, StageStatus.BLOCKED):
+        stage.last_error = error
+        stage.status = StageStatus.BLOCKED
+        outcome = "stage blocked (failure handling itself raised)"
+    else:
+        stage.last_error = error
+        stage.status = StageStatus.FAILED
+        outcome = "stage failed"
+
+    _log(
+        "FAILURE",
+        f"Run {run.name}: conductor error while advancing — {error} ({outcome})",
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+        reason="advance_error",
+        error=error,
+        traceback=tb[-4000:],
+    )
+    try:
+        atomic_save(state, storage.conductor_state(state.project_name))
+    except Exception as save_exc:
+        _log(
+            "FAILURE",
+            f"Could not save state after advance error: {save_exc}",
+            log_path,
+            audit_path,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Post-run processing
 # ---------------------------------------------------------------------------
@@ -2399,6 +2576,18 @@ async def _auto_resume_blocked_runs(
     for run_idx, run in enumerate(state.runs):
         if run.status != RunStatus.BLOCKED:
             continue
+        if run.current_stage >= len(run.stages):
+            # Every stage is done; only the post-run step failed. Redo it.
+            run.status = RunStatus.ACTIVE
+            _log(
+                "AUTO_RESUME",
+                f"Run {run.name}: all stages done, repeating post-run step",
+                log_path,
+                audit_path,
+                run=run_idx,
+            )
+            any_resumed = True
+            continue
         stage = run.stages[run.current_stage]
         if stage.status != StageStatus.BLOCKED:
             # Cascaded dependency block — just reset run to PENDING
@@ -2493,6 +2682,7 @@ async def conductor_run_loop(
     await _auto_resume_blocked_runs(state, storage, log_path, audit_path)
 
     exit_reason = "unknown"
+    advance_errors: dict[int, int] = {}  # run index -> consecutive exceptions
 
     for _iteration in range(config.max_iterations):
         active_run_indices = activate_ready_runs(state, max_parallel=config.max_parallel)
@@ -2604,9 +2794,18 @@ async def conductor_run_loop(
             si = run.current_stage
             if si < len(run.stages) and run.stages[si].status == StageStatus.EXECUTING:
                 any_executing = True
-            await advance_run(
-                state, run_idx, tmux, storage, config, preset, log_path, audit_path
-            )
+            try:
+                await advance_run(
+                    state, run_idx, tmux, storage, config, preset, log_path, audit_path
+                )
+            except Exception as exc:
+                advance_errors[run_idx] = advance_errors.get(run_idx, 0) + 1
+                _record_advance_error(
+                    state, run_idx, exc, storage, log_path, audit_path,
+                    consecutive=advance_errors[run_idx],
+                )
+            else:
+                advance_errors.pop(run_idx, None)
 
         # Sleep only when all active are monitoring (executing) and no foreground work
         has_foreground = _has_foreground_runs(state, active_run_indices)

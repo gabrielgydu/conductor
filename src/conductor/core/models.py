@@ -59,6 +59,9 @@ class StageState(BaseModel):
     first_transient_failure_ts: datetime | None = None
     backoff_until: datetime | None = None
     last_exit_code: int | None = None
+    # Error that made the orchestrator itself fail this stage (an exception
+    # while advancing it), shown to the failure diagnosis.
+    last_error: str | None = None
 
 
 class RunState(BaseModel):

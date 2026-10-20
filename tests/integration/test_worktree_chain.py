@@ -245,3 +245,74 @@ def test_branch_naming_convention(tmp_git_repo: Path, tmp_path: Path) -> None:
 
     create_worktree(state, 0, 1, repo, worktrees_base)
     assert state.runs[0].stages[1].branch == "conductor/my-project/api-endpoints/impl"
+
+
+# ---------------------------------------------------------------------------
+# WC-5..7: Resume when git still has worktree registrations conductor lost
+# ---------------------------------------------------------------------------
+
+
+def _one_stage_state(project: str, base_branch: str) -> ConductorState:
+    return ConductorState(
+        project_name=project,
+        base_branch=base_branch,
+        runs=[
+            RunState(
+                index=0,
+                name="auth",
+                description="Auth",
+                stages=[StageState(name="main", spec_mode="full")],
+            )
+        ],
+    )
+
+
+def test_recreates_worktree_whose_directory_was_deleted(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    """Dir gone (rm, tmpfs reboot) but still registered: recreate, don't raise."""
+    import shutil
+
+    repo = tmp_git_repo
+    worktrees_base = tmp_path / "worktrees"
+    state = _one_stage_state("proj", get_default_branch(repo))
+    create_worktree(state, 0, 0, repo, worktrees_base)
+    wt = Path(state.runs[0].stages[0].worktree)
+    shutil.rmtree(wt)
+
+    state.runs[0].stages[0].worktree = None
+    create_worktree(state, 0, 0, repo, worktrees_base)
+
+    assert (wt / ".git").exists()
+    assert state.runs[0].stages[0].worktree == str(wt)
+
+
+def test_two_projects_with_same_run_names_get_separate_worktrees(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    repo = tmp_git_repo
+    worktrees_base = tmp_path / "worktrees"
+    base = get_default_branch(repo)
+    v1 = _one_stage_state("proj-v1", base)
+    v2 = _one_stage_state("proj-v2", base)
+
+    create_worktree(v1, 0, 0, repo, worktrees_base)
+    create_worktree(v2, 0, 0, repo, worktrees_base)
+
+    assert v1.runs[0].stages[0].worktree != v2.runs[0].stages[0].worktree
+    assert v2.runs[0].stages[0].branch == "conductor/proj-v2/auth/main"
+
+
+def test_reuses_worktree_after_worktrees_base_changed(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    """The stage's branch is checked out under the old base: reuse that worktree."""
+    repo = tmp_git_repo
+    state = _one_stage_state("proj", get_default_branch(repo))
+    create_worktree(state, 0, 0, repo, tmp_path / "old-base")
+    old_wt = state.runs[0].stages[0].worktree
+
+    state.runs[0].stages[0].worktree = None
+    create_worktree(state, 0, 0, repo, tmp_path / "new-base")
+
+    assert state.runs[0].stages[0].worktree == old_wt
