@@ -119,7 +119,34 @@ async def test_auto_resume_reactivates_run_blocked_after_its_last_stage(loop_env
 
     await orch._auto_resume_blocked_runs(state, storage, None, None)
 
-    assert state.runs[0].status == RunStatus.ACTIVE
+    assert state.runs[0].status == RunStatus.PENDING
+    assert orch.activate_ready_runs(state) == [0]
+
+
+@pytest.mark.asyncio
+async def test_resumed_runs_respect_max_parallel(loop_env, tmp_path):
+    """Two runs blocked at different times must not both resume at once."""
+    runs = []
+    for i, name in enumerate(("feat-a", "feat-b")):
+        run = make_run_state(i, name, status=RunStatus.BLOCKED)
+        run.stages[0].status = StageStatus.DONE
+        run.current_stage = 1
+        runs.append(run)
+    state = _state(*runs)
+
+    await orch._auto_resume_blocked_runs(state, StorageResolver(tmp_path), None, None)
+
+    assert orch.activate_ready_runs(state, max_parallel=1) == [0]
+    assert state.runs[1].status == RunStatus.PENDING
+
+
+def test_pending_run_listed_before_an_active_one_waits_for_its_slot():
+    first = make_run_state(0, "feat-a", status=RunStatus.PENDING)
+    second = make_run_state(1, "feat-b", status=RunStatus.ACTIVE)
+    state = _state(first, second)
+
+    assert orch.activate_ready_runs(state, max_parallel=1) == [1]
+    assert first.status == RunStatus.PENDING
 
 
 # ---------------------------------------------------------------------------

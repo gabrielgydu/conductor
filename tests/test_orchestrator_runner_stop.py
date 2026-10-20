@@ -180,7 +180,7 @@ async def test_auto_resume_keeps_a_successful_exit_after_the_block(tmp_path):
         await orch._auto_resume_blocked_runs(state, storage, None, None, tmux=_tmux(idle=True))
 
     assert state.runs[0].stages[0].status == StageStatus.DONE
-    assert state.runs[0].status == RunStatus.ACTIVE
+    assert state.runs[0].status == RunStatus.PENDING  # activated within max_parallel
     assert exit_file.read_text() == "0"
 
 

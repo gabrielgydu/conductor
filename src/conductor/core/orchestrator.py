@@ -2637,14 +2637,12 @@ def activate_ready_runs(state: ConductorState, max_parallel: int = 1) -> list[in
     Returns list of run indices that are now active (or were already active).
     """
     run_by_index: dict[int, RunState] = {run.index: run for run in state.runs}
-    activated: list[int] = []
+    # Count every ACTIVE run before activating any: a PENDING run listed
+    # before an ACTIVE one must not slip past the cap.
+    active_count = sum(1 for run in state.runs if run.status == RunStatus.ACTIVE)
 
     for run in state.runs:
-        if run.status not in (RunStatus.PENDING, RunStatus.ACTIVE):
-            continue
-
-        if run.status == RunStatus.ACTIVE:
-            activated.append(run.index)
+        if run.status != RunStatus.PENDING:
             continue
 
         # PENDING — check deps
@@ -2664,12 +2662,12 @@ def activate_ready_runs(state: ConductorState, max_parallel: int = 1) -> list[in
         )
         if all_done:
             # Respect concurrency cap before activating
-            if max_parallel > 0 and len(activated) >= max_parallel:
+            if max_parallel > 0 and active_count >= max_parallel:
                 continue
             run.status = RunStatus.ACTIVE
-            activated.append(run.index)
+            active_count += 1
 
-    return activated
+    return [run.index for run in state.runs if run.status == RunStatus.ACTIVE]
 
 
 def _waiting_reason(
@@ -3413,6 +3411,8 @@ async def _auto_resume_blocked_runs(
 
     A blocked stage whose runner has since exited 0 is DONE, and one whose
     runner is still working is watched again; only the others restart.
+    Resumed runs go back to PENDING, so activate_ready_runs applies
+    max_parallel to them; only a run with a live runner is ACTIVE at once.
     """
     any_resumed = False
     for run_idx, run in enumerate(state.runs):
@@ -3420,7 +3420,7 @@ async def _auto_resume_blocked_runs(
             continue
         if run.current_stage >= len(run.stages):
             # Every stage is done; only the post-run step failed. Redo it.
-            run.status = RunStatus.ACTIVE
+            run.status = RunStatus.PENDING
             _log(
                 "AUTO_RESUME",
                 f"Run {run.name}: all stages done, repeating post-run step",
@@ -3447,7 +3447,7 @@ async def _auto_resume_blocked_runs(
         if _runner_outcome(state, run_idx, si, storage) == 0:
             stage.status = StageStatus.EXECUTING
             _finish_runner(state, run_idx, si, 0, storage, log_path, audit_path)
-            run.status = RunStatus.ACTIVE
+            run.status = RunStatus.PENDING
             _log(
                 "AUTO_RESUME",
                 f"Run {run.name} stage {stage.name}: runner finished with exit 0 "
@@ -3489,7 +3489,7 @@ async def _auto_resume_blocked_runs(
         stage.first_transient_failure_ts = None
         stage.backoff_until = None
         run.monitor.stall_count = 0
-        run.status = RunStatus.ACTIVE
+        run.status = RunStatus.PENDING
         _log(
             "AUTO_RESUME",
             f"Run {run.name} stage {stage.name}: resumed, retries reset",
