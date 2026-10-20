@@ -57,6 +57,13 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "AUTO_RESUME":       EventConfig("↻",  True),
     "TRANSIENT_FAILURE": EventConfig("⏳", True),
     "TRANSIENT_RETRY":   EventConfig("↻",  True),
+    # Manual-test events (conductor.core.manual_test)
+    "MANUAL_TEST_START": EventConfig("●",  True),
+    "MANUAL_TEST_DONE":  EventConfig("■",  True),
+    "MANUAL_GENERATION_START": EventConfig("▶", True),
+    "MANUAL_GENERATION_END": EventConfig("◼", True),
+    "FINDING_FIX_RETRY": EventConfig("↻",  True),
+    "MANUAL_FIX_SKIPPED": EventConfig("!", True),
     # Loop events
     "LOOP_START":        EventConfig("●",  True),
     "LOOP_DONE":         EventConfig("■",  True),
@@ -105,6 +112,12 @@ _COLOR_MAP: dict[str, str] = {
     "TRANSIENT_FAILURE": _YELLOW,
     "TRANSIENT_RETRY": _YELLOW,
     "STAGE_TRANSITION": _CYAN,
+    # Manual-test colors
+    "MANUAL_TEST_START": _CYAN_BOLD,
+    "MANUAL_TEST_DONE": _GREEN,
+    "MANUAL_GENERATION_START": _CYAN,
+    "FINDING_FIX_RETRY": _YELLOW,
+    "MANUAL_FIX_SKIPPED": _YELLOW,
     # Loop colors
     "LOOP_START": _CYAN_BOLD,
     "LOOP_DONE": _GREEN,

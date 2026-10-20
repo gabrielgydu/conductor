@@ -196,6 +196,50 @@ async def test_run_generation_lists_auto_approved_flags(tmp_path, monkeypatch):
     assert end["auto_approved"] == ["database cli: mysql -e 'select 1'"]
 
 
+def test_every_manual_test_event_is_registered():
+    import ast
+
+    from conductor.core.logging import EVENT_REGISTRY
+
+    tree = ast.parse(Path(manual_test.__file__).read_text(encoding="utf-8"))
+    emitted = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"_log", "live_log"}
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+    assert "MANUAL_GENERATION_END" in emitted
+    assert sorted(emitted - EVENT_REGISTRY.keys()) == []
+
+
+@pytest.mark.asyncio
+async def test_run_generation_writes_markdown_log(tmp_path, monkeypatch):
+    repo, conductor_dir, state = _new_state(tmp_path)
+    _fake_claude(monkeypatch, [(_assistant_text(PASS_RESULT), 0, "")])
+
+    await manual_test._run_generation(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=_FakeTmux(),
+        prompt="prompt",
+        label="scenario-0",
+        model="sonnet",
+        scenario=state.scenarios[0],
+        log_path=conductor_dir / "MANUAL-TEST-LOG.md",
+        audit_path=conductor_dir / "MANUAL-TEST-AUDIT.jsonl",
+    )
+
+    log = (conductor_dir / "MANUAL-TEST-LOG.md").read_text(encoding="utf-8")
+    assert "MANUAL_GENERATION_START" in log
+    assert "MANUAL_GENERATION_END" in log
+
+
 def test_parse_scenarios_from_table():
     scenarios = parse_scenarios_from_markdown(PLAN_TABLE)
 
