@@ -12,16 +12,19 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from conductor.core.claude import ClaudeResult, resolve_model, run_claude
+from conductor.core.claude import resolve_model, run_claude
 from conductor.core.launch import claude_session_script
 from conductor.core.logging import live_log
-from conductor.core.models import atomic_save, load_state
+from conductor.core.models import atomic_save
 from conductor.core.presets import load_preset
 from conductor.core.storage import StorageResolver
+
+if TYPE_CHECKING:
+    from conductor.core.tmux import TmuxManager
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +292,7 @@ def create_loop_worktree(
 
 
 # ---------------------------------------------------------------------------
-# Quality gate + commit
+# Commit
 # ---------------------------------------------------------------------------
 
 
@@ -324,15 +327,6 @@ def commit_task(cwd: Path, task: LoopTask) -> str | None:
         cwd=str(cwd), capture_output=True, text=True,
     )
     return result.stdout.strip()
-
-
-def push_branch(cwd: Path, branch: str) -> bool:
-    """Push the branch to origin. Returns success."""
-    result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
-        cwd=str(cwd), capture_output=True, text=True,
-    )
-    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
