@@ -371,7 +371,7 @@ The inline marker serves as a traceable anchor — it marks exactly where the sp
 
 **On `--continue` iterations:** When user answers resolve a question, find and replace the corresponding `[NEEDS CLARIFICATION: ...]` marker with the actual spec content.
 
-**Before emitting SPEC_COMPLETE:** Verify that **zero** `[NEEDS CLARIFICATION` markers remain in any domain spec. The CLI enforces this as a hard gate — SPEC_COMPLETE will be rejected if any markers remain.
+**Before emitting SPEC_COMPLETE:** Verify that **zero** `[NEEDS CLARIFICATION` markers remain in any domain spec. The CLI enforces this as a hard gate: it rejects SPEC_COMPLETE while any `[NEEDS CLARIFICATION: ...]` marker remains and lists the markers it found in HANDOFF.md.
 
 ---
 

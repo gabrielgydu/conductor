@@ -219,3 +219,90 @@ async def test_header_rebuilt_when_agent_deletes_progress(spec_dir, fake_claude)
     assert sc.read_status(spec_dir) == "NEEDS_INPUT"
     assert sc.read_mode(spec_dir) == "backend"
     assert sc.read_iteration(spec_dir) == 1
+
+
+# ---------------------------------------------------------------------------
+# SPEC_COMPLETE marker gate
+# ---------------------------------------------------------------------------
+
+
+def _answered(spec_dir: Path) -> Path:
+    """Put the spec at NEEDS_INPUT with one answered question."""
+    sc.update_status(spec_dir, "NEEDS_INPUT")
+    (spec_dir / "QUESTIONS.md").write_text(
+        "## Round 1 Questions\n\n### Q1: Auth\n\n**Answer:**\n> Use the existing session auth\n",
+        encoding="utf-8",
+    )
+    return spec_dir
+
+
+def _domain(spec_dir: Path, body: str) -> None:
+    (spec_dir / "domains" / "01-core.md").write_text(f"# Core\n{body}\n", encoding="utf-8")
+
+
+def _complete() -> str:
+    return _stream(_result(f"All domains done.\n{COMPLETE}"))
+
+
+@pytest.mark.asyncio
+async def test_prose_mention_of_marker_does_not_block_completion(spec_dir, fake_claude):
+    _answered(spec_dir)
+    _domain(spec_dir, "## Changelog\n- Resolved former [NEEDS CLARIFICATION] markers from round 1.")
+    fake_claude.outputs = [_complete()]
+
+    await _run(spec_dir, cont=True)  # generate then fails its output check; irrelevant here
+
+    assert sc.read_status(spec_dir) == "COMPLETE"
+    assert len(fake_claude.prompts) == 2, "generate should have run"
+
+
+@pytest.mark.asyncio
+async def test_rejection_reason_reaches_next_iteration_prompt(spec_dir, fake_claude):
+    _answered(spec_dir)
+    _domain(spec_dir, "Auth: [NEEDS CLARIFICATION: which auth scheme?]")
+    fake_claude.outputs = [_complete(), _stream(_result(f"Asked again.\n{NEEDS_INPUT}"))]
+
+    assert await _run(spec_dir, cont=True) == 1
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+    assert sc.read_rejected_completions(spec_dir) == 1
+    handoff = (spec_dir / "HANDOFF.md").read_text()
+    assert "SPEC_COMPLETE rejected" in handoff
+    assert "domains/01-core.md:2: [NEEDS CLARIFICATION: which auth scheme?]" in handoff
+
+    assert await _run(spec_dir, cont=True) == 0
+    assert "domains/01-core.md:2: [NEEDS CLARIFICATION: which auth scheme?]" in fake_claude.prompts[1]
+    assert sc.read_rejected_completions(spec_dir) == 0, "an accepted verdict resets the count"
+
+
+@pytest.mark.asyncio
+async def test_continue_after_rejection_needs_no_new_answers(spec_dir, fake_claude):
+    # First iteration: no questions written, a marker left behind, COMPLETE claimed.
+    _domain(spec_dir, "Retention: [NEEDS CLARIFICATION: how long?]")
+    fake_claude.outputs = [_complete(), _stream(_result(f"Fixed.\n{NEEDS_INPUT}"))]
+    assert await _run(spec_dir) == 1
+    assert (spec_dir / "QUESTIONS.md").read_text() == ""
+
+    assert await _run(spec_dir, cont=True) == 0
+
+    assert len(fake_claude.prompts) == 2, "the continue run must start a session to fix the marker"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_rejections_stop_for_a_human(spec_dir, fake_claude):
+    _answered(spec_dir)
+    _domain(spec_dir, "Auth: [NEEDS CLARIFICATION: which auth scheme?]")
+    # The agent rewrites PROGRESS.md each session; the count must survive it.
+    fake_claude.on_call = lambda n: _rewrite_progress_without_header(spec_dir) or _domain(
+        spec_dir, "Auth: [NEEDS CLARIFICATION: which auth scheme?]"
+    )
+    fake_claude.outputs = [_complete() for _ in range(sc.MAX_REJECTED_COMPLETIONS)]
+
+    codes = [await _run(spec_dir, cont=True) for _ in range(sc.MAX_REJECTED_COMPLETIONS)]
+
+    assert codes == [1] * (sc.MAX_REJECTED_COMPLETIONS - 1) + [sc.EXIT_NEEDS_HUMAN]
+    assert sc.read_rejected_completions(spec_dir) == sc.MAX_REJECTED_COMPLETIONS
+
+    assert await _run(spec_dir, cont=True) == sc.EXIT_NEEDS_HUMAN
+    assert len(fake_claude.prompts) == sc.MAX_REJECTED_COMPLETIONS, "no session after the cap"
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
