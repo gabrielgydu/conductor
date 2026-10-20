@@ -412,10 +412,12 @@ Mark each node with: `[PENDING]`, `[IN_PROGRESS]`, `[COMPLETE]`
 
 ## PROGRESS.md Domain Table
 
-Update the domain table in `{SPEC_DIR}/PROGRESS.md` as you work. Keep the STATUS and ITERATION lines at the top, then the table:
+Update the domain table in `{SPEC_DIR}/PROGRESS.md` as you work. Keep the header lines (STATUS, MODE, PRESET, ITERATION) at the top exactly as they are, then the table:
 
 ```
 STATUS: SPECCING
+MODE: fullstack
+PRESET: myproject
 ITERATION: 3
 
 ## Domain Progress
@@ -428,7 +430,7 @@ ITERATION: 3
 | 04 | Frontend – List View | PENDING | — |
 ```
 
-Do NOT modify the STATUS line — the runner script manages it. Only update ITERATION if instructed.
+Do NOT modify or remove the header lines — speccer manages them.
 
 ---
 

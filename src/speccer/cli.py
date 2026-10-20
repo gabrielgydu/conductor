@@ -88,7 +88,7 @@ def _read_field(progress_file: Path, field: str, default: str = "") -> str:
 
 def _write_field(progress_file: Path, field: str, value: str) -> None:
     """Replace `FIELD: ...` line in PROGRESS.md, or insert after first line if missing."""
-    text = progress_file.read_text(encoding="utf-8")
+    text = progress_file.read_text(encoding="utf-8") if progress_file.exists() else ""
     pattern = rf"^{re.escape(field)}:.*$"
     replacement = f"{field}: {value}"
     new_text, n = re.subn(pattern, replacement, text, flags=re.MULTILINE)
@@ -126,6 +126,20 @@ def update_status(spec_dir: Path, status: str) -> None:
 
 def update_iteration(spec_dir: Path, iteration: int) -> None:
     _write_field(spec_dir / "PROGRESS.md", "ITERATION", str(iteration))
+
+
+def _restore_header(spec_dir: Path, mode: str, preset: str, iteration: int) -> None:
+    """Put back the PROGRESS.md header lines speccer owns after a spec session.
+
+    The agent rewrites PROGRESS.md to keep its domain table current. If it
+    drops MODE, read_mode falls back to 'fullstack' and generate uses the
+    generic templates, so a backend stage silently ships no API-CONTRACTS.md.
+    STATUS needs no restoring: every exit path of a run writes it.
+    """
+    progress = spec_dir / "PROGRESS.md"
+    _write_field(progress, "MODE", mode)
+    _write_field(progress, "PRESET", preset)
+    _write_field(progress, "ITERATION", str(iteration))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -684,6 +698,8 @@ async def _cmd_run_async(
 
     _log("")
     _log(f"Claude finished in {result.duration:.1f}s (exit_code={result.exit_code})")
+
+    _restore_header(spec_dir, mode=mode, preset=preset, iteration=iteration)
 
     if result.exit_code != 0:
         update_status(spec_dir, pre_status)

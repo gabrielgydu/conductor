@@ -166,3 +166,56 @@ async def test_token_only_in_tool_input_does_not_complete_spec(spec_dir, fake_cl
     assert code == 1
     assert sc.read_status(spec_dir) == "INIT"
     assert len(fake_claude.prompts) == 1, "generate must not run without a verdict"
+
+
+# ---------------------------------------------------------------------------
+# PROGRESS.md header ownership
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_progress_without_header(spec_dir: Path) -> None:
+    """What an agent following the old prompt example wrote: no MODE/PRESET."""
+    (spec_dir / "PROGRESS.md").write_text(
+        "STATUS: SPECCING\nITERATION: 3\n\n## Domain Progress\n\n"
+        "| # | Domain | Status | File |\n|---|--------|--------|------|\n"
+        "| 01 | Core | COMPLETE | 01-core.md |\n",
+        encoding="utf-8",
+    )
+    (spec_dir / "domains" / "01-core.md").write_text("# Core\nDone.\n", encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_header_restored_after_agent_rewrites_progress(spec_dir, fake_claude):
+    fake_claude.on_call = lambda n: _rewrite_progress_without_header(spec_dir)
+    fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]
+
+    assert await _run(spec_dir) == 0
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+    assert sc.read_mode(spec_dir) == "backend"
+    assert sc.read_preset(spec_dir) == "toy"
+    assert sc.read_iteration(spec_dir) == 1
+    assert "| 01 | Core | COMPLETE | 01-core.md |" in (spec_dir / "PROGRESS.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_backend_generate_keeps_backend_template_after_rewrite(spec_dir, fake_claude):
+    fake_claude.on_call = lambda n: n == 1 and _rewrite_progress_without_header(spec_dir)
+    fake_claude.outputs = [_stream(_result(f"All domains done.\n{COMPLETE}"))]
+
+    await _run(spec_dir)  # generate then fails its output check; irrelevant here
+
+    assert len(fake_claude.prompts) == 2
+    assert "API-CONTRACTS.md" in fake_claude.prompts[1], "generate used the generic template"
+
+
+@pytest.mark.asyncio
+async def test_header_rebuilt_when_agent_deletes_progress(spec_dir, fake_claude):
+    fake_claude.on_call = lambda n: (spec_dir / "PROGRESS.md").unlink()
+    fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]
+
+    assert await _run(spec_dir) == 0
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+    assert sc.read_mode(spec_dir) == "backend"
+    assert sc.read_iteration(spec_dir) == 1
