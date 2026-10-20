@@ -116,6 +116,30 @@ async def test_runner_exit_code_file_counts_only_when_written_by_this_attempt(tm
 
 
 @pytest.mark.asyncio
+async def test_exit_file_caught_mid_write_is_not_a_failure(tmp_path, monkeypatch):
+    """`echo 0 > file` truncates before writing; an empty file read in that
+    instant must not turn a successful runner into exit 1 or a dead runner."""
+    state, storage, _ = _env(tmp_path)
+    exit_file = _exit_file(storage)
+    exit_file.parent.mkdir(parents=True, exist_ok=True)
+    exit_file.write_text("")
+    finished = MagicMock()
+    monkeypatch.setattr(orch, "_finish_runner", finished)
+
+    await orch.monitor_runner(state, 0, 0, _tmux(idle=True), storage, ConductorConfig())
+
+    finished.assert_not_called()
+    assert state.runs[0].stages[0].status == StageStatus.EXECUTING
+
+    # A file that stays empty is a wrapper killed mid-write: a failure.
+    old = time.time() - orch.EXIT_FILE_SETTLE_S - 1
+    os.utime(exit_file, (old, old))
+    await orch.monitor_runner(state, 0, 0, _tmux(), storage, ConductorConfig())
+
+    assert finished.call_args.args[3] == 1
+
+
+@pytest.mark.asyncio
 async def test_blocking_stops_the_runner_before_container_teardown(tmp_path, monkeypatch):
     state, storage, _ = _env(tmp_path, StageStatus.BLOCKED)
     tmux = _tmux()

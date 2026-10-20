@@ -277,10 +277,18 @@ def _speccer_exit_file(storage: StorageResolver, project_name: str, fname: str) 
     return _ipc_dir(storage, project_name) / f"conductor-speccer-exit-{fname}"
 
 
+# Wrappers write exit files with `echo $rc > file`, which truncates first: an
+# empty file is a write in progress unless it stays empty this long.
+EXIT_FILE_SETTLE_S = 5.0
+
+
 def _read_exit_code(exit_file: Path) -> int | None:
     """Exit code a wrapper wrote, None if there is none (yet); garbage counts as 1."""
     try:
-        return int(exit_file.read_text().strip())
+        text = exit_file.read_text().strip()
+        if not text and time.time() - exit_file.stat().st_mtime < EXIT_FILE_SETTLE_S:
+            return None
+        return int(text)
     except OSError:
         return None
     except ValueError:
@@ -1883,23 +1891,17 @@ def _runner_outcome(
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
     exit_file = _runner_exit_file(storage, state.project_name, fname)
-    try:
-        return int(exit_file.read_text().strip())
-    except OSError:
-        pass
-    except ValueError:
-        return 1
+    if exit_file.exists():
+        return _read_exit_code(exit_file)
     if not stage.worktree or stage.started_at is None:
         return None
     durable = Path(stage.worktree) / "docs" / fname / "exit_code"
     try:
         if durable.stat().st_mtime <= stage.started_at.timestamp():
             return None
-        return int(durable.read_text().strip())
     except OSError:
         return None
-    except ValueError:
-        return 1
+    return _read_exit_code(durable)
 
 
 def _own_pane_group(pid: int, exit_file: Path) -> bool:
@@ -2049,6 +2051,10 @@ async def monitor_runner(
                 log_path, audit_path, run=run_idx, stage=stage_idx,
             )
         _finish_runner(state, run_idx, stage_idx, exit_code, storage, log_path, audit_path)
+        return
+    if exit_file.exists():
+        # The wrapper is writing its exit code right now: the runner has
+        # ended, so the idle checks below would misread it as a crash.
         return
 
     # Still running — check if window went idle (died without exit file)
