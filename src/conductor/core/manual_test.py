@@ -568,7 +568,7 @@ def _format_evidence_lines(evidence: ManualEvidence) -> list[str]:
     lines.extend(f"url={url}" for url in evidence.urls)
     lines.extend(f"screenshot={path}" for path in evidence.screenshots)
     lines.extend(f"trace={path}" for path in evidence.traces)
-    lines.extend(f"mailhog={msg}" for msg in evidence.mailhog_messages)
+    lines.extend(f"mail={msg}" for msg in evidence.mailhog_messages)
     lines.extend(f"console={err}" for err in evidence.console_errors)
     lines.extend(f"db={readback}" for readback in evidence.db_readbacks)
     lines.extend(evidence.notes)
@@ -803,7 +803,8 @@ def _parse_evidence(block: str) -> ManualEvidence:
         urls=_evidence_values(evidence_block, "url"),
         screenshots=_evidence_values(evidence_block, "screenshot"),
         traces=_evidence_values(evidence_block, "trace"),
-        mailhog_messages=_evidence_values(evidence_block, "mailhog", "mailhog_message"),
+        # <mail> for any mail catcher; <mailhog> is the older tag.
+        mailhog_messages=_evidence_values(evidence_block, "mail", "mailhog", "mailhog_message"),
         console_errors=_evidence_values(evidence_block, "console", "console_error"),
         db_readbacks=_evidence_values(evidence_block, "db", "db_readback"),
         notes=_evidence_values(evidence_block, "note"),
@@ -1514,7 +1515,7 @@ Pass format:
     <url>...</url>
     <screenshot>...</screenshot>
     <trace>...</trace>
-    <mailhog>...</mailhog>
+    <mail>...</mail>
     <db_readback>...</db_readback>
     <note>...</note>
   </evidence>

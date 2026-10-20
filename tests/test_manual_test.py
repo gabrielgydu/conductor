@@ -716,6 +716,23 @@ def test_blocked_results_may_rest_on_notes():
     assert blocked.valid is True
 
 
+def test_mail_evidence_tag_counts_for_any_mail_catcher():
+    signal = parse_manual_signal(
+        """<manual-result status="pass">
+  <summary>Invoice mail arrived</summary>
+  <evidence><mail>Mailpit message 42: "Your invoice"</mail></evidence>
+</manual-result>
+<manual-pass/>"""
+    )
+
+    assert signal.valid is True
+    assert signal.evidence.mailhog_messages == ['Mailpit message 42: "Your invoice"']
+    assert manual_test._format_evidence_lines(signal.evidence) == [
+        "Invoice mail arrived",
+        'mail=Mailpit message 42: "Your invoice"',
+    ]
+
+
 def test_parse_manual_finding_and_blocked_validation():
     finding = parse_manual_signal(
         """<manual-result status="finding">
