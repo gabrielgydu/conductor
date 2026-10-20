@@ -178,6 +178,16 @@ def _load_prompt_template(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _self_argv(*args: str) -> list[str]:
+    """argv that runs this conductor again: same interpreter, same installed package.
+
+    Works for a wheel install as well as the repo wrapper. -P keeps the
+    current directory off sys.path, so a project's own `conductor` module
+    can't shadow ours.
+    """
+    return [sys.executable, "-P", "-m", "conductor", *args]
+
+
 # ─── tmux ────────────────────────────────────────────────────────────────────
 
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh"}
@@ -586,11 +596,7 @@ def _run_completeness_review(
     run_claude,
 ) -> str | None:
     """Run completeness review. Returns feedback string if issues found, None if passed."""
-    try:
-        review_template = _load_prompt_template("completeness-review")
-    except FileNotFoundError:
-        print("Warning: completeness-review-prompt.md not found, skipping review.", file=sys.stderr)
-        return None
+    review_template = _load_prompt_template("completeness-review")  # checked by _cmd_plan
 
     # Format descriptions for the review
     desc_text = ""
@@ -734,17 +740,13 @@ def _cmd_plan(args, *, next_steps: bool = True):
         f"{preset_info}"
     )
 
-    # Load plan prompt template and substitute context
+    # Both templates up front, so a broken install fails before any Claude call
     try:
         template = _load_prompt_template("plan")
-    except FileNotFoundError:
-        # Fallback if template not found
-        template = (
-            "You are planning a multi-run conductor project.\n\n"
-            "{CONTEXT}\n\n"
-            "Output the plan inside a ```conductor-state code block.\n"
-            'For each run+stage, also output a description block: <description name="run-{idx}-{stage_name}">...\n'
-        )
+        _load_prompt_template("completeness-review")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}. The conductor installation is incomplete; reinstall it.")
+        sys.exit(1)
     prompt = template.replace("{CONTEXT}", context)
 
     runs_json, descriptions = _generate_and_review_plan(
@@ -967,8 +969,7 @@ def _cmd_run(args):
 
     if not inside_tmux:
         # Re-exec inside tmux session
-        conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
-        reexec = [conductor_bin, "run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path)]
+        reexec = _self_argv("run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path))
         reexec.extend(_run_override_flags(overrides))
 
         _unlock_project(storage, args.name)
@@ -1312,11 +1313,10 @@ def _cmd_loop(args):
 
     if not inside_tmux:
         # Re-exec inside tmux
-        conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
-        reexec = [
-            conductor_bin, "loop", "--inside-tmux", "--name", args.name,
+        reexec = _self_argv(
+            "loop", "--inside-tmux", "--name", args.name,
             "--project-dir", str(repo_path), "--plan", state.plan_file,
-        ]
+        )
         if state.preset:
             reexec.extend(["--preset", state.preset])
         if getattr(args, "no_worktree", False):
@@ -1447,16 +1447,7 @@ def _cmd_manual_test(args):
         return
 
     if not inside_tmux:
-        conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
-        reexec = [
-            conductor_bin,
-            "manual-test",
-            "--inside-tmux",
-            "--name",
-            args.name,
-            "--project-dir",
-            str(repo_path),
-        ]
+        reexec = _self_argv("manual-test", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path))
         if state.plan_file:
             reexec.extend(["--plan", state.plan_file])
         if state.preset:

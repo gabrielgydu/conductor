@@ -41,6 +41,10 @@ conductor = "conductor.cli:main"
 speccer = "speccer.cli:main"
 runner = "runner.cli:main"
 
+[tool.setuptools.package-data]
+# Prompt templates are read at runtime; without this a wheel ships none of them.
+conductor = ["prompts/*.md", "prompts/speccer/*.md"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
