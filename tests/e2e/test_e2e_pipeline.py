@@ -25,16 +25,15 @@ pytestmark = pytest.mark.usefixtures("isolated_run_loop")
 def _make_spawn_callback(mock_speccer, mock_tmux):
     """Return a spawn callback that drives MockSpeccer.
 
-    Speccer spawns are blocking (spawn_in_window_and_wait), so MockTmux ends
-    them itself. Runner spawns (window name ends with -exec) finish at once
-    with exit code 0, so the orchestrator sees a clean completion.
+    Every window finishes at once with exit code 0: speccer windows after
+    MockSpeccer has written its files, runner windows (name ends with -exec)
+    straight away, so the orchestrator sees a clean completion.
     """
 
     def callback(name: str, cmd: str) -> None:
-        if name.endswith("-exec"):
-            mock_tmux.finish_window(name, 0)
-        else:
+        if not name.endswith("-exec"):
             mock_speccer._handle_spawn(name, cmd)
+        mock_tmux.finish_window(name, 0)
 
     return callback
 

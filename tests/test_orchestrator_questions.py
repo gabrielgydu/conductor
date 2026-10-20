@@ -91,8 +91,13 @@ def _env(tmp_path: Path, *, questions: str | None = QUESTIONS, progress: str = "
 
 
 def _tmux() -> MagicMock:
+    """Fake tmux whose speccer windows exit 0 as soon as they are spawned."""
     tmux = MagicMock()
-    tmux.spawn_in_window_and_wait = AsyncMock(return_value=0)
+
+    def spawn(name, cmd, *, exit_file, **_):
+        Path(exit_file).write_text("0")
+
+    tmux.spawn_runner_in_window = AsyncMock(side_effect=spawn)
     return tmux
 
 
@@ -149,7 +154,7 @@ async def test_failed_answer_call_backs_off_and_skips_continue(tmp_path, monkeyp
         await advance_run(state, 0, tmux, storage, ConductorConfig())
 
     stage = state.runs[0].stages[0]
-    tmux.spawn_in_window_and_wait.assert_not_awaited()
+    tmux.spawn_runner_in_window.assert_not_awaited()
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT
     assert stage.backoff_until is not None and stage.backoff_until > datetime.now(timezone.utc)
     assert stage.spec_failures == 0
@@ -174,7 +179,7 @@ async def test_already_answered_questions_continue_without_a_brain_call(tmp_path
         await advance_run(state, 0, tmux, storage, ConductorConfig())
 
     assert fake.calls == []
-    cmd = tmux.spawn_in_window_and_wait.await_args.args[1]
+    cmd = tmux.spawn_runner_in_window.await_args.args[1]
     assert "--continue" in cmd
 
 
@@ -201,7 +206,7 @@ async def test_auto_answer_rounds_are_capped(tmp_path, monkeypatch):
         await advance_run(state, 0, tmux, storage, ConductorConfig())
 
     assert fake.calls == []
-    tmux.spawn_in_window_and_wait.assert_not_awaited()
+    tmux.spawn_runner_in_window.assert_not_awaited()
     stage = state.runs[0].stages[0]
     assert orch._waiting_reason(state, state.runs[0], True, datetime.now(timezone.utc)) == "human"
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT

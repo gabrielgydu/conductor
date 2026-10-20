@@ -192,6 +192,109 @@ def _speccer_exit_file(storage: StorageResolver, project_name: str, fname: str) 
     return _ipc_dir(storage, project_name) / f"conductor-speccer-exit-{fname}"
 
 
+def _read_exit_code(exit_file: Path) -> int | None:
+    """Exit code a wrapper wrote, None if there is none (yet); garbage counts as 1."""
+    try:
+        return int(exit_file.read_text().strip())
+    except OSError:
+        return None
+    except ValueError:
+        return 1
+
+
+def _write_exit_code(exit_file: Path, code: int | None) -> None:
+    """Record *code* in *exit_file*; None removes it."""
+    if code is None:
+        exit_file.unlink(missing_ok=True)
+    else:
+        exit_file.write_text(str(code))
+
+
+def _last_change(paths: list[Path], since: float) -> float:
+    """Latest mtime among *paths* (files or directories), at least *since*."""
+    latest = since
+    for path in paths:
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            pass
+    return latest
+
+
+# Blocking steps (speccer) run in a tmux window and are polled, never waited
+# on blindly: a window that dies without an exit code, or goes silent, must
+# not freeze the orchestrator (and every other run) for the rest of the night.
+STEP_POLL_S = 5.0
+STEP_STARTUP_GRACE_S = 15.0
+STEP_INACTIVITY_S = 45 * 60.0  # no new pane output and no spec file changes
+EXIT_TIMED_OUT = 124
+
+
+async def _run_step_in_window(
+    tmux: _tmux_module.TmuxManager,
+    window: str,
+    cmd: str,
+    *,
+    exit_file: Path,
+    cwd: str,
+    log_file: Path,
+    activity: list[Path],
+    stage_state: StageState,
+    log_path: Path | None,
+    audit_path: Path | None,
+    **audit,
+) -> int | None:
+    """Run *cmd* in *window* until it exits; return its exit code.
+
+    Returns None when the window ended without writing an exit code, and
+    EXIT_TIMED_OUT (after stopping the window) when neither its output
+    (*log_file*) nor any of the *activity* paths changed for
+    STEP_INACTIVITY_S. The wait is a polling loop, so Ctrl-C and SIGTERM
+    still end conductor while a step runs.
+    """
+    _write_exit_code(exit_file, None)
+    await tmux.spawn_runner_in_window(
+        window, cmd, exit_file=exit_file, cwd=cwd, log_file=log_file
+    )
+    started = time.time()
+    idle_checks = 0
+    while True:
+        rc = _read_exit_code(exit_file)
+        if rc is not None:
+            return rc
+        now = time.time()
+        if not await tmux.is_window_alive(window):
+            idle_checks = 2  # window closed: nothing will write the exit code
+        elif now - started > STEP_STARTUP_GRACE_S and await tmux.is_runner_idle(window):
+            # No process under the pane shell: it ended, or is about to write
+            # its exit code. Confirm on the next poll before giving up.
+            idle_checks += 1
+        else:
+            idle_checks = 0
+        if idle_checks >= 2:
+            rc = _read_exit_code(exit_file)
+            if rc is None:
+                _log(
+                    "FAILURE",
+                    f"{window}: command ended without an exit code",
+                    log_path, audit_path, window=window, **audit,
+                )
+            return rc
+        if now - _last_change([log_file, *activity], started) > STEP_INACTIVITY_S:
+            minutes = int(STEP_INACTIVITY_S // 60)
+            stage_state.last_error = (
+                f"{window} produced no output and changed no spec files for "
+                f"{minutes} min; conductor stopped it"
+            )
+            await _stop_runner(
+                tmux, window, exit_file, f"no activity for {minutes} min",
+                log_path, audit_path, **audit,
+            )
+            _write_exit_code(exit_file, EXIT_TIMED_OUT)
+            return EXIT_TIMED_OUT
+        await asyncio.sleep(STEP_POLL_S)
+
+
 # ---------------------------------------------------------------------------
 # Worktree management
 # ---------------------------------------------------------------------------
@@ -526,8 +629,10 @@ async def run_speccer_init(
         mode=mode,
     )
     log_file = storage.tmux_log(state.project_name, f"speccer-init_{fname}")
-    exit_code = await tmux.spawn_in_window_and_wait(
-        window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
+    exit_code = await _run_step_in_window(
+        tmux, window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
+        activity=[progress_file.parent], stage_state=stage,
+        log_path=log_path, audit_path=audit_path, run=run_idx, stage=stage_idx,
     )
 
     _log(
@@ -542,6 +647,7 @@ async def run_speccer_init(
     )
 
     if exit_code != 0:
+        stage.last_exit_code = exit_code if exit_code is not None else 1
         _log(
             "FAILURE",
             f"speccer init exited {exit_code} for {fname}",
@@ -583,7 +689,11 @@ async def run_speccer_run(
         stage=stage_idx,
     )
     log_file = storage.tmux_log(state.project_name, f"speccer-run_{fname}")
-    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
+    await _run_step_in_window(
+        tmux, window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
+        activity=[Path(wt) / "docs" / fname / "spec"], stage_state=stage,
+        log_path=log_path, audit_path=audit_path, run=run_idx, stage=stage_idx,
+    )
 
     _log(
         "SPECCER_INVOKE",
@@ -627,7 +737,11 @@ async def run_speccer_continue(
         stage=stage_idx,
     )
     log_file = storage.tmux_log(state.project_name, f"speccer-continue_{fname}")
-    await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
+    await _run_step_in_window(
+        tmux, window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
+        activity=[Path(wt) / "docs" / fname / "spec"], stage_state=stage,
+        log_path=log_path, audit_path=audit_path, run=run_idx, stage=stage_idx,
+    )
 
     _log(
         "SPECCER_INVOKE",
@@ -669,7 +783,11 @@ async def run_speccer_generate(
         stage=stage_idx,
     )
     log_file = storage.tmux_log(state.project_name, f"speccer-generate_{fname}")
-    rc = await tmux.spawn_in_window_and_wait(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
+    rc = await _run_step_in_window(
+        tmux, window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file,
+        activity=[Path(wt) / "docs" / fname], stage_state=stage,
+        log_path=log_path, audit_path=audit_path, run=run_idx, stage=stage_idx,
+    )
 
     _log(
         "SPECCER_INVOKE",
@@ -682,6 +800,7 @@ async def run_speccer_generate(
     )
 
     if rc != 0:
+        stage.last_exit_code = rc if rc is not None else 1
         _log(
             "SPECCER_GENERATE_FAILED",
             f"speccer generate {fname} exited with code {rc}",
@@ -845,12 +964,7 @@ def speccer_exit_code_handler(
     stage = state.runs[run_idx].stages[stage_idx]
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
 
-    exit_code: int | None = None
-    if exit_file.exists():
-        try:
-            exit_code = int(exit_file.read_text().strip())
-        except (ValueError, OSError):
-            exit_code = None
+    exit_code = _read_exit_code(exit_file)
 
     progress_file = _progress_file_path(state, run_idx, stage_idx)
     _recoverable = {"NEEDS_INPUT", "COMPLETE", "GENERATED"}

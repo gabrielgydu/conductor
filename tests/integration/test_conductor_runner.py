@@ -274,6 +274,10 @@ async def test_conductor_detects_dead_runner(
     # Runner window is dead — no exit file written
     mock_tmux.set_window_alive(WINDOW, False)
     # Intentionally no exit_code file (this is the key to dead runner detection)
+    # Speccer steps of a restarted stage finish at once.
+    mock_tmux.set_spawn_callback(
+        lambda name, cmd: None if name.endswith("-exec") else mock_tmux.finish_window(name, 0)
+    )
 
     result = await conductor_run_loop(state, config)
 
