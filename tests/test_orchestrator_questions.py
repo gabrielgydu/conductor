@@ -22,6 +22,13 @@ QUESTIONS = (
     "### Q1: Scope\n**Question:** Which endpoints?\n**Answer:**\n\n---\n\n"
     "### Q2: Auth\n**Question:** Which auth method?\n**Answer:**\n"
 )
+# speccer answered Q2 itself and left Q1 and Q3 open, as real rounds have.
+PARTLY_SELF_ANSWERED = (
+    "## Round 1 Questions\n\n"
+    "### Q1: Scope\n**Answer:**\n(user will add answer here starting with > )\n\n"
+    "### Q2: Crons [SELF-ANSWERED]\n> Self-resolved: crons are off in tests.\n\n"
+    "### Q3: Tenancy\n**Answer:**\n> \n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +173,90 @@ async def test_failed_answer_call_backs_off_and_skips_continue(tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("text", "still_open"),
+    [
+        (QUESTIONS, ["1", "2"]),
+        (PARTLY_SELF_ANSWERED, ["1", "3"]),
+        # speccer's empty "> " placeholders answer nothing
+        ("### Q1: a\n**Answer:**\n> \n### Q2: b\n**Answer:**\n>\n", ["1", "2"]),
+        (QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> yes\n"), []),
+        # the block answer_questions appends after the last question
+        (QUESTIONS + "\n> ### Q1\n> All of them.\n> ### Q2\n> JWT.\n", []),
+        (QUESTIONS + "\n> ### Q2\n> JWT.\n", ["1"]),
+        # asked again after an earlier answer: open again
+        ("### Q1: a\n> ### Q1\n> yes\n## Round 2\n### Q1: c\n**Answer:**\n", ["1"]),
+        ("Which auth method should we use?\n", None),
+    ],
+    ids=[
+        "unanswered", "self-answered", "placeholders", "answered-inline",
+        "auto-answered", "auto-answer-partial", "asked-again", "no-headings",
+    ],
+)
+def test_open_questions(text, still_open):
+    assert orch._open_questions(text) == still_open
+
+
+@pytest.mark.asyncio
+async def test_auto_answers_cover_every_open_question(tmp_path, monkeypatch):
+    """One self-answered question must not stop the others from being answered."""
+    state, storage, spec = _env(tmp_path, questions=PARTLY_SELF_ANSWERED)
+    fake = _answer("### Q1\nAll /auth endpoints.\n### Q3\nOne list per tenant.")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert len(fake.calls) == 1
+    assert "Q2 already have answers" in fake.calls[0]["prompt"]
+    assert "answer only Q1, Q3" in fake.calls[0]["prompt"]
+    text = (spec / "QUESTIONS.md").read_text()
+    assert "> ### Q3\n> One list per tenant." in text
+    assert orch._open_questions(text) == []
+    assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_partly_self_answered_questions_wait_for_a_human(tmp_path, monkeypatch):
+    state, storage, spec = _env(tmp_path, questions=PARTLY_SELF_ANSWERED)
+    state.overnight = False
+    fake = _answer("unused")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert fake.calls == []
+    tmux.spawn_runner_in_window.assert_not_awaited()
+    run = state.runs[0]
+    assert orch._waiting_reason(state, run, False, datetime.now(timezone.utc)) == "human"
+    assert "answer questions Q1, Q3 in" in orch._questions_waiting_message(state, run, False)
+
+
+@pytest.mark.asyncio
+async def test_earlier_auto_answers_continue_without_a_brain_call(tmp_path, monkeypatch):
+    """Answers written before a crash or a failed --continue are not asked for again."""
+    answered = QUESTIONS + "\n\n> ### Q1\n> All of them.\n> ### Q2\n> JWT.\n"
+    state, storage, spec = _env(tmp_path, questions=answered)
+    fake = _answer("unused")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert fake.calls == []
+    assert (spec / "QUESTIONS.md").read_text() == answered
+    assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]
+
+
 @pytest.mark.asyncio
 async def test_already_answered_questions_continue_without_a_brain_call(tmp_path, monkeypatch):
-    """A human (or an earlier round) answered: don't append a second set of answers."""
-    state, storage, _ = _env(tmp_path, questions=QUESTIONS + "\n> Use JWT\n")
+    """A human answered every question: continue, don't append a second set of answers."""
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, storage, _ = _env(tmp_path, questions=answered)
     state.overnight = False
     fake = _answer("unused")
     monkeypatch.setattr(brain, "run_claude", fake)
@@ -210,6 +297,23 @@ async def test_auto_answer_rounds_are_capped(tmp_path, monkeypatch):
     stage = state.runs[0].stages[0]
     assert orch._waiting_reason(state, state.runs[0], True, datetime.now(timezone.utc)) == "human"
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+
+
+@pytest.mark.asyncio
+async def test_human_answers_after_the_auto_answer_cap_continue(tmp_path, monkeypatch):
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, storage, _ = _env(tmp_path, questions=answered)
+    state.runs[0].stages[0].question_rounds = orch.MAX_AUTO_QUESTION_ROUNDS
+    fake = _answer("unused")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    assert orch._waiting_reason(state, state.runs[0], True, datetime.now(timezone.utc)) is None
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert fake.calls == []
+    assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]
 
 
 # ---------------------------------------------------------------------------

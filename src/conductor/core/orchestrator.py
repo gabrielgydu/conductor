@@ -1267,6 +1267,9 @@ ANSWER_TIMEOUT_S = 1200.0
 MAX_AUTO_QUESTION_ROUNDS = 8
 
 _QUESTION_HEADING = re.compile(r"^#{2,4}[ \t]*Q(\d+)\b", re.MULTILINE | re.IGNORECASE)
+# An answer line labelled with its question, as in the block answer_questions
+# appends ("> ### Q2") or a person's "> Q2: ...".
+_ANSWER_LABEL = re.compile(r"^> [\s#*>_-]*Q(\d+)\b", re.IGNORECASE)
 
 
 def _questions_file(run: RunState, stage: StageState) -> Path | None:
@@ -1276,35 +1279,79 @@ def _questions_file(run: RunState, stage: StageState) -> Path | None:
     return Path(stage.worktree) / "docs" / fname / "spec" / "QUESTIONS.md"
 
 
-def _has_answers(questions_file: Path | None) -> bool:
-    """Whether QUESTIONS.md holds answers (speccer's test: a line starting '> ')."""
+def _is_answer(line: str) -> bool:
+    # speccer only checks for a "> " line, but its template leaves an empty
+    # one under each question.
+    return line.startswith("> ") and bool(line[2:].strip())
+
+
+def _open_questions(text: str) -> list[str] | None:
+    """Numbers of the '### Qn' questions in QUESTIONS.md that hold no answer.
+
+    An answer line belongs to the question whose section it is in (a
+    person's answer, or speccer's own "> Self-answered ...") unless it is
+    labelled with another question's number. A question asked again further
+    down is open again. None when the file has no '### Qn' headings.
+    """
+    answered: dict[str, bool] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if heading := _QUESTION_HEADING.match(line):
+            current = heading.group(1)
+            answered[current] = False
+        elif _is_answer(line):
+            if label := _ANSWER_LABEL.match(line):
+                current = label.group(1)
+            if current in answered:
+                answered[current] = True
+    if not answered:
+        return None
+    return [n for n, done in answered.items() if not done]
+
+
+def _answers_missing(questions_file: Path | None) -> bool:
+    """Whether speccer's questions still need answers before it can continue.
+
+    True while any '### Qn' question is open, or, without such headings,
+    while the file has no answer at all. A missing or unreadable file has
+    nothing answered.
+    """
     if questions_file is None:
-        return False
+        return True
     try:
         text = questions_file.read_text(encoding="utf-8")
     except OSError:
-        return False
-    return any(line.startswith("> ") for line in text.splitlines())
+        return True
+    still_open = _open_questions(text)
+    if still_open is None:
+        return not any(_is_answer(line) for line in text.splitlines())
+    return bool(still_open)
 
 
 def _awaits_human(run: RunState, stage: StageState, overnight: bool) -> bool:
     """Whether a SPEC_NEEDS_INPUT stage can only be moved on by a person.
 
     Overnight, questions are answered automatically up to
-    MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise the stage waits until someone
-    writes answers into QUESTIONS.md.
+    MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise, and after that, the stage
+    waits until someone has answered every question in QUESTIONS.md.
     """
-    if overnight:
-        return stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS
     questions = _questions_file(run, stage)
-    return questions is not None and questions.exists() and not _has_answers(questions)
+    if overnight:
+        return (
+            stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS
+            and _answers_missing(questions)
+        )
+    return questions is not None and questions.exists() and _answers_missing(questions)
 
 
-def _unanswered(questions: str, answers: str) -> list[str]:
-    """Numbers of the '### Qn' questions that *answers* has no heading for."""
-    asked = dict.fromkeys(m.group(1) for m in _QUESTION_HEADING.finditer(questions))
+def _q_list(numbers: list[str]) -> str:
+    return ", ".join("Q" + n for n in numbers)
+
+
+def _unanswered(numbers: list[str], answers: str) -> list[str]:
+    """Those of the questions *numbers* that *answers* has no heading for."""
     return [
-        n for n in asked
+        n for n in numbers
         if not re.search(rf"^[\s#*>_-]*Q{n}\b", answers, re.MULTILINE | re.IGNORECASE)
     ]
 
@@ -1336,6 +1383,10 @@ async def answer_questions(
     questions = questions_file.read_text(encoding="utf-8").strip()
     if not questions:
         return True
+    still_open = _open_questions(questions)
+    if still_open == []:
+        return True  # all answered already (by a person or by speccer itself)
+    pending = still_open or []  # empty: no '### Qn' headings to go by
 
     # Build context
     cdir = conductor_dir or storage.conductor_dir(state.project_name)
@@ -1366,6 +1417,14 @@ async def answer_questions(
         "contain only the answers: for every question a heading `### Qn` (its number) followed "
         "by the answer. No preamble, no closing remarks."
     )
+    settled = [
+        n for n in dict.fromkeys(_QUESTION_HEADING.findall(questions)) if n not in pending
+    ]
+    if settled:
+        system_prompt += (
+            f"\n\n{_q_list(settled)} already have answers (the '> ' lines under "
+            f"them); answer only {_q_list(pending)}."
+        )
 
     context = (
         f"{system_prompt}\n\n"
@@ -1394,7 +1453,7 @@ async def answer_questions(
         tools="Read,Grep,Glob",  # read-only: ground answers in the code
         cwd=wt,
     )
-    missing = _unanswered(questions, reply.text) if reply.ok else []
+    missing = _unanswered(pending, reply.text) if reply.ok else []
     usable = reply.ok and not missing
 
     if usable:
@@ -1420,7 +1479,7 @@ async def answer_questions(
         return False
 
     reason = (
-        f"auto-answers skip question(s) {', '.join('Q' + n for n in missing)}"
+        f"auto-answers skip question(s) {_q_list(missing)}"
         if missing
         else f"auto-answer produced no final answer ({reply.detail})"
     )
@@ -2719,14 +2778,20 @@ def _questions_waiting_message(
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
     continue_cmd = f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue`"
+    try:
+        still_open = _open_questions(questions.read_text(encoding="utf-8"))
+    except OSError:
+        still_open = None
+    which = f"questions {_q_list(still_open)}" if still_open else "the questions"
     if overnight:
         return (
             f"Run {run.name} stage {stage.name}: still asking questions after "
-            f"{stage.question_rounds} automatic answer rounds. Review {questions}, "
-            f"then run {continue_cmd} and re-run conductor."
+            f"{stage.question_rounds} automatic answer rounds. Answer {which} in "
+            f"{questions} (lines starting with '> ') and re-run conductor, or run "
+            f"{continue_cmd} and then re-run conductor."
         )
     return (
-        f"Run {run.name} stage {stage.name}: answer the questions in {questions} "
+        f"Run {run.name} stage {stage.name}: answer {which} in {questions} "
         "(lines starting with '> ') and re-run conductor, or re-run it without "
         "--no-overnight to have them answered automatically."
     )
@@ -2902,7 +2967,7 @@ async def advance_run(
             # Nothing to do until someone answers; the main loop ends with
             # needs_input once no other run has work left.
             return
-        if overnight and not _has_answers(_questions_file(run, stage)):
+        if overnight and _answers_missing(_questions_file(run, stage)):
             answered = await answer_questions(
                 state,
                 run_idx,
