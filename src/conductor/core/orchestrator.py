@@ -3298,9 +3298,9 @@ async def _review_learnings(
 
     The edits are made in the worktree of the most recently finished run and
     committed on its branch, never in the user's own checkout. Only existing
-    CLAUDE.md files inside that worktree can be edited (or a root CLAUDE.md
-    created when there is none). An unchanged set of learnings is reviewed
-    once, unless *force*.
+    CLAUDE.md files inside that worktree can be edited (a symlinked one
+    through its target there), or a root CLAUDE.md created when there is
+    none. An unchanged set of learnings is reviewed once, unless *force*.
     """
     import hashlib as _hashlib
 
@@ -3356,7 +3356,13 @@ async def _review_learnings(
         _log("POST_RUN", f"Learnings review failed: {reply.detail}", log_path, audit_path)
         return
 
-    allowed = set(existing) or {root / "CLAUDE.md"}
+    # A CLAUDE.md may be a symlink (to AGENTS.md, say): edit its target, but
+    # only one inside the worktree.
+    allowed = (
+        {p.resolve() for p in existing if p.resolve().is_relative_to(root)}
+        if existing
+        else {root / "CLAUDE.md"}
+    )
     changed: list[Path] = []
     for rel, addition in _parse_learning_blocks(reply.text).items():
         candidate = Path(rel)

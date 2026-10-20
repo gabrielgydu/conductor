@@ -132,6 +132,30 @@ async def test_learnings_message_says_whether_the_commit_still_goes_out(
     assert expected in capsys.readouterr().err
 
 
+@pytest.mark.asyncio
+async def test_symlinked_claude_md_is_edited_through_its_target(project, monkeypatch):
+    wt = project.wt
+    _git(wt, "mv", "CLAUDE.md", "AGENTS.md")
+    (wt / "CLAUDE.md").symlink_to("AGENTS.md")
+    outside = project.outside / "global-CLAUDE.md"
+    outside.write_text("# Global rules\n")
+    (wt / ".claude" / "CLAUDE.md").unlink()
+    (wt / ".claude" / "CLAUDE.md").symlink_to(outside)
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "symlinks")
+    monkeypatch.setattr(brain, "run_claude", _FakeClaude(
+        "<<<FILE: CLAUDE.md>>>\n- A rule.\n<<<END>>>\n"
+        "<<<FILE: .claude/CLAUDE.md>>>\n- nope\n<<<END>>>\n"
+    ))
+
+    await orch._review_learnings(project.state, project.storage)
+
+    assert (wt / "CLAUDE.md").is_symlink()
+    assert "- A rule." in (wt / "AGENTS.md").read_text()
+    assert "AGENTS.md" in _git(wt, "show", "--name-only", "--format=", "HEAD")
+    assert outside.read_text() == "# Global rules\n"
+
+
 # ---------------------------------------------------------------------------
 # Overnight audit report
 # ---------------------------------------------------------------------------
