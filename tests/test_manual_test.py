@@ -1207,6 +1207,192 @@ def test_detect_relevant_check_commands():
     assert detect_relevant_check_commands(changed, ManualTestPolicy()) == []
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout
+
+
+def _committed_files(repo: Path, rev: str = "HEAD") -> list[str]:
+    output = _git(repo, "show", "-z", "--name-only", "--format=", rev)
+    return sorted(path.strip("\n") for path in output.split("\0") if path.strip("\n"))
+
+
+def _git_project(tmp_path: Path, files: dict[str, str] | None = None):
+    """A committed git repo plus manual-test state with one open, fixable finding."""
+    repo, conductor_dir, state = _new_state(tmp_path)
+    _git(repo, "init", "-q")
+    for key, value in {
+        "user.email": "tester@example.com",
+        "user.name": "Tester",
+        "commit.gpgsign": "false",
+        "core.hooksPath": ".git/hooks",
+    }.items():
+        _git(repo, "config", key, value)
+    for name, content in (files or {"app/Foo.php": "<?php // broken\n"}).items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    finding = ManualFinding(
+        id="MT-001",
+        scenario_index=0,
+        severity="medium",
+        category="app_bug",
+        title="Send button fails",
+        reproduction=["Open checkout preview", "Click send"],
+        expected="Email sends",
+        actual="Send fails",
+        evidence=ManualEvidence(screenshots=["artifacts/screenshots/fail.png"]),
+    )
+    state.findings.append(finding)
+    state.scenarios[0].status = "failed"
+    state.scenarios[0].findings.append(finding.id)
+    return repo, conductor_dir, state, finding
+
+
+def _script_generations(monkeypatch, state, steps):
+    """Fake _run_generation: each call pops (final text, side effect) and records its label."""
+    calls = []
+
+    async def fake_run_generation(**kwargs):
+        calls.append(kwargs["label"])
+        state.generations.append(
+            manual_test.ManualGeneration(
+                index=len(state.generations) + 1,
+                started_at=manual_test.datetime.now(manual_test.timezone.utc),
+            )
+        )
+        final, action = steps.pop(0)
+        if action:
+            action()
+        output = _assistant_text(final)
+        return manual_test.parse_manual_signal(output, policy=kwargs.get("policy")), output
+
+    monkeypatch.setattr(manual_test, "_run_generation", fake_run_generation)
+    return calls
+
+
+async def _fix(repo, conductor_dir, state, finding, policy=None):
+    await manual_test._fix_and_verify_finding(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=object(),
+        plan_content=PLAN_TABLE,
+        finding=finding,
+        log_path=manual_test.manual_log_path(conductor_dir),
+        audit_path=manual_test.manual_audit_path(conductor_dir),
+        model="sonnet",
+        policy=policy,
+    )
+
+
+FIXER_HANDOFF = "Fixed the send handler.\n<manual-handoff/>"
+
+
+def test_git_changed_files_lists_files_in_untracked_dirs_and_odd_names(tmp_path):
+    repo, *_ = _git_project(tmp_path, {"app/Old.php": "old", "app/Bar.php": "old"})
+    (repo / "newmod").mkdir()
+    for name in ["newmod/a.php", "newmod/b.php", "app/my file.php", "app/Café.php"]:
+        (repo / name).write_text("new", encoding="utf-8")
+    (repo / "app/Old.php").unlink()
+    (repo / "app/Bar.php").write_text("staged", encoding="utf-8")
+    _git(repo, "add", "app/Bar.php")
+
+    assert manual_test._git_changed_files(repo) == sorted(
+        ["app/Bar.php", "app/Café.php", "app/Old.php", "app/my file.php", "newmod/a.php", "newmod/b.php"]
+    )
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        (".playwright-cli/page-2026-05-02T22-30-40-289Z.yml", True),
+        (".playwright-mcp/console.log", True),
+        ("page-2026-05-02T22-30-40-289Z.png", True),
+        ("test-results/checkout/trace.zip", True),
+        ("app/playwright-report/index.html", True),
+        ("config/services.yaml", False),
+        ("docs/screenshots/admin.png", False),
+        ("app/src/Checkout.php", False),
+    ],
+)
+def test_test_artifact_filter_matches_tool_output_only(path, expected):
+    assert manual_test._is_test_artifact(path) is expected
+
+
+def test_commit_verified_finding_commits_only_the_fix(tmp_path):
+    repo, _, _, finding = _git_project(
+        tmp_path, {"app/Bar.php": "old", "app/Old.php": "old", "app/Unrelated.php": "old"}
+    )
+    (repo / "newmod").mkdir()
+    (repo / "newmod/user.txt").write_text("user's untracked notes", encoding="utf-8")
+    (repo / "app/Unrelated.php").write_text("user's staged work", encoding="utf-8")
+    _git(repo, "add", "app/Unrelated.php")
+    fix = ["app/Bar.php", "app/Café.php", "app/Old.php", "app/[id].php", "app/my file.php", "newmod/b.php"]
+    (repo / "app/Bar.php").write_text("fixed", encoding="utf-8")
+    (repo / "app/Old.php").unlink()
+    for name in ["app/Café.php", "app/[id].php", "app/my file.php", "newmod/b.php"]:
+        (repo / name).write_text("new", encoding="utf-8")
+
+    assert manual_test._commit_verified_finding(repo, finding, fix)
+
+    assert _committed_files(repo) == sorted(fix)
+    assert _git(repo, "diff", "--cached", "--name-only") == "app/Unrelated.php\n"
+    assert "newmod/user.txt" in manual_test._git_changed_files(repo)
+
+
+@pytest.mark.asyncio
+async def test_fix_commit_contains_only_the_fixers_source_changes(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    (repo / ".playwright-cli").mkdir()
+    (repo / ".playwright-cli/page-2026-05-02T22-30-40-289Z.yml").write_text("snapshot", encoding="utf-8")
+
+    def fixer_edits():
+        (repo / "app/Foo.php").write_text("<?php // fixed\n", encoding="utf-8")
+        (repo / "app/new dir").mkdir()
+        (repo / "app/new dir/Helper.php").write_text("<?php\n", encoding="utf-8")
+        (repo / "test-results").mkdir()
+        (repo / "test-results/trace.zip").write_text("zip", encoding="utf-8")
+
+    calls = _script_generations(monkeypatch, state, [(FIXER_HANDOFF, fixer_edits), (PASS_RESULT, None)])
+
+    await _fix(repo, conductor_dir, state, finding)
+
+    assert calls == ["fix-MT-001", "verify-MT-001"]
+    assert finding.status == "verified"
+    assert len(finding.fix_commits) == 1
+    assert _committed_files(repo) == ["app/Foo.php", "app/new dir/Helper.php"]
+    assert manual_test._git_changed_files(repo) == [
+        ".playwright-cli/page-2026-05-02T22-30-40-289Z.yml",
+        "test-results/trace.zip",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_fix_commit_is_reported_and_leaves_nothing_staged(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    hook = repo / ".git/hooks/pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho 'lint failed' >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    def fixer_edits():
+        (repo / "app/Foo.php").write_text("<?php // fixed\n", encoding="utf-8")
+
+    _script_generations(monkeypatch, state, [(FIXER_HANDOFF, fixer_edits), (PASS_RESULT, None)])
+
+    await _fix(repo, conductor_dir, state, finding)
+
+    assert finding.status == "verified"
+    assert finding.fix_commits == []
+    assert "Commit failed" in finding.verification[-1]
+    assert "lint failed" in finding.verification[-1]
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+    assert _git(repo, "status", "--porcelain") == " M app/Foo.php\n"
+    assert _audit_events(conductor_dir, "MANUAL_COMMIT_FAILED")[0]["files"] == ["app/Foo.php"]
+
+
 def test_git_changed_files_includes_staged_files(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

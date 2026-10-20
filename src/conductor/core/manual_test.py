@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1692,8 +1693,12 @@ def detect_relevant_check_commands(
     return commands
 
 
+# Output browser and test tooling leaves in the target repo while testing:
+# Playwright CLI/MCP page snapshots and Playwright's report directories.
 _TEST_ARTIFACT_PATTERNS = re.compile(
-    r"\.yaml$|\.yml\.snap$|/artifacts/|/screenshots/|/mailhog/|/generations/"
+    r"(^|/)(\.playwright-(cli|mcp)|test-results|playwright-report|blob-report)/"
+    r"|(^|/)page-\d{4}-\d\d-\d\dT[\d-]+Z?\.(ya?ml|png|jpe?g)$"
+    r"|\.yml\.snap$"
 )
 
 
@@ -1701,36 +1706,30 @@ def _is_test_artifact(path: str) -> bool:
     return bool(_TEST_ARTIFACT_PATTERNS.search(path))
 
 
-def _git_changed_files(cwd: Path, exclude_test_artifacts: bool = False) -> list[str]:
-    files: list[str] = []
-    for args in [
-        ["git", "diff", "--name-only", "--diff-filter=ACMRTD"],
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRTD"],
-    ]:
-        result = subprocess.run(
-            args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        files.extend(line.strip() for line in result.stdout.splitlines() if line.strip())
+# Paths are passed to git as literal names, never as globs.
+_GIT = ["git", "--literal-pathspecs"]
 
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
+
+def _git_root(cwd: Path) -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    return Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else cwd
+
+
+def _git_changed_files(cwd: Path) -> list[str]:
+    """Every path with staged, unstaged or untracked changes, relative to the repo root.
+
+    Files inside untracked directories are listed one by one, and names come
+    back unquoted, so paths with spaces or non-ASCII characters work.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
         cwd=cwd,
         capture_output=True,
-        text=True,
         check=False,
     )
-    for line in status.stdout.splitlines():
-        if line.startswith("?? "):
-            files.append(line[3:].strip())
-
-    all_files = sorted(set(files))
-    if exclude_test_artifacts:
-        return [f for f in all_files if not _is_test_artifact(f)]
-    return all_files
+    return sorted({os.fsdecode(entry[3:]) for entry in result.stdout.split(b"\0") if len(entry) > 3})
 
 
 def _format_files_for_log(files: list[str], limit: int = 12) -> str:
@@ -1778,43 +1777,50 @@ def _commit_verified_finding(
     finding: ManualFinding,
     changed_files: list[str],
 ) -> str | None:
-    if not changed_files:
-        return None
+    """Commit exactly *changed_files* (root-relative) and return the short hash.
 
-    subprocess.run(
-        ["git", "add", "--", *changed_files],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-    )
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRTD"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if not staged.stdout.strip():
+    Anything else the user has staged stays staged and out of the commit.
+    Returns None when none of the files has changes left. If staging or the
+    commit fails (a pre-commit hook, say), the files are unstaged again so a
+    later commit cannot sweep them in, and CalledProcessError propagates.
+    """
+    root = _git_root(cwd)
+    pending = set(_git_changed_files(root))
+    files = [path for path in changed_files if path in pending]
+    if not files:
         return None
-
+    # New and modified files must be added first; deletions commit as they are.
+    present = [path for path in files if os.path.lexists(root / path)]
     message = (
         f"Fix {finding.id}: {finding.title}\n\n"
         f"Verified manual-test scenario {finding.scenario_index}."
     )
-    subprocess.run(
-        ["git", "commit", "-m", message],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-    )
+    try:
+        if present:
+            subprocess.run([*_GIT, "add", "-A", "--", *present], cwd=root, check=True, capture_output=True)
+        subprocess.run(
+            [*_GIT, "commit", "--only", "-m", message, "--", *files],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        subprocess.run([*_GIT, "reset", "-q", "--", *files], cwd=root, check=False, capture_output=True)
+        raise
     result = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
-        cwd=cwd,
+        cwd=root,
         capture_output=True,
         text=True,
         check=False,
     )
     return result.stdout.strip() or None
+
+
+def _process_error_text(exc: subprocess.CalledProcessError) -> str:
+    output = exc.stderr or exc.stdout or b""
+    text = output.decode(errors="replace") if isinstance(output, bytes) else str(output)
+    return _clip(text, 300) or str(exc)
 
 
 def _scenario_for_finding(
@@ -2244,7 +2250,9 @@ async def _fix_and_verify_finding(
         return
 
     all_changed = _git_changed_files(project_dir)
-    fixer_files = [f for f in all_changed if f not in preexisting_files]
+    fixer_files = [
+        f for f in all_changed if f not in preexisting_files and not _is_test_artifact(f)
+    ]
     if not fixer_files:
         finding.status = "open"
         finding.verification.append("Fixer produced no new file changes")
@@ -2292,7 +2300,21 @@ async def _fix_and_verify_finding(
             commit_hash = _commit_verified_finding(project_dir, finding, fixer_files)
         except subprocess.CalledProcessError as exc:
             commit_hash = None
-            finding.verification.append(f"Commit failed: {exc}")
+            error = _process_error_text(exc)
+            # Verification did pass, so the status stays; the fix is left
+            # unstaged in the worktree for the user to commit.
+            finding.verification.append(
+                f"Commit failed, fix left uncommitted ({_format_files_for_log(fixer_files)}): {error}"
+            )
+            _log(
+                "MANUAL_COMMIT_FAILED",
+                f"{finding.id}: commit failed, fix left uncommitted: {error}",
+                log_path,
+                audit_path,
+                finding_id=finding.id,
+                files=fixer_files,
+                error=error,
+            )
         if commit_hash:
             finding.fix_commits.append(commit_hash)
         save_manual_state(state, conductor_dir)

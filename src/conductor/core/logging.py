@@ -66,6 +66,7 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "MANUAL_FIX_SKIPPED": EventConfig("!", True),
     "MANUAL_INFRA_RETRY": EventConfig("⏳", True),
     "MANUAL_TEST_PAUSED": EventConfig("⏸", True),
+    "MANUAL_COMMIT_FAILED": EventConfig("✗", True),
     # Loop events
     "LOOP_START":        EventConfig("●",  True),
     "LOOP_DONE":         EventConfig("■",  True),
@@ -122,6 +123,7 @@ _COLOR_MAP: dict[str, str] = {
     "MANUAL_FIX_SKIPPED": _YELLOW,
     "MANUAL_INFRA_RETRY": _YELLOW,
     "MANUAL_TEST_PAUSED": _RED,
+    "MANUAL_COMMIT_FAILED": _RED,
     # Loop colors
     "LOOP_START": _CYAN_BOLD,
     "LOOP_DONE": _GREEN,
