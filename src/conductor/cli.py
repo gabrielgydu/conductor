@@ -1299,14 +1299,13 @@ def _cmd_validate(args):
         validate_and_fix,
         run_validation,
     )
+    from conductor.integration.merge import integration_worktree_path
 
-    # Determine project directory: integration worktree or repo root
+    # Determine project directory: the integration worktree while it exists
+    # (a merge in progress or interrupted), otherwise the given checkout
     project_dir = repo_path
     if state.integration and state.integration.branch:
-        if state.worktrees_base:
-            wt_path = Path(state.worktrees_base) / f"integration-{state.project_name}"
-        else:
-            wt_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
+        wt_path = integration_worktree_path(state, storage.repo_root)
         if wt_path.exists():
             project_dir = wt_path
 

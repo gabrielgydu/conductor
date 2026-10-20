@@ -98,6 +98,43 @@ def _get_conflicting_files(cwd: Path) -> list[str]:
     return [f for f in result.stdout.splitlines() if f.strip()]
 
 
+def integration_worktree_path(state: ConductorState, repo_root: Path) -> Path:
+    """Integration worktree location, next to the run worktrees.
+
+    Same base as orchestrator.create_worktree: state.worktrees_base, else
+    <repo_root.parent>/worktrees.
+    """
+    if state.worktrees_base:
+        base = Path(state.worktrees_base)
+    else:
+        base = Path(repo_root).parent / "worktrees"
+    return base / f"integration-{state.project_name}"
+
+
+async def _remove_worktree(wt: Path, repo_root: Path) -> None:
+    """Force-remove the integration worktree (non-fatal).
+
+    Runs after everything worth keeping was committed; what is left is check
+    output (test-results/ ...), which would make a plain remove fail.
+    """
+    try:
+        try:
+            _, leftover, _ = await _run_git(["status", "--porcelain"], wt)
+        except OSError:  # the worktree directory is already gone
+            leftover = ""
+        if leftover.strip():
+            logger.warning(
+                "Discarding uncommitted files in %s: %s",
+                wt,
+                ", ".join(line[3:] for line in leftover.splitlines()),
+            )
+        rc, _, err = await _run_git(["worktree", "remove", "--force", str(wt)], repo_root)
+        if rc != 0:
+            logger.warning("Failed to remove worktree %s: %s", wt, err.strip())
+    except Exception as e:
+        logger.warning("Exception removing worktree %s: %s", wt, e)
+
+
 # ---------------------------------------------------------------------------
 # DAG ordering
 # ---------------------------------------------------------------------------
@@ -217,11 +254,8 @@ async def run_integration_merge(
     eligible_runs = get_activation_order(state)
 
     branch_name = f"integration/{state.project_name}"
-    if state.worktrees_base:
-        worktree_path = Path(state.worktrees_base) / f"integration-{state.project_name}"
-    else:
-        worktree_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
     repo_root = Path(storage.repo_root)
+    worktree_path = integration_worktree_path(state, repo_root)
     _print(f"Starting integration merge: {len(eligible_runs)} runs → {branch_name}")
 
     if len(eligible_runs) < 2:
@@ -268,8 +302,20 @@ async def run_integration_merge(
                 branch=branch_name,
             )
 
-    wt = worktree_path
+    try:
+        return await _integrate(state, storage, worktree_path, branch_name, eligible_runs)
+    finally:
+        await _remove_worktree(worktree_path, repo_root)
 
+
+async def _integrate(
+    state: ConductorState,
+    storage,  # StorageResolver
+    wt: Path,
+    branch_name: str,
+    eligible_runs: list[RunState],
+) -> IntegrationState:
+    """Merge, validate, commit, push and open the PR inside worktree *wt*."""
     merged_runs: list[RunState] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
@@ -458,14 +504,6 @@ async def run_integration_merge(
                 logger.error("PR creation failed after 3 attempts for branch %s", branch_name)
     except Exception as e:
         logger.error("PR creation failed: %s", e)
-
-    # --- Cleanup worktree (non-fatal) ---
-    try:
-        rc, _, err = await _run_git(["worktree", "remove", str(wt)], repo_root)
-        if rc != 0:
-            logger.warning("Failed to remove worktree %s: %s", wt, err)
-    except Exception as e:
-        logger.warning("Exception removing worktree %s: %s", wt, e)
 
     if has_partial:
         final_status = IntegrationStatus.PARTIAL

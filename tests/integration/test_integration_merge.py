@@ -46,6 +46,15 @@ def _project_name(tmp_path: Path) -> str:
     return f"it{abs(hash(str(tmp_path))) % 999999:06d}"
 
 
+def _worktree_list(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
 def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
     """State whose integration worktree lives under tmp_path, not /tmp."""
     return ConductorState(
@@ -434,3 +443,51 @@ async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermeti
 
     assert show("app.txt") == "fixed\n"
     assert show("helper.txt") == "added by the fix\n"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Default worktree location; leftovers do not keep the worktree alive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_worktree_next_to_repo_is_removed_when_dirty(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    """Without worktrees_base the worktree goes beside the repo (not /tmp) and is
+    force-removed even though validation left check output behind."""
+    from conductor.core.validation import ValidationResult
+
+    real_merge_repo.create_branch("dw-a", {"dw_a.txt": "a\n"})
+    real_merge_repo.create_branch("dw-b", {"dw_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = ConductorState(
+        project_name=project_name,
+        base_branch="main",
+        runs=[
+            _done_run_with_branch(0, "feat-a", "dw-a"),
+            _done_run_with_branch(1, "feat-b", "dw-b"),
+        ],
+    )
+    expected = real_merge_repo.path.parent / "worktrees" / f"integration-{project_name}"
+    validated_in: list[Path] = []
+
+    async def validate_leaving_output(vctx, max_attempts):
+        validated_in.append(vctx.project_dir)
+        (vctx.project_dir / "test-results").mkdir()
+        (vctx.project_dir / "test-results" / "trace.zip").write_text("x")
+        return ValidationResult(passed=True, summary="1/1 checks passed")
+
+    hermetic_merge.validate.side_effect = validate_leaving_output
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert validated_in == [expected]
+    assert not expected.exists()
+    assert str(expected) not in _worktree_list(real_merge_repo.path)

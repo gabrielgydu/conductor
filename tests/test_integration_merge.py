@@ -10,6 +10,7 @@ import pytest
 from conductor.integration.merge import (
     _has_conflict_markers,
     _build_pr_body,
+    integration_worktree_path,
 )
 from conductor.core.models import (
     ConflictRecord,
@@ -51,6 +52,15 @@ def test_has_conflict_markers_true():
 def test_has_conflict_markers_false():
     content = "def foo():\n    return 42\n"
     assert _has_conflict_markers(content) is False
+
+
+def test_integration_worktree_path_sits_next_to_the_run_worktrees():
+    state = ConductorState(project_name="proj", base_branch="main")
+    assert integration_worktree_path(state, Path("/src/repo")) == Path(
+        "/src/worktrees/integration-proj"
+    )
+    state.worktrees_base = "/wt"
+    assert integration_worktree_path(state, Path("/src/repo")) == Path("/wt/integration-proj")
 
 
 def test_build_pr_body_no_conflicts():
