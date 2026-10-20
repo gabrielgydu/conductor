@@ -1630,6 +1630,8 @@ def _edit(repo: Path, content: str, name: str = "app/Foo.php"):
 @pytest.mark.asyncio
 async def test_retry_after_a_failed_fix_starts_clean_and_commits_the_reedited_file(tmp_path, monkeypatch):
     repo, conductor_dir, state, finding = _git_project(tmp_path)
+    (repo / "app/Foo.php").write_text("<?php // the user's own work\n", encoding="utf-8")
+    _git(repo, "stash", "push", "-q", "-m", "my work")
     prompts: list[str] = []
     calls = _script_generations(
         monkeypatch,
@@ -1650,7 +1652,12 @@ async def test_retry_after_a_failed_fix_starts_clean_and_commits_the_reedited_fi
     assert first.files == ["app/Foo.php"]
     assert first.stash
     assert manual_test._git_changed_files(repo) == []
-    assert "conductor manual-test: failed fix MT-001 attempt 1" in _git(repo, "stash", "list")
+    # Kept under its own ref: the user's `git stash pop` still gets their own work.
+    assert first.stash_ref == "refs/conductor/manual-test/checkout-manual/MT-001-attempt-1"
+    assert _git(repo, "rev-parse", first.stash_ref).strip() == first.stash
+    assert "wrong guess" in _git(repo, "stash", "show", "-p", "--include-untracked", first.stash)
+    stash_list = _git(repo, "stash", "list").splitlines()
+    assert len(stash_list) == 1 and stash_list[0].endswith(": my work")
     assert _audit_events(conductor_dir, "MANUAL_FIX_STASHED")[0]["stash"] == first.stash
 
     await _fix(repo, conductor_dir, state, finding, GREP_CHECK)
@@ -1663,7 +1670,7 @@ async def test_retry_after_a_failed_fix_starts_clean_and_commits_the_reedited_fi
     assert (repo / "app/Foo.php").read_text(encoding="utf-8") == "<?php // fixed\n"
     report = generate_manual_report(state)
     assert "  - fix attempt 1: Focused checks failed" in report
-    assert f"changes in stash {first.stash[:12]}" in report
+    assert f"changes in {first.stash_ref}" in report
 
 
 @pytest.mark.asyncio

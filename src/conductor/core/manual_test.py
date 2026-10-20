@@ -112,14 +112,20 @@ class ManualFixAttempt(BaseModel):
     outcome: str = ""
     # Files the fixer changed, relative to the repo root.
     files: list[str] = Field(default_factory=list)
-    # Stash commit holding a failed attempt's changes.
+    # Stash commit holding a failed attempt's changes, and the ref keeping it
+    # (off the user's stash list; empty if it could not be written).
     stash: str = ""
+    stash_ref: str = ""
     # Cut short by a paused run: not the fixer's failure, so it does not count.
     interrupted: bool = False
 
     @property
     def failed(self) -> bool:
         return bool(self.outcome) and not self.interrupted
+
+    @property
+    def stash_label(self) -> str:
+        return self.stash_ref or f"stash {self.stash[:12]}"
 
 
 class ManualFinding(BaseModel):
@@ -669,7 +675,7 @@ def generate_manual_report(state: ManualTestState) -> str:
             )
             for attempt in finding.fix_attempts:
                 if attempt.outcome:
-                    stash = f"; changes in stash {attempt.stash[:12]}" if attempt.stash else ""
+                    stash = f"; changes in {attempt.stash_label}" if attempt.stash else ""
                     lines.append(f"  - fix attempt {attempt.number}: {attempt.outcome}{stash}")
     else:
         lines.append("- none")
@@ -2034,8 +2040,13 @@ def _commit_verified_finding(
     return result.stdout.strip() or None
 
 
-def _stash_files(cwd: Path, files: list[str], message: str) -> str:
-    """Stash the changes to *files* (new files included); return the stash commit or ""."""
+def _stash_files(cwd: Path, files: list[str], message: str, ref: str) -> tuple[str, str]:
+    """Stash the changes to *files* (new files included) and keep the stash as *ref*.
+
+    Returns (stash commit, ref), or ("", "") when there was nothing to stash.
+    The stash then leaves the user's stash list, so their `git stash pop`
+    cannot apply it; if *ref* cannot be written it stays there (ref "").
+    """
     root = _git_root(cwd)
 
     def stash_head() -> str:
@@ -2056,7 +2067,19 @@ def _stash_files(cwd: Path, files: list[str], message: str) -> str:
         capture_output=True,
     )
     after = stash_head()
-    return after if after != before else ""
+    if after == before:
+        return "", ""
+    try:
+        subprocess.run(
+            ["git", "update-ref", "--create-reflog", "-m", message, ref, after],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return after, ""
+    subprocess.run(["git", "stash", "drop", "-q"], cwd=root, check=False, capture_output=True)
+    return after, ref
 
 
 def _process_error_text(exc: subprocess.CalledProcessError) -> str:
@@ -2722,16 +2745,19 @@ def _shelve_failed_fix(
     The fixer only runs on a tree without other changes, so its changes are
     exactly the non-artifact files that changed since. Stashing them gives
     the next attempt a clean tree (and later scenarios working code), keeps
-    the attempt recoverable, and lets the next fixer prompt point at it.
+    the attempt recoverable under refs/conductor/manual-test/ (not on the
+    user's stash list), and lets the next fixer prompt point at it.
     An interrupted attempt is reopened without counting against the limit.
     """
     if files:
         attempt.files = files
         try:
-            attempt.stash = _stash_files(
+            attempt.stash, attempt.stash_ref = _stash_files(
                 project_dir,
                 files,
                 f"conductor manual-test: failed fix {finding.id} attempt {attempt.number}",
+                f"refs/conductor/manual-test/{_safe_name(state.name)}/"
+                f"{_safe_name(finding.id)}-attempt-{attempt.number}",
             )
         except subprocess.CalledProcessError as exc:
             finding.verification.append(
@@ -2740,17 +2766,18 @@ def _shelve_failed_fix(
             )
         if attempt.stash:
             finding.verification.append(
-                f"Fix attempt {attempt.number} changes stashed as {attempt.stash[:12]} "
+                f"Fix attempt {attempt.number} changes stashed in {attempt.stash_label} "
                 f"({_format_files_for_log(files)})"
             )
             _log(
                 "MANUAL_FIX_STASHED",
-                f"{finding.id}: attempt {attempt.number} changes stashed as {attempt.stash[:12]}",
+                f"{finding.id}: attempt {attempt.number} changes stashed in {attempt.stash_label}",
                 log_path,
                 audit_path,
                 finding_id=finding.id,
                 attempt=attempt.number,
                 stash=attempt.stash,
+                ref=attempt.stash_ref,
                 files=files,
             )
     attempt.outcome = outcome
