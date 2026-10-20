@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
 
 from conductor.core.enums import IntegrationStatus, RunStatus
 from conductor.core.models import ConductorState, RunState, StageState
+from conductor.integration.e2e import generate_integration_tests as _real_generate
 from conductor.integration.merge import run_integration_merge
 
 # No real Claude / npx / gh-retry sleeps; see tests/integration/conftest.py.
@@ -848,3 +849,143 @@ async def test_validation_gets_the_uncommitted_project_preset(
     assert ".conductor/" not in files  # the worktree never had the preset
     ctx = hermetic_merge.validate.await_args.args[0]
     assert [c.name for c in ctx.preset.validation.checks] == ["api-tests"]
+
+
+# ---------------------------------------------------------------------------
+# Test 15: The integration worktree gets the main checkout's node packages
+# ---------------------------------------------------------------------------
+
+
+def _playwright_ready_main(repo: Path, gitignore: str | None) -> Path:
+    """Commit a playwright.config.ts (and *gitignore*) on main and install a stand-in
+    @playwright/test in the main checkout; returns its node_modules."""
+    git = ["git", "-C", str(repo)]
+    (repo / "playwright.config.ts").write_text("export default {};\n")
+    if gitignore is not None:
+        (repo / ".gitignore").write_text(gitignore)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "playwright setup"], check=True)
+    modules = repo / "node_modules"
+    (modules / "@playwright" / "test").mkdir(parents=True)
+    (modules / "@playwright" / "test" / "package.json").write_text("{}\n")
+    (modules / ".bin").mkdir()
+    (modules / ".bin" / "playwright").write_text("#!/bin/sh\n")
+    (modules / "vite").mkdir()
+    (modules / ".cache").mkdir()
+    return modules
+
+
+@pytest.mark.asyncio
+async def test_integration_specs_are_generated_with_the_main_checkout_packages(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """A fresh worktree has no node_modules, so the Playwright gate skipped spec
+    generation (and the specs) in every real integration."""
+    import conductor.integration.e2e as e2e_module
+    from conductor.core.claude import ClaudeResult
+    from conductor.core.smoke_test import playwright_unavailable
+    from conductor.core.validation import ValidationResult
+
+    modules = _playwright_ready_main(real_merge_repo.path, "node_modules/\n")
+    real_merge_repo.create_branch("pw-a", {"pw_a.txt": "a\n"})
+    real_merge_repo.create_branch("pw-b", {"pw_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "pw-a"),
+        _done_run_with_branch(1, "feat-b", "pw-b"),
+    )
+    wt = tmp_path / "worktrees" / f"integration-{project_name}"
+    generated_in: list[str] = []
+
+    async def claude_writes_spec(prompt, **kwargs):
+        generated_in.append(kwargs["cwd"])
+        spec = Path(kwargs["cwd"]) / e2e_module.INTEGRATION_SPECS[0]
+        spec.parent.mkdir(parents=True)
+        spec.write_text("// cross-feature spec\n")
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    seen_by_validation = {}
+
+    async def validate(vctx, max_attempts):
+        node_modules = vctx.project_dir / "node_modules"
+        seen_by_validation["gate"] = playwright_unavailable(vctx.project_dir)
+        seen_by_validation["entries"] = sorted(p.name for p in node_modules.iterdir())
+        seen_by_validation["real dirs"] = sorted(
+            p.name for p in node_modules.iterdir() if not p.is_symlink()
+        )
+        return ValidationResult(passed=True, summary="1/1 checks passed")
+
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", _real_generate)
+    monkeypatch.setattr(e2e_module, "run_claude", claude_writes_spec)
+    hermetic_merge.validate.side_effect = validate
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert generated_in == [str(wt)]
+    assert seen_by_validation == {
+        "gate": None,
+        "entries": [".bin", "@playwright", "vite"],  # no tool caches
+        "real dirs": [".bin", "@playwright"],
+    }
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:{e2e_module.INTEGRATION_SPECS[0]}")
+    files = _show(real_merge_repo, f"{branch}:").split()
+    assert not any(f.startswith("node_modules") for f in files)
+    # Removing the worktree removed the links, not the packages they point to.
+    assert not wt.exists()
+    assert (modules / "@playwright" / "test" / "package.json").is_file()
+    assert (modules / ".bin" / "playwright").is_file()
+
+
+def _commit_everything(cwd: Path) -> None:
+    subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cwd), "commit", "-qm", "fix"], check=True)
+
+
+@pytest.mark.asyncio
+async def test_node_modules_is_not_linked_where_git_would_commit_it(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """Without a node_modules ignore rule a Claude session's `git add -A` would put
+    the links on the branch."""
+    import conductor.integration.e2e as e2e_module
+    from conductor.core.validation import ValidationResult
+
+    _playwright_ready_main(real_merge_repo.path, gitignore=None)
+    real_merge_repo.create_branch("ni-a", {"ni_a.txt": "a\n"})
+    real_merge_repo.create_branch("ni-b", {"ni_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "ni-a"),
+        _done_run_with_branch(1, "feat-b", "ni-b"),
+    )
+    claude = AsyncMock()
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", _real_generate)
+    monkeypatch.setattr(e2e_module, "run_claude", claude)
+
+    async def fix_session_commits_everything(vctx, max_attempts):
+        (vctx.project_dir / "fix.txt").write_text("fix\n")
+        _commit_everything(vctx.project_dir)
+        return ValidationResult(passed=True, summary="1/1 checks passed", fix_attempts=1)
+
+    hermetic_merge.validate.side_effect = fix_session_commits_everything
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.merged_runs == [0, 1]
+    files = _show(real_merge_repo, f"integration/{project_name}:").split()
+    assert "fix.txt" in files
+    assert not any(f.startswith("node_modules") for f in files)
+    claude.assert_not_awaited()  # still no @playwright/test: generation skipped

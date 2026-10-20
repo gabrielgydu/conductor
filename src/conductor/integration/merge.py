@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import subprocess
 from collections import deque
 from collections.abc import Sequence
@@ -138,6 +139,46 @@ async def _remove_worktree(wt: Path, repo_root: Path) -> None:
             logger.warning("Failed to remove worktree %s: %s", wt, err.strip())
     except Exception as e:
         logger.warning("Exception removing worktree %s: %s", wt, e)
+
+
+async def _link_node_modules(repo_root: Path, wt: Path) -> None:
+    """Make the main checkout's installed node packages resolvable in *wt*.
+
+    The integration worktree is a fresh checkout, so without this the
+    Playwright gate (smoke_test.playwright_unavailable) always closes and the
+    integration specs and generated smoke test never run. wt/node_modules is
+    a real directory of per-package symlinks rather than one symlink: an
+    ignore pattern written as `node_modules/` does not match a symlink, and
+    an `npm install` by a fix session then replaces links in the worktree
+    instead of deleting or writing packages in the main checkout. Scope
+    directories and .bin are linked entry by entry for the same reason;
+    other dot entries (tool caches, npm's hidden lockfile) are left out.
+    """
+    src, dst = repo_root / "node_modules", wt / "node_modules"
+    if not src.is_dir() or dst.exists() or dst.is_symlink():
+        return
+    try:
+        dst.mkdir()
+        for entry in src.iterdir():
+            if entry.name.startswith("@") or entry.name == ".bin":
+                (dst / entry.name).mkdir()
+                for sub in entry.iterdir():
+                    (dst / entry.name / sub.name).symlink_to(sub)
+            elif not entry.name.startswith("."):
+                (dst / entry.name).symlink_to(entry)
+    except OSError as exc:
+        logger.warning("Linking %s into %s failed: %s", src, wt, exc)
+        shutil.rmtree(dst, ignore_errors=True)
+        return
+    # A Claude session's `git add -A` would put unignored links on the branch.
+    _, untracked, _ = await _run_git(
+        ["ls-files", "--others", "--exclude-standard", "--directory", "--", "node_modules"], wt
+    )
+    if untracked.strip():
+        shutil.rmtree(dst, ignore_errors=True)
+        logger.warning("Not linking %s: node_modules is not gitignored in %s", src, wt)
+        return
+    _print(f"Linked the packages in {src} into the worktree")
 
 
 async def _runs_touching(path: str, runs: list[RunState], start: str, cwd: Path) -> list[str]:
@@ -370,13 +411,16 @@ async def run_integration_merge(
         preset = None
 
     try:
-        return await _integrate(state, worktree_path, branch_name, eligible_runs, preset)
+        return await _integrate(
+            state, repo_root, worktree_path, branch_name, eligible_runs, preset
+        )
     finally:
         await _remove_worktree(worktree_path, repo_root)
 
 
 async def _integrate(
     state: ConductorState,
+    repo_root: Path,
     wt: Path,
     branch_name: str,
     eligible_runs: list[RunState],
@@ -498,6 +542,9 @@ async def _integrate(
             branch=branch_name,
             conflicts_unresolved=conflicts_unresolved,
         )
+
+    # Generation and the Playwright checks below need the project's packages.
+    await _link_node_modules(repo_root, wt)
 
     # --- Integration E2E tests: generated once here, run by validation ---
     from conductor.integration.e2e import generate_integration_tests
