@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,19 +92,21 @@ Output ONLY a markdown checklist. No preamble, no explanation. Each line:
 """
 
 
-def _extract_text_from_result(output: str) -> str:
-    """Extract assistant text content from stream-json output."""
-    text_parts = []
+def _stream_events(output: str) -> Iterator[dict]:
+    """Yield the JSON objects in stream-json *output*, skipping anything else."""
     for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
-            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def _extract_text_from_result(output: str) -> str:
+    """Extract assistant text content from stream-json output."""
+    text_parts = []
+    for event in _stream_events(output):
         if event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -220,6 +223,28 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
 # ---------------------------------------------------------------------------
 # Claude output parsing
 # ---------------------------------------------------------------------------
+
+
+def session_reached_model(output: str) -> bool:
+    """True if the session got at least one real assistant message.
+
+    False means Claude never got to work: empty output (claude or
+    stream_filter did not start) or only the synthetic message the CLI
+    emits for an API error such as an unknown model, an expired login or a
+    usage limit (flagged ``is_api_error_message``).
+    """
+    return any(
+        e.get("type") == "assistant" and not e.get("is_api_error_message")
+        for e in _stream_events(output)
+    )
+
+
+def session_error(output: str) -> str:
+    """The error the CLI reported in the session's result event, if any."""
+    for event in _stream_events(output):
+        if event.get("type") == "result" and event.get("is_error"):
+            return str(event.get("result") or event.get("subtype") or "")
+    return ""
 
 
 def check_output_for_signal(output: str) -> str | None:
@@ -401,6 +426,8 @@ async def _wait_for_exit(
 
 # Sessions a task gets before it is marked failed and the loop moves on
 _MAX_ATTEMPTS_PER_TASK = 3
+# Sessions in a row in which Claude produced nothing before the loop stops
+_MAX_EMPTY_SESSIONS = 2
 
 
 def _fail_task(
@@ -481,7 +508,14 @@ class _SessionFiles:
 
 def run_loop_in_tmux(state: LoopState, project_dir: Path, storage: StorageResolver) -> None:
     """Main loop — runs inside tmux. Invokes Claude CLI sessions sequentially."""
-    asyncio.run(_loop_main(state, project_dir, storage))
+    try:
+        asyncio.run(_loop_main(state, project_dir, storage))
+    except Exception:
+        # Don't leave LOOP-STATE.json saying "running" for a loop that died
+        state.status = "failed"
+        state.updated_at = datetime.now(timezone.utc)
+        atomic_save(state, storage.conductor_dir(state.name) / "LOOP-STATE.json")
+        raise
 
 
 async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolver) -> None:
@@ -512,11 +546,14 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
 
     _log("LOOP_START", f"Starting loop: {state.name}, {len(state.tasks)} tasks", log_path, audit_path)
 
-    max_sessions = len(state.tasks) * 3  # Safety cap: 3 sessions per task max
-    session_num = 0
+    # Every session either finishes its task or uses one of its
+    # _MAX_ATTEMPTS_PER_TASK attempts; sessions in which Claude never ran
+    # don't count against the task, but _MAX_EMPTY_SESSIONS of them in a
+    # row stop the loop.
+    empty_sessions = 0
+    stop_reason = ""
 
-    while state.current_task_index < len(state.tasks) and session_num < max_sessions:
-        session_num += 1
+    while state.current_task_index < len(state.tasks):
         task = state.tasks[state.current_task_index]
 
         if task.status == "completed":
@@ -572,8 +609,23 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
 
         # Check for task signal
         signal = check_output_for_signal(output_text)
+        reached_model = session_reached_model(output_text)
+        empty_sessions = 0 if reached_model else empty_sessions + 1
 
-        if signal == "completed":
+        if not reached_model:
+            # Login, model, usage limit or launch problem: not the task's fault
+            task.attempts -= 1
+            why = session_error(output_text) or files.stderr_tail() or f"no output, see {log_file}"
+            _log(
+                "NO_SIGNAL",
+                f"Session {state.session_count}: Claude produced no output (exit {exit_code}): {why}",
+                log_path, audit_path, task_index=task.index,
+            )
+            if empty_sessions >= _MAX_EMPTY_SESSIONS:
+                stop_reason = f"{empty_sessions} sessions in a row without Claude output: {why}"
+                _log("FAILURE", f"Stopping loop: {stop_reason}", log_path, audit_path)
+
+        elif signal == "completed":
             _log("TASK_SIGNAL", f"Task {task.index} signaled completed", log_path, audit_path)
 
             try:
@@ -612,7 +664,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
             # No signal — context exhaustion or crash
             _log(
                 "NO_SIGNAL",
-                f"Session ended without signal (exit {exit_code}). Will restart.",
+                f"Session ended without signal (exit {exit_code}).",
                 log_path, audit_path,
             )
             try:
@@ -631,6 +683,8 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
             else:
                 if partial_hash:
                     _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
+            if task.attempts >= _MAX_ATTEMPTS_PER_TASK:
+                _fail_task(state, task, "no completion signal", log_path, audit_path)
 
         # Save state after each session
         state.updated_at = datetime.now(timezone.utc)
@@ -638,24 +692,36 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
 
         files.remove()
 
+        if stop_reason:
+            break
+
     # Done
     completed = sum(1 for t in state.tasks if t.status == "completed")
     failed = sum(1 for t in state.tasks if t.status == "failed")
-    state.status = "completed" if failed == 0 else "failed"
+    # Anything short of every task done is a failed loop, not a completed one
+    state.status = "completed" if completed == len(state.tasks) else "failed"
     state.updated_at = datetime.now(timezone.utc)
     atomic_save(state, state_path)
 
     _log(
         "LOOP_DONE",
-        f"Loop finished: {completed}/{len(state.tasks)} completed, {failed} failed",
+        f"Loop finished: {completed}/{len(state.tasks)} completed, {failed} failed"
+        + (f" (stopped: {stop_reason})" if stop_reason else ""),
         log_path, audit_path,
     )
 
     # Print clear completion banner
     sep = "═" * 50
+    title = "LOOP COMPLETE" if state.status == "completed" else "LOOP FAILED"
     print(f"\n{sep}", file=sys.stderr)
-    print(f"  LOOP COMPLETE: {state.name}", file=sys.stderr)
+    print(f"  {title}: {state.name}", file=sys.stderr)
     print(f"  {completed}/{len(state.tasks)} tasks done, {failed} failed", file=sys.stderr)
+    if stop_reason:
+        print(f"  Stopped: {stop_reason}", file=sys.stderr)
+        print(
+            f"  Fix the cause, then resume: conductor loop --name {state.name} --project-dir {project_dir}",
+            file=sys.stderr,
+        )
     if state.branch:
         print(f"  Branch: {state.branch}", file=sys.stderr)
     print(f"{sep}\n", file=sys.stderr)

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from conductor.core.loop import LoopState, _loop_main, parse_checklist
+from conductor.core.loop import LoopState, _loop_main, parse_checklist, run_loop_in_tmux
 from conductor.core.storage import StorageResolver
 
 _FAKE_CLAUDE_PY = r'''
@@ -273,3 +273,83 @@ async def test_commit_that_keeps_failing_fails_the_task(repo, claude, tmux):
     assert saved.tasks[0].attempts == 3
     assert "TASK_FAILED" in [e["event"] for e in events]
     assert len(claude.calls) >= 4  # the loop moved on to the second task
+
+
+# -- sessions without a signal, final status --------------------------------
+
+TWO_TASKS = ONE_TASK + "- [ ] **Second** — another task\n"
+
+
+async def test_task_without_signal_fails_after_three_sessions(repo, claude, tmux):
+    """No-signal sessions used to retry the same task until 3*N sessions, then report 'completed'."""
+    claude.script([
+        {"events": [say("working")], "write": {"notes.txt": "1\n"}},
+        {"events": [say("working")], "write": {"notes.txt": "2\n"}},
+        {"events": [say("working")], "write": {"notes.txt": "3\n"}},
+        {"events": [say("<task-completed/>")], "write": {"second.txt": "x\n"}},
+    ])
+
+    saved, events = await run_loop(make_state(repo, TWO_TASKS), repo)
+
+    assert [(t.status, t.attempts) for t in saved.tasks] == [("failed", 3), ("completed", 1)]
+    assert saved.status == "failed"
+    assert _git(repo, "log", "--format=%s").splitlines()[1:4] == ["WIP: Add notes"] * 3
+    (done,) = [e for e in events if e["event"] == "LOOP_DONE"]
+    assert "1/2 completed, 1 failed" in done["message"]
+
+
+async def test_loop_stops_when_claude_never_runs(repo, claude, tmux):
+    """An expired login fails every session instantly; that must not burn or fail the tasks."""
+    claude.script([{"stderr": "Invalid API key · Please run /login", "exit": 1}])
+
+    saved, events = await run_loop(make_state(repo, TWO_TASKS), repo)
+
+    assert len(claude.calls) == 2
+    assert [(t.status, t.attempts) for t in saved.tasks] == [("in_progress", 0), ("pending", 0)]
+    assert saved.status == "failed"
+    (failure,) = [e for e in events if e["event"] == "FAILURE"]
+    assert "Invalid API key" in failure["message"]
+
+
+async def test_api_error_session_counts_as_claude_not_running(repo, claude, tmux):
+    """The CLI reports an unknown model as a synthetic assistant message plus an error result."""
+    error = "There's an issue with the selected model (claude-nope). It may not exist."
+    claude.script([{"events": [
+        say(error, is_api_error_message=True, error="model_not_found"),
+        {"type": "result", "subtype": "success", "is_error": True, "result": error},
+    ], "exit": 1}])
+
+    saved, events = await run_loop(make_state(repo, ONE_TASK, model="claude-nope"), repo)
+
+    assert len(claude.calls) == 2
+    assert saved.tasks[0].attempts == 0
+    (failure,) = [e for e in events if e["event"] == "FAILURE"]
+    assert error in failure["message"]
+
+
+async def test_one_empty_session_is_retried(repo, claude, tmux):
+    claude.script([
+        {"exit": 1},
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "n\n"}},
+    ])
+
+    saved, _ = await run_loop(make_state(repo, ONE_TASK), repo)
+
+    assert (saved.status, saved.tasks[0].status, saved.tasks[0].attempts) == ("completed", "completed", 1)
+
+
+def test_crashed_loop_is_not_left_running(repo, claude, tmux, monkeypatch):
+    async def boom(self, *args, **kwargs):
+        raise RuntimeError("tmux went away")
+
+    monkeypatch.setattr(BashTmux, "spawn_in_window", boom)
+    state = make_state(repo, ONE_TASK)
+    storage = StorageResolver(repo)
+
+    with pytest.raises(RuntimeError, match="tmux went away"):
+        run_loop_in_tmux(state, repo, storage)
+
+    saved = LoopState.model_validate_json(
+        (storage.conductor_dir("fix") / "LOOP-STATE.json").read_text()
+    )
+    assert saved.status == "failed"
