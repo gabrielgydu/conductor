@@ -35,19 +35,15 @@ SAMPLE_EVENT_TYPES = ["system", "assistant", "user", "rate_limit_event", "assist
 def make_mock_proc(
     stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readline_lines=None
 ):
-    """Build a mock asyncio subprocess.
-
-    Supports both run_claude paths: communicate() (on_event=None) and the
-    default streaming path (stdin write/drain/close/wait_closed, then
-    stdout.readline with stderr.read drained in the background).
+    """Build a mock asyncio subprocess for run_claude: stdin write/drain/
+    close/wait_closed, stdout.readline, and stderr.read drained to EOF.
     """
     proc = MagicMock()
     proc.returncode = returncode
 
-    # communicate() returns (stdout, stderr)
-    proc.communicate = AsyncMock(return_value=(stdout_bytes, b""))
     proc.wait = AsyncMock(return_value=returncode)
     proc.kill = MagicMock()
+    proc.terminate = MagicMock()
 
     # stdin
     stdin = MagicMock()
@@ -58,8 +54,7 @@ def make_mock_proc(
     stdin.is_closing = MagicMock(return_value=False)
     proc.stdin = stdin
 
-    # stdout — line by line for streaming use. By default it yields the same
-    # bytes communicate() returns, so both run_claude paths see one output.
+    # stdout — line by line
     if readline_lines is None:
         readline_lines = stdout_bytes.splitlines(keepends=True)
     stdout = MagicMock()
@@ -71,7 +66,7 @@ def make_mock_proc(
     stdout.readline = readline
     proc.stdout = stdout
 
-    # stderr — drained in the background by the streaming path
+    # stderr — drained in the background
     stderr = MagicMock()
     stderr.read = AsyncMock(return_value=b"")
     proc.stderr = stderr
@@ -101,13 +96,13 @@ async def test_run_claude_basic():
 
 
 @pytest.mark.asyncio
-async def test_run_claude_without_streaming():
-    """on_event=None keeps the non-streaming communicate() path."""
+async def test_run_claude_without_streaming(capsys):
+    """on_event=None reads the same output but prints no progress."""
     proc = make_mock_proc()
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_claude("Say hello", on_event=None)
-    proc.communicate.assert_awaited_once_with(b"Say hello")
-    proc.stdin.write.assert_not_called()
+    proc.stdin.write.assert_called_once_with(b"Say hello")
+    assert capsys.readouterr().err == ""
     assert result.exit_code == 0
     assert result.output == SAMPLE_STREAM_JSON_OUTPUT.decode()
     assert result.tokens_used["input_tokens"] == 4
@@ -225,7 +220,6 @@ async def test_run_claude_prompt_via_stdin():
     proc.stdin.write.assert_called_once_with(b"my prompt text")
     proc.stdin.close.assert_called_once()
     proc.stdin.wait_closed.assert_awaited_once()
-    proc.communicate.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -249,6 +243,128 @@ async def test_run_claude_exits_before_reading_prompt(tmp_path, monkeypatch, on_
     assert result.exit_code == 3
     assert result.output == ""
     assert result.tokens_used is None
+
+
+def install_fake_claude(tmp_path, monkeypatch, script: str) -> Path:
+    """Put a shell-script `claude` first on PATH; returns its pid file.
+
+    The script runs with $PIDFILE set; scripts that block `exec` into the
+    blocking command so the CLI's pid is the one that has to be stopped.
+    """
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\n" + script)
+    fake.chmod(0o755)
+    pidfile = tmp_path / "claude.pid"
+    monkeypatch.setenv("PIDFILE", str(pidfile))
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    return pidfile
+
+
+def assert_reaped(pidfile: Path) -> None:
+    pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # killed *and* reaped: not even a zombie is left
+
+
+_HANGING_CLAUDE = """\
+cat >/dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
+echo $$ > "$PIDFILE"
+exec sleep 30
+"""
+
+
+@pytest.mark.asyncio
+async def test_run_claude_timeout_stops_the_cli(tmp_path, monkeypatch):
+    pidfile = install_fake_claude(tmp_path, monkeypatch, _HANGING_CLAUDE)
+    result = await asyncio.wait_for(run_claude("hi", on_event=None, timeout_s=0.5), timeout=10)
+    assert result.timed_out and result.failed
+    assert result.exit_code != 0
+    assert '"text":"working"' in result.output  # output up to the timeout is kept
+    assert result.result_event is None
+    assert_reaped(pidfile)
+
+
+@pytest.mark.asyncio
+async def test_run_claude_cancel_stops_the_cli(tmp_path, monkeypatch):
+    """Cancelling the coroutine used to leave claude running, orphaned."""
+    pidfile = install_fake_claude(tmp_path, monkeypatch, _HANGING_CLAUDE)
+    task = asyncio.create_task(run_claude("hi", on_event=None))
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
+    assert_reaped(pidfile)
+
+
+class _Abort(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_run_claude_error_stops_the_cli(tmp_path, monkeypatch):
+    pidfile = install_fake_claude(tmp_path, monkeypatch, _HANGING_CLAUDE)
+
+    def abort(event):
+        raise _Abort()
+
+    with pytest.raises(_Abort):
+        await asyncio.wait_for(run_claude("hi", on_event=abort), timeout=10)
+    assert_reaped(pidfile)
+
+
+@pytest.mark.asyncio
+async def test_run_claude_survives_a_failing_callback(capsys):
+    """A bug in a progress printer must not cost the session's result."""
+    calls = []
+
+    def flaky(event):
+        calls.append(event["type"])
+        raise AttributeError("'NoneType' object has no attribute 'get'")
+
+    proc = make_mock_proc()
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=flaky)
+    assert calls == SAMPLE_EVENT_TYPES  # still called for every event
+    assert result.subtype == "success" and result.cost == 0.00152329
+    assert capsys.readouterr().err.count("on_event callback failed") == 1
+
+
+@pytest.mark.asyncio
+async def test_run_claude_keeps_stderr_tail(tmp_path, monkeypatch):
+    install_fake_claude(tmp_path, monkeypatch, """\
+cat >/dev/null
+head -c 10000 /dev/zero | tr '\\0' x >&2
+echo '[claude-code:unrecognized_model] {"model":"nope"}' >&2
+exit 1
+""")
+    result = await asyncio.wait_for(run_claude("hi", on_event=None), timeout=10)
+    assert result.exit_code == 1 and result.failed
+    assert len(result.stderr) == 4096
+    assert result.stderr.endswith('[claude-code:unrecognized_model] {"model":"nope"}\n')
+    assert result.stderr.startswith("xxx")
+
+
+@pytest.mark.asyncio
+async def test_run_claude_skips_a_line_over_the_stream_limit(tmp_path, monkeypatch):
+    """An oversized line used to raise ValueError and abandon the session."""
+    import conductor.core.claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_STREAM_LIMIT", 4096)
+    fixture = STREAM_JSON_FIXTURES / "success.jsonl"
+    install_fake_claude(tmp_path, monkeypatch, f"""\
+cat >/dev/null
+printf '{{"type":"user","message":{{"content":"%s"}}}}\\n' "$(head -c 20000 /dev/zero | tr '\\0' y)"
+cat '{fixture}'
+""")
+    result = await asyncio.wait_for(run_claude("hi", on_event=None), timeout=10)
+    assert result.exit_code == 0
+    assert result.subtype == "success" and result.cost == 0.00152329
+    # The oversized line is dropped; at most a non-JSON tail fragment of it remains.
+    assert "y" * 4096 not in result.output
 
 
 @pytest.mark.asyncio

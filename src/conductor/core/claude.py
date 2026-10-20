@@ -169,6 +169,11 @@ class ClaudeResult:
     duration: float
     # The stream-json `result` event (the last one), or None if none arrived.
     result_event: dict | None = None
+    # The last few KB of the CLI's stderr. Worth logging on a failure, though
+    # the CLI reports most errors (auth, unknown model) in the result event.
+    stderr: str = ""
+    # True when run_claude's timeout_s expired and the CLI was stopped.
+    timed_out: bool = False
 
     @property
     def is_error(self) -> bool:
@@ -181,8 +186,8 @@ class ClaudeResult:
 
     @property
     def failed(self) -> bool:
-        """True when the run did not succeed: a non-zero exit or an error result."""
-        return self.exit_code != 0 or self.is_error
+        """True when the run did not succeed: non-zero exit, error result or timeout."""
+        return self.exit_code != 0 or self.is_error or self.timed_out
 
     @property
     def subtype(self) -> str | None:
@@ -219,6 +224,94 @@ def _tokens_used(result_event: dict | None) -> dict[str, int] | None:
     }
 
 
+# Max bytes per stdout line: stream-json lines carry whole tool results.
+_STREAM_LIMIT = 10 * 1024 * 1024
+# How much of the CLI's stderr a ClaudeResult keeps.
+_STDERR_TAIL_BYTES = 4096
+# How long a terminated CLI gets to exit before it is killed.
+_TERMINATE_GRACE_S = 5.0
+
+
+async def _write_prompt(proc: asyncio.subprocess.Process, prompt: str) -> None:
+    """Write the prompt to stdin and close it.
+
+    Like communicate(), ignore a broken pipe: if claude exits before reading
+    its whole prompt (bad flag, auth failure), its exit code reports that.
+    """
+    try:
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    proc.stdin.close()
+    try:
+        await proc.stdin.wait_closed()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+async def _drain_stderr(proc: asyncio.subprocess.Process, tail: bytearray) -> None:
+    """Read stderr to EOF so the CLI never blocks on it, keeping the last bytes."""
+    while chunk := await proc.stderr.read(4096):
+        tail += chunk
+        del tail[:-_STDERR_TAIL_BYTES]
+
+
+async def _read_stdout(
+    proc: asyncio.subprocess.Process,
+    lines: list[str],
+    on_event: Callable[[dict], None] | None,
+) -> None:
+    """Collect stdout lines until EOF, handing each JSON object to on_event."""
+    callback_failed = False
+    while True:
+        try:
+            raw = await proc.stdout.readline()
+        except ValueError:
+            # A line over _STREAM_LIMIT. readline() has discarded what it had
+            # buffered; the rest of that line may come back as a non-JSON
+            # fragment, which every consumer skips. Carry on rather than lose
+            # the session.
+            sys.stderr.write(f"run_claude: skipped a stdout line over {_STREAM_LIMIT} bytes\n")
+            continue
+        if not raw:
+            return
+        line = raw.decode("utf-8", errors="replace")
+        lines.append(line)
+        stripped = line.strip()
+        if on_event is None or not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        try:
+            on_event(event)
+        except Exception as exc:
+            # Progress output is best effort; it must not cost the session.
+            if not callback_failed:
+                callback_failed = True
+                sys.stderr.write(f"run_claude: on_event callback failed, continuing: {exc!r}\n")
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    """Stop the CLI if it is still running (SIGTERM, then SIGKILL) and reap it."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), _TERMINATE_GRACE_S)
+            return
+        except TimeoutError:
+            proc.kill()
+    except ProcessLookupError:
+        pass  # exited on its own in the meantime
+    await proc.wait()
+
+
 async def run_claude(
     prompt: str,
     *,
@@ -228,11 +321,18 @@ async def run_claude(
     append_args: list[str] | None = None,
     cwd: str | None = None,
     on_event: Callable[[dict], None] | object = _USE_DEFAULT,
+    timeout_s: float | None = None,
 ) -> ClaudeResult:
     """Run claude CLI non-interactively, passing prompt via stdin.
 
     By default, streams live progress to stderr (tool calls, text, context usage).
-    Pass on_event=None to suppress output, or a custom callback.
+    Pass on_event=None to suppress output, or a custom callback; an exception in
+    the callback is reported once and does not stop the run.
+
+    timeout_s bounds the whole run. When it expires the CLI is stopped and the
+    result has timed_out=True, a non-zero exit code and the output so far.
+    However run_claude ends (returns, raises or is cancelled), the CLI process
+    has been stopped and reaped by then.
     """
     # Resolve sentinel to default progress printer
     if on_event is _USE_DEFAULT:
@@ -258,60 +358,37 @@ async def run_claude(
         stderr=PIPE,
         cwd=cwd,
         close_fds=True,
-        limit=10 * 1024 * 1024,  # 10MB line buffer (Claude JSON lines can be large)
+        limit=_STREAM_LIMIT,
     )
 
-    if on_event is None:
-        # Original non-streaming path
-        stdout_bytes, _stderr_bytes = await proc.communicate(prompt.encode("utf-8"))
-        duration = time.monotonic() - start
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-    else:
-        # Streaming path: write prompt, close stdin, then read stdout line by line.
-        # Like communicate(), ignore a broken stdin pipe: if claude exits before
-        # reading its whole prompt (bad flag, auth failure), report its exit code
-        # instead of raising BrokenPipeError.
+    lines: list[str] = []
+    stderr_tail = bytearray()
+    timed_out = False
+    # Feed stdin while reading stdout and stderr, so no pipe can fill up and
+    # deadlock whatever order the CLI reads and writes in.
+    io_tasks = [
+        asyncio.create_task(_write_prompt(proc, prompt)),
+        asyncio.create_task(_drain_stderr(proc, stderr_tail)),
+        asyncio.create_task(_read_stdout(proc, lines, on_event)),
+    ]
+    try:
+        async with asyncio.timeout(timeout_s) as deadline:
+            await asyncio.gather(*io_tasks)
+            await proc.wait()
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        timed_out = True
+    finally:
         try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        proc.stdin.close()
-        try:
-            await proc.stdin.wait_closed()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            await _stop(proc)
+        finally:
+            for task in io_tasks:
+                task.cancel()
+            await asyncio.gather(*io_tasks, return_exceptions=True)
+    duration = time.monotonic() - start
 
-        # Drain stderr in background to avoid pipe deadlock
-        async def _drain_stderr():
-            while True:
-                chunk = await proc.stderr.read(4096)
-                if not chunk:
-                    break
-
-        stderr_task = asyncio.create_task(_drain_stderr())
-
-        lines: list[str] = []
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace")
-            lines.append(line)
-            stripped = line.strip()
-            if stripped:
-                try:
-                    event = json.loads(stripped)
-                    if isinstance(event, dict):
-                        on_event(event)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-        await stderr_task
-        await proc.wait()
-        duration = time.monotonic() - start
-        stdout_text = "".join(lines)
-
+    stdout_text = "".join(lines)
     result_event = find_result_event(stdout_text)
 
     return ClaudeResult(
@@ -321,6 +398,8 @@ async def run_claude(
         cost=result_cost_usd(result_event),
         duration=duration,
         result_event=result_event,
+        stderr=stderr_tail.decode("utf-8", errors="replace"),
+        timed_out=timed_out,
     )
 
 
