@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,7 +24,12 @@ SAMPLE_STREAM_JSON_OUTPUT = b"".join(SAMPLE_STREAM_JSON_LINES)
 def make_mock_proc(
     stdout_bytes=SAMPLE_STREAM_JSON_OUTPUT, returncode=0, readline_lines=None
 ):
-    """Build a mock asyncio subprocess."""
+    """Build a mock asyncio subprocess.
+
+    Supports both run_claude paths: communicate() (on_event=None) and the
+    default streaming path (stdin write/drain/close/wait_closed, then
+    stdout.readline with stderr.read drained in the background).
+    """
     proc = MagicMock()
     proc.returncode = returncode
 
@@ -37,19 +43,27 @@ def make_mock_proc(
     stdin.write = MagicMock()
     stdin.drain = AsyncMock()
     stdin.close = MagicMock()
+    stdin.wait_closed = AsyncMock()
     stdin.is_closing = MagicMock(return_value=False)
     proc.stdin = stdin
 
-    # stdout — for streaming use
-    if readline_lines is not None:
-        stdout = MagicMock()
-        lines_iter = iter(readline_lines + [b""])
+    # stdout — line by line for streaming use. By default it yields the same
+    # bytes communicate() returns, so both run_claude paths see one output.
+    if readline_lines is None:
+        readline_lines = stdout_bytes.splitlines(keepends=True)
+    stdout = MagicMock()
+    lines_iter = iter(readline_lines + [b""])
 
-        async def readline():
-            return next(lines_iter)
+    async def readline():
+        return next(lines_iter)
 
-        stdout.readline = readline
-        proc.stdout = stdout
+    stdout.readline = readline
+    proc.stdout = stdout
+
+    # stderr — drained in the background by the streaming path
+    stderr = MagicMock()
+    stderr.read = AsyncMock(return_value=b"")
+    proc.stderr = stderr
 
     return proc
 
@@ -66,9 +80,56 @@ async def test_run_claude_basic():
         result = await run_claude("Say hello")
     assert isinstance(result, ClaudeResult)
     assert result.exit_code == 0
+    assert result.output == SAMPLE_STREAM_JSON_OUTPUT.decode()
     assert result.tokens_used is not None
     assert result.tokens_used["input_tokens"] == 1000
     assert result.tokens_used["output_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_claude_without_streaming():
+    """on_event=None keeps the non-streaming communicate() path."""
+    proc = make_mock_proc()
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("Say hello", on_event=None)
+    proc.communicate.assert_awaited_once_with(b"Say hello")
+    proc.stdin.write.assert_not_called()
+    assert result.exit_code == 0
+    assert result.output == SAMPLE_STREAM_JSON_OUTPUT.decode()
+    assert result.tokens_used["input_tokens"] == 1000
+    assert result.tokens_used["output_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_claude_streams_events_to_callback():
+    lines = [
+        b'{"type":"system","subtype":"init","model":"claude-opus-4-8"}\n',
+        b"not-json\n",
+        b"\n",
+        b'["not", "a", "dict"]\n',
+        *SAMPLE_STREAM_JSON_LINES,
+    ]
+    proc = make_mock_proc(readline_lines=lines)
+    events = []
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=events.append)
+    # only JSON objects reach the callback, in stream order
+    assert [e["type"] for e in events] == ["system", "assistant", "result"]
+    # raw output keeps every line, including the ones that were not events
+    assert result.output == b"".join(lines).decode()
+    assert result.tokens_used["output_tokens"] == 500
+
+
+@pytest.mark.asyncio
+async def test_run_claude_default_prints_progress(capsys):
+    lines = [
+        b'{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}\n',
+        *SAMPLE_STREAM_JSON_LINES,
+    ]
+    proc = make_mock_proc(readline_lines=lines)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        await run_claude("hi")
+    assert "Bash: ls -la" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
@@ -91,12 +152,15 @@ async def test_run_claude_prompt_via_stdin():
         "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
     ) as mock_exec:
         await run_claude("my prompt text")
-    # prompt must NOT appear in command args
+    # prompt must NOT appear in command args; claude reads it from stdin ("-p -")
     call_args = mock_exec.call_args[0]
     assert "my prompt text" not in call_args
-    # must be passed via communicate stdin
-    communicate_call = proc.communicate.call_args
-    assert communicate_call[0][0] == b"my prompt text"
+    assert call_args[call_args.index("-p") + 1] == "-"
+    # streaming path writes the prompt to stdin, then closes it so claude sees EOF
+    proc.stdin.write.assert_called_once_with(b"my prompt text")
+    proc.stdin.close.assert_called_once()
+    proc.stdin.wait_closed.assert_awaited_once()
+    proc.communicate.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -105,6 +169,21 @@ async def test_run_claude_nonzero_exit():
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_claude("fail")
     assert result.exit_code == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_event", [None, lambda event: None], ids=["communicate", "streaming"])
+async def test_run_claude_exits_before_reading_prompt(tmp_path, monkeypatch, on_event):
+    """claude dying before it reads stdin (bad flag, not logged in) must surface
+    as its exit code, not as BrokenPipeError — real pipes, prompt > pipe buffer."""
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\nexit 3\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    result = await asyncio.wait_for(run_claude("x" * 1_000_000, on_event=on_event), timeout=10)
+    assert result.exit_code == 3
+    assert result.output == ""
+    assert result.tokens_used is None
 
 
 @pytest.mark.asyncio

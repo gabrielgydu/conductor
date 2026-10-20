@@ -242,11 +242,20 @@ async def run_claude(
         duration = time.monotonic() - start
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
     else:
-        # Streaming path: write prompt, close stdin, then read stdout line by line
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
+        # Streaming path: write prompt, close stdin, then read stdout line by line.
+        # Like communicate(), ignore a broken stdin pipe: if claude exits before
+        # reading its whole prompt (bad flag, auth failure), report its exit code
+        # instead of raising BrokenPipeError.
+        try:
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         proc.stdin.close()
-        await proc.stdin.wait_closed()
+        try:
+            await proc.stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
         # Drain stderr in background to avoid pipe deadlock
         async def _drain_stderr():
