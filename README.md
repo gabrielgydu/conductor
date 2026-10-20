@@ -172,6 +172,7 @@ All metadata lives outside the target repo at `~/.conductor/projects/<project-ke
 ├── conductor/
 │   └── <project-name>/
 │       ├── CONDUCTOR-STATE.json      # DAG state, run/stage status
+│       ├── conductor.lock            # Single-instance lock (run/go/plan/loop/manual-test/cleanup)
 │       ├── CONDUCTOR-LOG.md          # Human-readable event log
 │       ├── CONDUCTOR-AUDIT.jsonl     # Machine-readable audit trail
 │       ├── STATS.json                # Token usage and cost tracking

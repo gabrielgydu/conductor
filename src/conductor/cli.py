@@ -269,6 +269,28 @@ def _launch_in_tmux(
     sys.exit(0)
 
 
+# ─── Project lock ────────────────────────────────────────────────────────────
+
+
+def _lock_project(storage: StorageResolver, name: str, command: str) -> None:
+    """Take the project's single-instance lock, or exit naming whoever holds it."""
+    from conductor.core.lock import LockHeld, acquire_project_lock
+
+    try:
+        acquire_project_lock(storage.conductor_dir(name), command)
+    except LockHeld as exc:
+        print(f"Error: {exc}")
+        print("Wait for it to finish, or stop it first.")
+        sys.exit(1)
+
+
+def _unlock_project(storage: StorageResolver, name: str) -> None:
+    """Hand the lock over, e.g. to the process a tmux re-exec is about to start."""
+    from conductor.core.lock import release_project_lock
+
+    release_project_lock(storage.conductor_dir(name))
+
+
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 
@@ -518,6 +540,7 @@ def _cmd_plan(args):
         args.base_branch = _detect_git_branch(args.project_dir)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    _lock_project(storage, args.name, "plan")
 
     brief_path = storage.conductor_brief(args.name)
     if not brief_path.exists():
@@ -674,6 +697,7 @@ def _cmd_go(args):
     """One-shot resumable command: init → copy brief → plan → run."""
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    _lock_project(storage, args.name, "go")
     state_path = storage.conductor_state(args.name)
     brief_path = storage.conductor_brief(args.name)
 
@@ -775,6 +799,7 @@ def _cmd_run(args):
     """Execute the conductor orchestration loop."""
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    _lock_project(storage, args.name, "run")
 
     state_path = storage.conductor_state(args.name)
     if not state_path.exists():
@@ -795,6 +820,7 @@ def _cmd_run(args):
         reexec = [conductor_bin, "run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path)]
         reexec.extend(_run_override_flags(overrides))
 
+        _unlock_project(storage, args.name)
         _launch_in_tmux(
             f"conductor-{state.project_name}",
             "conductor",
@@ -935,6 +961,7 @@ def _cmd_cleanup(args):
         print("No conductor project found.")
         sys.exit(0)
 
+    _lock_project(storage, args.name, "cleanup")
     state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
 
     # A leftover session is killed; a live one makes this exit with an error.
@@ -995,6 +1022,7 @@ def _cmd_loop(args):
     """Start or resume a conductor loop."""
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    _lock_project(storage, args.name, "loop")
 
     state_path = storage.conductor_dir(args.name) / "LOOP-STATE.json"
     inside_tmux = getattr(args, "inside_tmux", False)
@@ -1099,6 +1127,7 @@ def _cmd_loop(args):
         if state.model:
             reexec.extend(["--model", state.model])
 
+        _unlock_project(storage, args.name)
         _launch_in_tmux(
             f"conductor-loop-{state.name}",
             "loop",
@@ -1164,6 +1193,7 @@ def _cmd_manual_test(args):
     """Start, resume, or initialize a manual-test run."""
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
+    _lock_project(storage, args.name, "manual-test")
     conductor_dir = storage.conductor_dir(args.name)
 
     from conductor.core.manual_test import (
@@ -1238,6 +1268,7 @@ def _cmd_manual_test(args):
             reexec.extend(["--model", state.model])
         reexec.extend(["--max-turns", str(state.max_turns)])
 
+        _unlock_project(storage, args.name)
         _launch_in_tmux(
             f"conductor-manual-test-{state.name}",
             "manual-test",
