@@ -371,6 +371,72 @@ async def test_pause_during_coverage_keeps_the_matrix_and_reruns_coverage(tmp_pa
     assert [s.name for s in final.scenarios][-1] == "Coverage row"
 
 
+def _apply(state, conductor_dir, scenario, signal_text):
+    """One scenario generation as _run_manual_phases records it."""
+    scenario.attempts += 1
+    generation = manual_test.ManualGeneration(
+        index=len(state.generations) + 1,
+        started_at=manual_test.datetime.now(manual_test.timezone.utc),
+        scenario_index=scenario.index,
+    )
+    state.generations.append(generation)
+    manual_test._apply_signal_to_scenario(
+        state=state,
+        conductor_dir=conductor_dir,
+        scenario=scenario,
+        generation=generation,
+        signal=parse_manual_signal(signal_text),
+        output_text=signal_text,
+    )
+
+
+def test_scenario_prompt_inlines_the_end_of_a_long_handoff(tmp_path):
+    _, conductor_dir, state = _new_state(tmp_path)
+    handoff = conductor_dir / "generations" / "generation-007-handoff.md"
+    work_log = "\n".join(f"step {i}: clicked through the admin settings page" for i in range(150))
+    handoff.write_text(
+        f"# Manual Test Generation Handoff\n\n```text\n{work_log}\n"
+        "HANDOFF SUMMARY: tenant 42 created; next step is the invoice page\n```\n",
+        encoding="utf-8",
+    )
+    state.scenarios[0].handoff_notes = f"See {handoff}"
+
+    prompt = build_scenario_prompt(state, PLAN_TABLE, state.scenarios[0], conductor_dir)
+
+    assert "HANDOFF SUMMARY: tenant 42 created" in prompt
+    assert f"Read {handoff} for all of it" in prompt
+    assert "step 0: clicked" not in prompt
+
+
+def test_honest_handoffs_have_their_own_budget(tmp_path):
+    _, conductor_dir, state = _new_state(tmp_path)
+    scenario = state.scenarios[0]
+
+    for _ in range(manual_test.MAX_SCENARIO_HANDOFFS - 1):
+        _apply(state, conductor_dir, scenario, "Halfway, context is running low.\n<manual-handoff/>")
+    assert scenario.status == "pending"
+    assert scenario.handoffs == manual_test.MAX_SCENARIO_HANDOFFS - 1
+
+    _apply(state, conductor_dir, scenario, "Still going.\n<manual-handoff/>")
+    assert scenario.status == "blocked"
+    assert "handed off 5 times" in scenario.evidence.summary
+
+
+def test_invalid_results_block_after_three_attempts_despite_handoffs(tmp_path):
+    _, conductor_dir, state = _new_state(tmp_path)
+    scenario = state.scenarios[0]
+
+    _apply(state, conductor_dir, scenario, "Halfway.\n<manual-handoff/>")
+    _apply(state, conductor_dir, scenario, "I forgot the tag")
+    _apply(state, conductor_dir, scenario, "I forgot the tag again")
+    assert scenario.status == "pending"
+
+    _apply(state, conductor_dir, scenario, "and again")
+    assert scenario.status == "blocked"
+    assert scenario.evidence.summary == "Scenario did not produce a valid result after 3 attempts"
+    assert scenario.evidence.notes == ["missing required manual signal tag"]
+
+
 def test_parse_scenarios_from_table():
     scenarios = parse_scenarios_from_markdown(PLAN_TABLE)
 

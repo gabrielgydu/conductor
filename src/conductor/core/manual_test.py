@@ -56,6 +56,13 @@ FIXABLE_FINDING_CATEGORIES = {"app_bug", "ux"}
 MAX_CONSECUTIVE_INFRA_FAILURES = 3
 INFRA_RETRY_DELAY_SECS = 60
 
+# A scenario is blocked after this many generations without a valid signal, or
+# after this many honest <manual-handoff/>s (long scenarios need several).
+MAX_SCENARIO_INVALID_RESULTS = 3
+MAX_SCENARIO_HANDOFFS = 5
+# How much of the previous handoff file is inlined into the next prompt.
+HANDOFF_EXCERPT_CHARS = 4000
+
 
 class ManualEvidence(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
@@ -121,7 +128,10 @@ class ManualScenario(BaseModel):
     description: str
     status: str = "pending"
     priority: str = "medium"
+    # Generations run for this scenario; `handoffs` of them ended in a valid
+    # <manual-handoff/>, the rest of the unfinished ones had no valid signal.
     attempts: int = 0
+    handoffs: int = 0
     started_at: datetime | None = None
     completed_at: datetime | None = None
     evidence: ManualEvidence | None = None
@@ -1318,10 +1328,16 @@ def _scenario_handoff_section(scenario: ManualScenario) -> str:
     if match:
         handoff_path = Path(match.group(1))
         if handoff_path.exists():
-            content = handoff_path.read_text(encoding="utf-8", errors="replace")[:4000]
+            content = handoff_path.read_text(encoding="utf-8", errors="replace")
 
     section = f"## Previous Handoff\n\n{scenario.handoff_notes}\n"
     if content:
+        # The newest output, including any handoff summary, is at the end.
+        if len(content) > HANDOFF_EXCERPT_CHARS:
+            content = (
+                f"...(earlier output omitted; Read {match.group(1)} for all of it)\n"
+                + content[-HANDOFF_EXCERPT_CHARS:]
+            )
         section += f"\n```markdown\n{content}\n```\n"
     return section + "\n"
 
@@ -1817,7 +1833,7 @@ def _apply_signal_to_scenario(
         state.current_scenario_index = scenario.index + 1
         return
 
-    reason = "handoff" if signal.kind == "handoff" else "; ".join(signal.errors)
+    reason = "handoff" if signal.kind == "handoff" and signal.valid else "; ".join(signal.errors)
     handoff = _write_generation_handoff(
         state=state,
         conductor_dir=conductor_dir,
@@ -1827,16 +1843,22 @@ def _apply_signal_to_scenario(
         output_text=output_text,
     )
     scenario.handoff_notes = f"See {handoff}"
-    if scenario.attempts >= 3:
-        scenario.status = "blocked"
-        scenario.evidence = ManualEvidence(
-            summary="Scenario did not produce a valid result after 3 attempts",
-            notes=signal.errors or ["No valid manual signal"],
-        )
-        scenario.completed_at = now
-        state.current_scenario_index = scenario.index + 1
+    if signal.kind == "handoff" and signal.valid:
+        scenario.handoffs += 1
+    invalid_results = scenario.attempts - scenario.handoffs
+    if scenario.handoffs >= MAX_SCENARIO_HANDOFFS:
+        summary = f"Scenario handed off {scenario.handoffs} times without reaching a result"
+        notes = [f"Last handoff: {handoff}"]
+    elif invalid_results >= MAX_SCENARIO_INVALID_RESULTS:
+        summary = f"Scenario did not produce a valid result after {invalid_results} attempts"
+        notes = signal.errors or ["No valid manual signal"]
     else:
         scenario.status = "pending"
+        return
+    scenario.status = "blocked"
+    scenario.evidence = ManualEvidence(summary=summary, notes=notes)
+    scenario.completed_at = now
+    state.current_scenario_index = scenario.index + 1
 
 
 async def _fix_and_verify_finding(
