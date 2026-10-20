@@ -13,7 +13,6 @@ from typing import AsyncIterator, Callable
 # Re-exported: callers resolve aliases through conductor.core.claude.
 from conductor.core.model_catalog import resolve_model as resolve_model
 from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
-from conductor.core.stream_filter import describe_result
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -153,6 +152,11 @@ def progress_on_event(event: dict) -> None:
 
     # Result event — subtype in bold green, or bold red with the CLI's message on an error
     if t == "result":
+        # Imported here, not at module scope: loop mode and manual-test run
+        # `python3 -m conductor.core.stream_filter`, and runpy warns when
+        # importing the conductor.core package has already loaded it.
+        from conductor.core.stream_filter import describe_result
+
         ts = _ts()
         label, summary, error_text = describe_result(event)
         if color:

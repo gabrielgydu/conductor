@@ -43,6 +43,27 @@ def test_copies_the_stream_and_prints_it(tmp_path):
     assert "success" in shown and "(2 turns, $0.0015, 3.0s)" in shown
 
 
+def test_runs_as_a_module_without_warnings(tmp_path):
+    """Loop mode and manual-test run `python3 -m conductor.core.stream_filter`.
+
+    runpy imports the conductor.core package first; if that already loaded
+    the filter, a RuntimeWarning lands in every session's tmux pane.
+    """
+    out = tmp_path / "out.jsonl"
+    stream = load_stream_json("success")
+    proc = subprocess.run(
+        [sys.executable, "-m", "conductor.core.stream_filter", str(out)],
+        input=stream,
+        capture_output=True,
+        timeout=20,
+        env={"PYTHONPATH": str(FILTER.parents[2]), "PYTHONIOENCODING": "utf-8:strict"},
+    )
+    assert proc.returncode == 0
+    assert proc.stderr == b""
+    assert out.read_bytes() == stream
+    assert "(2 turns, $0.0015, 3.0s)" in proc.stdout.decode()
+
+
 def test_unprintable_event_does_not_lose_the_result_event(tmp_path):
     """A shape the printer chokes on used to kill the filter, losing everything after it."""
     stream = (
