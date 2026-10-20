@@ -4,8 +4,10 @@ For each phase:
   1. Build prompt from phase's plan file
   2. Run Claude (steerable or plain)
   3. Monitor output for promise token
-  4. On token: stage, commit, optionally push
-  5. After all phases: write LEARNINGS.md summary, STATS.json, exit_code
+  4. On token: stage, run the preset quality gate, commit
+  5. Gate or commit hook fails: feed the errors back, retry (capped at
+     max_gate_retries)
+  6. After all phases: write LEARNINGS.md summary, STATS.json, exit_code
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from conductor.core.claude import run_claude, run_claude_steerable
-from conductor.core.presets import load_preset
+from conductor.core.presets import GateResult, Preset, load_preset
 from conductor.core.stats import (
     StatsEntry,
     TokenStats,
@@ -34,6 +36,7 @@ from runner.activity import parse_stream_json_text, append_event_to_activity_log
 from runner.config import RunConfig, PhaseConfig
 from runner.git_ops import (
     git_stage_all,
+    git_unstage_all,
     git_has_staged_changes,
     git_commit,
     git_snapshot_untracked,
@@ -83,6 +86,29 @@ def _runner_owned_paths(project_dir: Path, feature_dir: Path, feature_name: str)
         return paths  # feature dir outside the repo (runner CLI default)
     paths.extend((rel / name).as_posix() for name in _RUNNER_FILES)
     return paths
+
+
+# Gate output fed back to Claude is capped like local CI output.
+_MAX_GATE_FEEDBACK = 50_000
+
+
+def _gate_fix_context(gate: GateResult) -> str:
+    """Turn a failed quality gate into the fix block for the next iteration."""
+    failures = gate.failures or [gate.message or "quality gate failed"]
+    budget = max(2_000, _MAX_GATE_FEEDBACK // len(failures))
+    parts = []
+    for failure in failures:
+        if len(failure) > budget:
+            # Keep the "<check>: exit N" line and the tail, where errors land.
+            first, _, rest = failure.partition("\n")
+            failure = f"{first}\n... (truncated) ...\n{rest[-budget:]}"
+        parts.append(failure)
+    return (
+        "=== QUALITY GATE FAILED ===\n"
+        + "\n\n".join(parts)
+        + "\n\nThe runner re-runs these checks before every commit; the phase"
+        " is not committed until they pass.\n"
+    )
 
 
 def _promise_tag(token: str) -> str:
@@ -223,6 +249,7 @@ async def _run_phase(
     feature_dir: Path,
     log_dir: Path,
     stats_path: Path,
+    preset: Preset,
 ) -> tuple[bool, bool]:
     """Execute one phase. Returns (success, committed)."""
 
@@ -239,8 +266,6 @@ async def _run_phase(
     activity_log = feature_dir / "activity.log"
     untracked_snapshot = log_dir / f".pre-untracked-phase-{phase_num}"
 
-    preset = load_preset(cfg.preset, project_dir)
-
     header(f"PHASE {phase_num} — {phase_name}")
     log(f"Prompt: {prompt_file}")
     log(f"Token:  {phase.token}")
@@ -251,8 +276,10 @@ async def _run_phase(
     phase_complete = False
     phase_committed = False
     iteration = 0
+    gate_retries = 0
     commit_retries = 0
     fix_context = ""
+    fix_label = ""
 
     # Snapshot pre-existing untracked files so we don't commit them
     pre_untracked = git_snapshot_untracked(project_dir, untracked_snapshot)
@@ -266,7 +293,7 @@ async def _run_phase(
         iter_start = time.monotonic()
 
         if fix_context:
-            log(f"--- Phase {phase_num}, iteration {iteration} (FIX retry {commit_retries}/{cfg.max_gate_retries}) ---")
+            log(f"--- Phase {phase_num}, iteration {iteration} ({fix_label}) ---")
         else:
             log(f"--- Phase {phase_num}, iteration {iteration} / {cfg.max_iterations} ---")
 
@@ -349,11 +376,33 @@ async def _run_phase(
         git_unstage_paths(project_dir, runner_owned)
 
         if not git_has_staged_changes(project_dir):
-            # No changes to commit — phase is complete with no-op
+            # No changes to commit — phase is complete with no-op. The gate is
+            # not run: the tree is HEAD, which passed it when the previous
+            # phase committed (or is the base branch). Re-testing it would only
+            # spend this phase's retries on failures it did not introduce.
             log("No changes to commit — phase complete (no-op)")
             untracked_snapshot.unlink(missing_ok=True)
             phase_complete = True
             break
+
+        # ── Quality gate (preset [[quality_gate.checks]]) ──────────────
+        log("Running quality gate...")
+        gate = await asyncio.to_thread(preset.quality_gate, project_dir)
+        if not gate.passed:
+            git_unstage_all(project_dir)
+            gate_retries += 1
+            summary = "; ".join(f.partition("\n")[0] for f in gate.failures or [gate.message])
+            error(f"Quality gate failed (retry {gate_retries}/{cfg.max_gate_retries}): {summary}")
+            if gate_retries >= cfg.max_gate_retries:
+                error(f"PHASE {phase_num} — quality gate failed {cfg.max_gate_retries} times, giving up")
+                error("Last failures:")
+                error("\n".join(gate.failures or [gate.message])[-2000:])
+                return False, False
+            fix_context = _gate_fix_context(gate)
+            fix_label = f"quality gate fix {gate_retries}/{cfg.max_gate_retries}"
+            await asyncio.sleep(_RETRY_PAUSE_S)
+            continue
+        success("Quality gate passed")
 
         # ── Commit ─────────────────────────────────────────────────────
         commit_msg = f"Phase {phase_num}: {phase_name}"
@@ -371,6 +420,7 @@ async def _run_phase(
                 "Fix the issues above. The commit was rejected by a pre-commit hook.\n"
                 "Do NOT simply bypass the hook — fix the root cause.\n"
             )
+            fix_label = f"commit fix {commit_retries}/{cfg.max_gate_retries}"
             await asyncio.sleep(_RETRY_PAUSE_S)
             continue
 
@@ -463,6 +513,7 @@ async def run_phase_loop(
             feature_dir=feature_dir,
             log_dir=log_dir,
             stats_path=stats_path,
+            preset=preset,
         )
         phase_duration = time.monotonic() - phase_start
         if phase_committed:

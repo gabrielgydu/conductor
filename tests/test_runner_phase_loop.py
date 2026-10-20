@@ -146,3 +146,64 @@ async def test_phase_without_changes_makes_no_commit(project, monkeypatch):
     assert await _run(_config(repo, feature_dir, phases=1), feature_dir, fake, monkeypatch) == 0
 
     assert _commits(repo) == ["init"]
+
+
+# ─── Preset quality gate runs before every commit (F11) ─────────────────────
+
+
+def _gate_preset(tmp_path: Path, command: str) -> str:
+    preset = tmp_path / "gate.toml"
+    preset.write_text(
+        'name = "gated"\n\n[[quality_gate.checks]]\n'
+        f'name = "unit"\ncommand = {command!r}\n'
+    )
+    return str(preset)
+
+
+def write_code_without_fix(repo: Path, phase: int) -> str:
+    (repo / "app.py").write_text("BROKEN = True\n")
+    return f"done <promise>P{phase}_DONE</promise>"
+
+
+def write_fix(repo: Path, phase: int) -> str:
+    (repo / "app.py").write_text("BROKEN = False\n")
+    (repo / "fixed.txt").write_text("ok\n")
+    return f"fixed <promise>P{phase}_DONE</promise>"
+
+
+async def test_failing_gate_blocks_commit_and_fails_phase(project, tmp_path, monkeypatch):
+    repo, feature_dir = project
+    cfg = _config(repo, feature_dir, phases=1, preset=_gate_preset(tmp_path, "sh -c 'echo boom >&2; exit 3'"))
+    fake = FakeClaude(repo, [write_code_without_fix] * 3)
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 1
+
+    assert _commits(repo) == ["init"]
+    assert fake.calls == [1, 1]  # max_gate_retries=2: one fix attempt, then give up
+    assert "QUALITY GATE FAILED" in fake.prompts[1]
+    assert "unit: exit 3" in fake.prompts[1] and "boom" in fake.prompts[1]
+    assert (feature_dir / "exit_code").read_text() == "1"
+
+
+async def test_gate_failure_is_fed_back_until_it_passes(project, tmp_path, monkeypatch):
+    repo, feature_dir = project
+    cfg = _config(repo, feature_dir, phases=1, preset=_gate_preset(tmp_path, "test -f fixed.txt"))
+    fake = FakeClaude(repo, [write_code_without_fix, write_fix])
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+
+    assert "QUALITY GATE FAILED" not in fake.prompts[0]
+    assert "unit: exit 1" in fake.prompts[1]
+    assert _commits(repo) == ["Phase 1: Step 1", "init"]
+    assert sorted(_files_in(repo, "HEAD")) == ["app.py", "fixed.txt"]
+
+
+async def test_no_op_phase_skips_the_gate(project, tmp_path, monkeypatch):
+    # Nothing changed, so there is nothing new to gate; a base branch that
+    # already fails the gate must not fail phases that did not touch it.
+    repo, feature_dir = project
+    cfg = _config(repo, feature_dir, phases=1, preset=_gate_preset(tmp_path, "false"))
+    fake = FakeClaude(repo, [finish_without_changes])
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+    assert _commits(repo) == ["init"]
