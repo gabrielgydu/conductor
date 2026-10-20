@@ -361,6 +361,52 @@ def test_exit_file_poll_targets_tmux_windows_exactly(tmp_path, monkeypatch):
     assert targets == ["=conductor-proj", "=conductor-proj:=run0:stage-0-exec"]
 
 
+def _executing_shallow_runner(tmp_path, monkeypatch, age_s: float):
+    """A live runner window whose process tree is shallow (no Claude under it)."""
+    from datetime import datetime, timedelta, timezone
+
+    state, _ = _make_state_with_worktree(tmp_path)
+    stage = state.runs[0].stages[0]
+    stage.status = StageStatus.EXECUTING
+    stage.started_at = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+
+    def fake_run(cmd, **kwargs):
+        out = "run0:stage-0-exec\n" if cmd[1] == "list-windows" else "12345\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+    monkeypatch.setattr(orch._tmux_module, "check_pstree_depth", lambda pid: False)
+    monkeypatch.setattr(orch, "_shallow_since", {})
+    storage = _ipc_storage(tmp_path)
+    exit_file = orch._runner_exit_file(storage, "proj", "run-0")
+    return state, storage, exit_file
+
+
+ZOMBIE_KEY = "conductor-proj:run0:stage-0-exec"
+
+
+def test_zombie_needs_a_minute_of_shallow_tree_not_a_few_samples(tmp_path, monkeypatch):
+    """Polls 10 s apart plus monitor checks used to reach 3 samples in seconds."""
+    state, storage, exit_file = _executing_shallow_runner(tmp_path, monkeypatch, 600)
+
+    for _ in range(5):
+        assert not orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert not exit_file.exists()
+
+    orch._shallow_since[ZOMBIE_KEY] -= orch.ZOMBIE_SHALLOW_S
+    assert orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert exit_file.read_text() == "143"
+
+
+def test_starting_runner_is_not_judged_by_its_process_tree(tmp_path, monkeypatch):
+    state, storage, exit_file = _executing_shallow_runner(tmp_path, monkeypatch, 10)
+    orch._shallow_since[ZOMBIE_KEY] = 0.0  # streak left by an earlier runner
+
+    for _ in range(5):
+        assert not orch._any_runner_exit_file_ready(state, storage, "conductor-proj")
+    assert not exit_file.exists()
+
+
 # ---------------------------------------------------------------------------
 # Single-run push and PR
 # ---------------------------------------------------------------------------

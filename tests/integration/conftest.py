@@ -374,7 +374,7 @@ def isolated_run_loop(monkeypatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(orch, "_push_and_pr_for_branch", mocks.push_and_pr)
     monkeypatch.setattr(merge, "run_integration_merge", mocks.integration_merge)
-    monkeypatch.setattr(orch, "_shallow_tree_counts", {})
+    monkeypatch.setattr(orch, "_shallow_since", {})
     return mocks
 
 

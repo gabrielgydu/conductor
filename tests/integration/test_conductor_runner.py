@@ -11,6 +11,7 @@ import pytest
 # Ensure src is importable
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
+import conductor.core.orchestrator as orch
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.orchestrator import (
     ConductorConfig,
@@ -311,11 +312,19 @@ async def test_conductor_detects_zombie_runner(
     mock_claude_cli,
     tmp_storage_dir,
     tmp_path,
+    monkeypatch,
 ):
-    """Shallow process tree on 3 checks -> exit 143 -> infra retry from GENERATED."""
+    """Shallow process tree for a minute -> exit 143 -> infra retry from GENERATED."""
     state = _executing_state(tmp_path, activity="last words\n")
     mock_runner.write_run_sh(Path(state.runs[0].stages[0].worktree) / "docs" / "test-run")
-    # 3 checks to declare the zombie, then one advance to handle the failure
+    # Checks 30 s apart: shallow for 0 s, 30 s, then 60 s declares the zombie;
+    # one more advance handles the failure.
+    clock = iter(range(0, 3600, 30))
+    shallow_for = orch._shallow_for
+    monkeypatch.setattr(
+        orch, "_shallow_for",
+        lambda key, shallow, now=None: shallow_for(key, shallow, float(next(clock))),
+    )
     config = ConductorConfig(check_interval_s=0.0, max_iterations=4)
     mock_tmux.set_window_alive(WINDOW, True)
     mock_tmux.set_window_children(WINDOW, False)

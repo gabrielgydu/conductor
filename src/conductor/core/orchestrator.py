@@ -33,12 +33,25 @@ _PACKAGE_ROOT = (
 _SPECCER_BIN = str(_PACKAGE_ROOT / "speccer")
 _RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
 
-# Tracks consecutive shallow-pstree observations per tmux window name.
-# Only declare zombie after ZOMBIE_SHALLOW_THRESHOLD consecutive shallow checks,
-# to avoid false positives during the brief gap when the runner restarts Claude
-# between phase iterations.
-_shallow_tree_counts: dict[str, int] = {}
-ZOMBIE_SHALLOW_THRESHOLD = 3
+# A runner pane whose process tree stays shallow (the runner is alive but
+# no Claude or gate process under it) is a zombie. When each window was first
+# seen shallow, keyed "session:window"; a runner is declared a zombie only
+# after ZOMBIE_SHALLOW_S of continuous shallow samples, so the brief gap while
+# the runner restarts Claude between iterations is not one. Time, not a sample
+# count: the 10 s exit-file poll and monitor_runner both sample.
+_shallow_since: dict[str, float] = {}
+ZOMBIE_SHALLOW_S = 60.0
+# Runners younger than this are still starting up; their tree is not judged.
+ZOMBIE_STARTUP_GRACE_S = 60.0
+
+
+def _shallow_for(window_key: str, shallow: bool, now: float | None = None) -> float:
+    """Record one pane-tree sample; return how long the tree has been shallow."""
+    if not shallow:
+        _shallow_since.pop(window_key, None)
+        return 0.0
+    now = time.time() if now is None else now
+    return now - _shallow_since.setdefault(window_key, now)
 
 
 @dataclass
@@ -1583,6 +1596,8 @@ async def start_runner(
     exit_file = _runner_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
     _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
+    # A shallow streak of the previous runner in this window is not this one's.
+    _shallow_since.pop(f"conductor-{state.project_name}:{window_name}", None)
 
     # Generate RUN-CONFIG.json from the speccer-generated run.sh
     docs_dir = Path(wt) / "docs" / fname
@@ -1836,7 +1851,7 @@ def _any_runner_exit_file_ready(
             return True
         # Also detect dead windows (runner crashed without writing exit file)
         if session_name:
-            window_name = f"run{ri}:{stage.name}-exec"
+            window_name = _runner_window(ri, stage)
             r = subprocess.run(
                 # "=" makes tmux match names exactly, not by prefix: run0:api
                 # must never resolve to its sibling run0:api-exec.
@@ -1848,7 +1863,12 @@ def _any_runner_exit_file_ready(
                 exit_file.write_text("1")
                 return True
             # Check for zombie runner (window alive but Claude process dead)
-            if r.returncode == 0 and window_name in r.stdout.strip().splitlines():
+            started = stage.started_at.timestamp() if stage.started_at else 0.0
+            if (
+                r.returncode == 0
+                and window_name in r.stdout.strip().splitlines()
+                and time.time() - started > ZOMBIE_STARTUP_GRACE_S
+            ):
                 pid_r = subprocess.run(
                     ["tmux", "list-panes", "-t", f"={session_name}:={window_name}",
                      "-F", "#{pane_pid}"],
@@ -1858,16 +1878,11 @@ def _any_runner_exit_file_ready(
                     try:
                         pane_pid = int(pid_r.stdout.strip())
                         window_key = f"{session_name}:{window_name}"
-                        if not _tmux_module.check_pstree_depth(pane_pid):
-                            _shallow_tree_counts[window_key] = (
-                                _shallow_tree_counts.get(window_key, 0) + 1
-                            )
-                            if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
-                                _shallow_tree_counts.pop(window_key, None)
-                                exit_file.write_text("143")
-                                return True
-                        else:
-                            _shallow_tree_counts.pop(window_key, None)
+                        shallow = not _tmux_module.check_pstree_depth(pane_pid)
+                        if _shallow_for(window_key, shallow) >= ZOMBIE_SHALLOW_S:
+                            _shallow_since.pop(window_key, None)
+                            exit_file.write_text("143")
+                            return True
                     except (ValueError, OSError):
                         pass
     return False
@@ -2077,20 +2092,19 @@ async def monitor_runner(
                 stage=stage_idx,
                 window=window_name,
             )
-        elif elapsed > 60 and not await tmux.has_active_children(window_name):
-            session_name = tmux._session_name
-            window_key = f"{session_name}:{window_name}"
-            _shallow_tree_counts[window_key] = (
-                _shallow_tree_counts.get(window_key, 0) + 1
-            )
-            if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
-                _shallow_tree_counts.pop(window_key, None)
+        elif elapsed > ZOMBIE_STARTUP_GRACE_S and not await tmux.has_active_children(
+            window_name
+        ):
+            window_key = f"{tmux._session_name}:{window_name}"
+            shallow_s = _shallow_for(window_key, True)
+            if shallow_s >= ZOMBIE_SHALLOW_S:
+                _shallow_since.pop(window_key, None)
                 stage.last_exit_code = 143
                 stage.status = StageStatus.FAILED
                 _log(
                     "RUNNER_ZOMBIE",
-                    f"Runner {fname} alive but Claude process dead (no children, "
-                    f"{ZOMBIE_SHALLOW_THRESHOLD} consecutive checks)",
+                    f"Runner {fname} alive but Claude process dead (no children "
+                    f"for {shallow_s:.0f}s)",
                     log_path,
                     audit_path,
                     run=run_idx,
@@ -2100,9 +2114,8 @@ async def monitor_runner(
             else:
                 _log(
                     "RUNNER_SHALLOW_TREE",
-                    f"Runner {fname} shallow pstree (check "
-                    f"{_shallow_tree_counts[window_key]}/{ZOMBIE_SHALLOW_THRESHOLD}), "
-                    "waiting before declaring zombie",
+                    f"Runner {fname} shallow pstree for {shallow_s:.0f}s "
+                    f"(zombie after {ZOMBIE_SHALLOW_S:.0f}s)",
                     log_path,
                     audit_path,
                     run=run_idx,
@@ -2113,9 +2126,8 @@ async def monitor_runner(
                     state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
                 )
         else:
-            # Tree is healthy — reset any accumulated shallow count
-            window_key = f"{tmux._session_name}:{window_name}"
-            _shallow_tree_counts.pop(window_key, None)
+            # Tree is healthy (or the runner is young): no shallow streak.
+            _shallow_for(f"{tmux._session_name}:{window_name}", False)
             await check_stall(
                 state, run_idx, stage_idx, tmux, storage, config, log_path, audit_path
             )
