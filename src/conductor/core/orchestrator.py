@@ -1617,7 +1617,9 @@ def _any_runner_exit_file_ready(
         if session_name:
             window_name = f"run{ri}:{stage.name}-exec"
             r = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+                # "=" makes tmux match names exactly, not by prefix: run0:api
+                # must never resolve to its sibling run0:api-exec.
+                ["tmux", "list-windows", "-t", f"={session_name}", "-F", "#{window_name}"],
                 capture_output=True, text=True,
             )
             if r.returncode == 0 and window_name not in r.stdout.strip().splitlines():
@@ -1627,7 +1629,7 @@ def _any_runner_exit_file_ready(
             # Check for zombie runner (window alive but Claude process dead)
             if r.returncode == 0 and window_name in r.stdout.strip().splitlines():
                 pid_r = subprocess.run(
-                    ["tmux", "list-panes", "-t", f"{session_name}:{window_name}",
+                    ["tmux", "list-panes", "-t", f"={session_name}:={window_name}",
                      "-F", "#{pane_pid}"],
                     capture_output=True, text=True,
                 )

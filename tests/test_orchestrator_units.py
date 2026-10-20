@@ -339,3 +339,23 @@ def test_learnings_extend_the_existing_section_without_repeating_lines():
     assert updated.count("## Conductor Learnings") == 1
     assert updated.count("- rule A") == 1
     assert updated.index("- rule B") < updated.index("## Other")
+
+
+def test_exit_file_poll_targets_tmux_windows_exactly(tmp_path, monkeypatch):
+    """A prefix target would let run0:api resolve to its sibling run0:api-exec."""
+    state, _ = _make_state_with_worktree(tmp_path)
+    state.runs[0].stages[0].status = StageStatus.EXECUTING
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        out = "run0:stage-0-exec\n" if cmd[1] == "list-windows" else "12345\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+    monkeypatch.setattr(orch._tmux_module, "check_pstree_depth", lambda pid: True)
+
+    assert not orch._any_runner_exit_file_ready(state, _ipc_storage(tmp_path), "conductor-proj")
+
+    targets = [cmd[cmd.index("-t") + 1] for cmd in calls]
+    assert targets == ["=conductor-proj", "=conductor-proj:=run0:stage-0-exec"]
