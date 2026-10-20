@@ -33,6 +33,7 @@ class BrainReply:
     ok: bool  # CLI exited 0, the result is not an error, and text came back
     detail: str = ""  # why the call is not ok
     tokens: dict[str, int] | None = None
+    subtype: str = ""  # result event subtype, e.g. "success", "error_max_turns"
 
 
 def read_reply(result: ClaudeResult) -> BrainReply:
@@ -82,10 +83,10 @@ def read_reply(result: ClaudeResult) -> BrainReply:
     text = (final if final and final.strip() else "\n\n".join(blocks)).strip()
     if result.exit_code != 0 or failed_result:
         detail = f"claude exited {result.exit_code}" + (f" ({subtype})" if subtype else "")
-        return BrainReply(text, False, detail, result.tokens_used)
+        return BrainReply(text, False, detail, result.tokens_used, subtype)
     if not text:
-        return BrainReply("", False, "empty reply", result.tokens_used)
-    return BrainReply(text, True, "", result.tokens_used)
+        return BrainReply("", False, "empty reply", result.tokens_used, subtype)
+    return BrainReply(text, True, "", result.tokens_used, subtype)
 
 
 async def ask(

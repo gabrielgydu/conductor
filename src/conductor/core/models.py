@@ -62,6 +62,12 @@ class StageState(BaseModel):
     # Error that made the orchestrator itself fail this stage (an exception
     # while advancing it), shown to the failure diagnosis.
     last_error: str | None = None
+    # Consecutive speccer runs that exited non-zero and left the spec waiting
+    # for input, plus auto-answers that did not answer every question. Reset
+    # by a clean speccer exit; the stage FAILs when it reaches the limit.
+    spec_failures: int = 0
+    # `speccer run --continue` rounds started with auto-answered questions.
+    question_rounds: int = 0
 
 
 class RunState(BaseModel):

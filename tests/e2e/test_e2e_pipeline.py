@@ -184,8 +184,8 @@ async def test_overnight_mode(e2e_env, tmp_storage_dir):
     # First invocation -> NEEDS_INPUT, second -> COMPLETE
     e2e_env.speccer.set_lifecycle(needs_input=True, final_status="COMPLETE")
     e2e_env.claude.set_response(
-        "answer-questions",
-        "## QUESTIONS.md\n### Q1: Scope\n> Full scope\n### Q2: Auth\n> JWT tokens",
+        "answering clarification questions",  # answer_questions' prompt
+        "### Q1: Scope\nFull scope\n### Q2: Auth\nJWT tokens",
     )
     e2e_env.tmux.set_spawn_callback(_make_spawn_callback(e2e_env.speccer, e2e_env.tmux))
 

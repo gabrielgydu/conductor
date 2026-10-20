@@ -96,8 +96,8 @@ async def test_conductor_handles_spec_needs_input(
 
     mock_speccer.set_lifecycle(needs_input=True, final_status="COMPLETE")
     mock_claude_cli.set_response(
-        "answer-questions",
-        "## QUESTIONS.md\n### Q1: Scope\n> Full scope, all endpoints\n### Q2: Auth\n> Use JWT tokens",
+        "answering clarification questions",  # answer_questions' prompt
+        "### Q1: Scope\nFull scope, all endpoints\n### Q2: Auth\nUse JWT tokens",
     )
     mock_tmux.set_spawn_callback(_make_spawn_callback(mock_speccer, mock_tmux))
 

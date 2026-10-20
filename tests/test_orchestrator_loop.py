@@ -140,6 +140,13 @@ class _FakeSleep:
             self._on_call(len(self.calls))
 
 
+def _write_questions(wt: Path, fname: str, text: str = "### Q1: Scope\n**Answer:**\n") -> Path:
+    questions = wt / "docs" / fname / "spec" / "QUESTIONS.md"
+    questions.parent.mkdir(parents=True, exist_ok=True)
+    questions.write_text(text)
+    return questions
+
+
 def _block_run(state: ConductorState, run_idx: int = 0):
     def on_call(n: int) -> None:
         state.runs[run_idx].status = RunStatus.BLOCKED
@@ -192,6 +199,7 @@ async def test_questions_for_a_human_end_the_loop_with_needs_input(loop_env, mon
     state = _state(_active(0, "feat-a", StageStatus.SPEC_NEEDS_INPUT))
     state.overnight = False
     state.runs[0].stages[0].worktree = str(tmp_path / "wt")
+    _write_questions(tmp_path / "wt", "feat-a")
     sleep = _FakeSleep()
     monkeypatch.setattr(orch.asyncio, "sleep", sleep)
     config = ConductorConfig(check_interval_s=120.0)  # overnight comes from state
@@ -208,13 +216,15 @@ async def test_questions_for_a_human_end_the_loop_with_needs_input(loop_env, mon
 
 
 @pytest.mark.asyncio
-async def test_human_wait_does_not_stop_an_executing_run(loop_env, monkeypatch):
+async def test_human_wait_does_not_stop_an_executing_run(loop_env, monkeypatch, tmp_path):
     """One run waits for answers, another executes: keep monitoring, don't exit."""
     state = _state(
         _active(0, "feat-a", StageStatus.SPEC_NEEDS_INPUT),
         _active(1, "feat-b", StageStatus.EXECUTING),
     )
     state.overnight = False
+    state.runs[0].stages[0].worktree = str(tmp_path / "wt")
+    _write_questions(tmp_path / "wt", "feat-a")
     monkeypatch.setattr(orch.asyncio, "sleep", _FakeSleep(_block_run(state, 1)))
     config = ConductorConfig(check_interval_s=30.0, max_parallel=2)
 

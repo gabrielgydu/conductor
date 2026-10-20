@@ -790,6 +790,48 @@ def pre_reset_speccer_status(
         progress_file.write_text(content, encoding="utf-8")
 
 
+# Consecutive speccer rounds without progress (see StageState.spec_failures)
+# before the stage FAILs into handle_failure's diagnosis and retry budget.
+MAX_SPEC_FAILURES = 3
+
+
+def _count_spec_failure(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    reason: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> bool:
+    """Count a spec round that made no progress; True if the stage now FAILED.
+
+    speccer leaves STATUS=NEEDS_INPUT and exits 1 when Claude fails, when no
+    promise token comes back, or when SPEC_COMPLETE is rejected. Without a
+    limit the stage re-enters NEEDS_INPUT and starts another spec session
+    forever, never touching the retry budget.
+    """
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    stage.spec_failures += 1
+    failed = stage.spec_failures >= MAX_SPEC_FAILURES
+    _log(
+        "FAILURE",
+        f"Run {run.name} stage {stage.name}: {reason} "
+        f"({stage.spec_failures}/{MAX_SPEC_FAILURES} in a row"
+        + (", stage failed)" if failed else ")"),
+        log_path,
+        audit_path,
+        run=run_idx,
+        stage=stage_idx,
+        reason="spec_no_progress",
+        spec_failures=stage.spec_failures,
+        exit_code=stage.last_exit_code,
+    )
+    if failed:
+        stage.status = StageStatus.FAILED
+    return failed
+
+
 def speccer_exit_code_handler(
     state: ConductorState,
     run_idx: int,
@@ -812,13 +854,22 @@ def speccer_exit_code_handler(
 
     progress_file = _progress_file_path(state, run_idx, stage_idx)
     _recoverable = {"NEEDS_INPUT", "COMPLETE", "GENERATED"}
+    if exit_code is not None:
+        stage.last_exit_code = exit_code
 
     if exit_code == 0:
+        stage.spec_failures = 0
         sync_speccer_status(state, run_idx, stage_idx, storage, log_path, audit_path)
     elif exit_code is not None:
         # Non-zero exit — check PROGRESS.md for recoverable state
         if progress_file is not None and progress_file.exists():
             pstatus = _read_progress_status(progress_file)
+            if pstatus == "NEEDS_INPUT" and _count_spec_failure(
+                state, run_idx, stage_idx,
+                f"speccer exited {exit_code} with the spec still waiting for input",
+                log_path, audit_path,
+            ):
+                return
             if pstatus in _recoverable:
                 sync_speccer_status(
                     state, run_idx, stage_idx, storage, log_path, audit_path
@@ -932,6 +983,54 @@ def write_constitution(
     )
 
 
+# Wall-clock limit for answering one round of speccer questions.
+ANSWER_TIMEOUT_S = 1200.0
+# Automatic question rounds per stage before a person has to look.
+MAX_AUTO_QUESTION_ROUNDS = 8
+
+_QUESTION_HEADING = re.compile(r"^#{2,4}[ \t]*Q(\d+)\b", re.MULTILINE | re.IGNORECASE)
+
+
+def _questions_file(run: RunState, stage: StageState) -> Path | None:
+    if not stage.worktree:
+        return None
+    fname = run.name + stage.feature_suffix
+    return Path(stage.worktree) / "docs" / fname / "spec" / "QUESTIONS.md"
+
+
+def _has_answers(questions_file: Path | None) -> bool:
+    """Whether QUESTIONS.md holds answers (speccer's test: a line starting '> ')."""
+    if questions_file is None:
+        return False
+    try:
+        text = questions_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(line.startswith("> ") for line in text.splitlines())
+
+
+def _awaits_human(run: RunState, stage: StageState, overnight: bool) -> bool:
+    """Whether a SPEC_NEEDS_INPUT stage can only be moved on by a person.
+
+    Overnight, questions are answered automatically up to
+    MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise the stage waits until someone
+    writes answers into QUESTIONS.md.
+    """
+    if overnight:
+        return stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS
+    questions = _questions_file(run, stage)
+    return questions is not None and questions.exists() and not _has_answers(questions)
+
+
+def _unanswered(questions: str, answers: str) -> list[str]:
+    """Numbers of the '### Qn' questions that *answers* has no heading for."""
+    asked = dict.fromkeys(m.group(1) for m in _QUESTION_HEADING.finditer(questions))
+    return [
+        n for n in asked
+        if not re.search(rf"^[\s#*>_-]*Q{n}\b", answers, re.MULTILINE | re.IGNORECASE)
+    ]
+
+
 async def answer_questions(
     state: ConductorState,
     run_idx: int,
@@ -940,8 +1039,14 @@ async def answer_questions(
     conductor_dir: Path | None = None,
     log_path: Path | None = None,
     audit_path: Path | None = None,
-) -> None:
-    """Build context for speccer questions and call brain to answer them."""
+) -> bool:
+    """Answer speccer's questions in QUESTIONS.md on the product owner's behalf.
+
+    Returns True when speccer can continue: answers were written, or there is
+    nothing to answer (speccer then reports the problem itself). Returns
+    False when no usable answers came back; the stage then backs off (the
+    call failed) or counts a spec failure (the answers were incomplete).
+    """
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
@@ -949,10 +1054,10 @@ async def answer_questions(
 
     questions_file = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
     if not questions_file.exists():
-        return
+        return True
     questions = questions_file.read_text(encoding="utf-8").strip()
     if not questions:
-        return
+        return True
 
     # Build context
     cdir = conductor_dir or storage.conductor_dir(state.project_name)
@@ -976,8 +1081,12 @@ async def answer_questions(
     system_prompt = (
         "You are answering clarification questions on behalf of a product owner. "
         "A spec-generation tool has produced questions that need answers before it can continue. "
-        "Use the provided feature brief, constitution, description, and existing specs as context. "
-        "Answer each question directly and concisely. Do NOT start implementing — only answer the questions."
+        "Use the provided feature brief, constitution, description, and existing specs as context; "
+        "you may read the code in the current directory to ground your answers. "
+        "Answer each question directly and concisely. Do NOT start implementing — only answer the questions.\n\n"
+        "Your final message is written verbatim into QUESTIONS.md as the answers, so it must "
+        "contain only the answers: for every question a heading `### Qn` (its number) followed "
+        "by the answer. No preamble, no closing remarks."
     )
 
     context = (
@@ -999,64 +1108,46 @@ async def answer_questions(
         stage=stage_idx,
     )
 
-    result = await run_claude(
+    reply = await brain.ask(
         context,
         model=resolve_model("opus"),
-        max_turns=10,
+        timeout_s=ANSWER_TIMEOUT_S,
+        max_turns=20,
+        tools="Read,Grep,Glob",  # read-only: ground answers in the code
+        cwd=wt,
     )
+    missing = _unanswered(questions, reply.text) if reply.ok else []
+    usable = reply.ok and not missing
 
-    # Extract text from stream-json output
-    import json as _json
-
-    answer_text = ""
-    for line in result.output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = _json.loads(line)
-        except _json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "assistant":
-            content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        answer_text = block.get("text", "")
-                        break
-            elif isinstance(content, str):
-                answer_text = content
-            if answer_text:
-                break
-
-    if answer_text:
+    if usable:
         # Speccer expects answers as lines prefixed with "> " in QUESTIONS.md
-        prefixed = "\n".join(f"> {line}" for line in answer_text.splitlines())
+        prefixed = "\n".join(f"> {line}" for line in reply.text.splitlines())
         combined = questions + "\n\n" + prefixed + "\n"
         questions_file.write_text(combined, encoding="utf-8")
 
-    # Log brain call
-    brain_calls_dir = storage.brain_calls_dir(state.project_name)
-    import time as _time
-
-    ts = int(_time.time() * 1000)
-    log_file = brain_calls_dir / f"answer-questions-{run_idx}-{stage_idx}-{ts}.json"
-    log_file.write_text(
-        _json.dumps(
-            {
-                "action": "answer-questions",
-                "run_idx": run_idx,
-                "stage_idx": stage_idx,
-                "questions": questions,
-                "response": answer_text,
-                "tokens": result.tokens_used,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    brain.log_brain_call(
+        storage.brain_calls_dir(state.project_name),
+        "answer-questions", run_idx, stage_idx, context, reply,
+        questions=questions, written=usable, unanswered=missing,
     )
+    if usable:
+        return True
+
+    if not reply.ok and reply.subtype != "error_max_turns":
+        # The call itself failed (API down, CLI error, timeout): retry later.
+        _schedule_backoff(
+            state, run_idx, stage_idx,
+            f"answering questions failed ({reply.detail})", log_path, audit_path,
+        )
+        return False
+
+    reason = (
+        f"auto-answers skip question(s) {', '.join('Q' + n for n in missing)}"
+        if missing
+        else f"auto-answer produced no final answer ({reply.detail})"
+    )
+    _count_spec_failure(state, run_idx, stage_idx, reason, log_path, audit_path)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1707,6 +1798,21 @@ async def _back_off_and_restart(
     audit_path: Path | None,
 ) -> None:
     """Restart the stage after an exponential backoff; block after 8 hours of it."""
+    if _schedule_backoff(state, run_idx, stage_idx, reason, log_path, audit_path):
+        await restart_stage(
+            state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
+        )
+
+
+def _schedule_backoff(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    reason: str,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> bool:
+    """Set the stage's next exponential backoff; False (and BLOCKED) after 8 hours."""
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     now = datetime.now(timezone.utc)
@@ -1725,7 +1831,7 @@ async def _back_off_and_restart(
             reason="transient_timeout",
             exit_code=stage.last_exit_code,
         )
-        return
+        return False
     # Exponential backoff: 30s, 60s, 2m, 4m, 8m, 16m, 32m, 60m cap
     backoff_s = min(3600, 30 * (2 ** stage.transient_retries))
     stage.transient_retries += 1
@@ -1742,9 +1848,7 @@ async def _back_off_and_restart(
         transient_retries=stage.transient_retries,
         exit_code=stage.last_exit_code,
     )
-    await restart_stage(
-        state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
-    )
+    return True
 
 
 async def handle_failure(
@@ -1897,6 +2001,7 @@ async def restart_stage(
     current_status = stage.status
     stage.last_exit_code = None
     stage.last_error = None
+    stage.spec_failures = 0
 
     if current_status in (StageStatus.FAILED, StageStatus.BLOCKED):
         # Determine where to restart based on how far the stage got on disk.
@@ -2043,23 +2148,30 @@ def _waiting_reason(
         return "backoff"
     if stage.status == StageStatus.EXECUTING:
         return "executing"
-    if stage.status == StageStatus.SPEC_NEEDS_INPUT and not overnight:
+    if stage.status == StageStatus.SPEC_NEEDS_INPUT and _awaits_human(run, stage, overnight):
         return "human"
     return None
 
 
-def _questions_waiting_message(state: ConductorState, run: RunState) -> str:
+def _questions_waiting_message(
+    state: ConductorState, run: RunState, overnight: bool
+) -> str:
     """How a human answers a stage's speccer questions and lets conductor go on."""
     stage = run.stages[run.current_stage]
     fname = run.name + stage.feature_suffix
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
+    continue_cmd = f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue`"
+    if overnight:
+        return (
+            f"Run {run.name} stage {stage.name}: still asking questions after "
+            f"{stage.question_rounds} automatic answer rounds. Review {questions}, "
+            f"then run {continue_cmd} and re-run conductor."
+        )
     return (
         f"Run {run.name} stage {stage.name}: answer the questions in {questions} "
-        "(lines starting with '> '), then either run "
-        f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue` "
-        "and re-run conductor, or re-run conductor without --no-overnight to "
-        "have them answered automatically."
+        "(lines starting with '> ') and re-run conductor, or re-run it without "
+        "--no-overnight to have them answered automatically."
     )
 
 
@@ -2200,8 +2312,23 @@ async def advance_run(
 
     # ----- spec_needs_input -----
     if status == StageStatus.SPEC_NEEDS_INPUT:
-        if _overnight(config, state):
-            await answer_questions(
+        progress_file = _progress_file_path(state, run_idx, stage_idx)
+        if (
+            progress_file is not None
+            and progress_file.exists()
+            and _read_progress_status(progress_file) in ("COMPLETE", "GENERATED")
+        ):
+            # Finished outside conductor (`speccer run --continue` by hand).
+            sync_speccer_status(state, run_idx, stage_idx, storage, log_path, audit_path)
+            atomic_save(state, storage.conductor_state(state.project_name))
+            return
+        overnight = _overnight(config, state)
+        if _awaits_human(run, stage, overnight):
+            # Nothing to do until someone answers; the main loop ends with
+            # needs_input once no other run has work left.
+            return
+        if overnight and not _has_answers(_questions_file(run, stage)):
+            answered = await answer_questions(
                 state,
                 run_idx,
                 stage_idx,
@@ -2209,15 +2336,19 @@ async def advance_run(
                 log_path=log_path,
                 audit_path=audit_path,
             )
-            await run_speccer_continue(
-                state, run_idx, stage_idx, tmux, storage, log_path, audit_path
-            )
-            fname = run.name + stage.feature_suffix
-            speccer_exit_code_handler(
-                state, run_idx, stage_idx, fname, storage, log_path, audit_path
-            )
-            atomic_save(state, storage.conductor_state(state.project_name))
-        # If not overnight, return without advancing (skip — other runs may be active)
+            if not answered:
+                atomic_save(state, storage.conductor_state(state.project_name))
+                return
+        if overnight:
+            stage.question_rounds += 1
+        await run_speccer_continue(
+            state, run_idx, stage_idx, tmux, storage, log_path, audit_path
+        )
+        fname = run.name + stage.feature_suffix
+        speccer_exit_code_handler(
+            state, run_idx, stage_idx, fname, storage, log_path, audit_path
+        )
+        atomic_save(state, storage.conductor_state(state.project_name))
         return
 
     # ----- spec_complete -----
@@ -2904,7 +3035,7 @@ async def conductor_run_loop(
             for run_idx in waiting:
                 _log(
                     "CONDUCTOR_EXIT",
-                    _questions_waiting_message(state, state.runs[run_idx]),
+                    _questions_waiting_message(state, state.runs[run_idx], overnight),
                     log_path,
                     audit_path,
                     reason="needs_input",
