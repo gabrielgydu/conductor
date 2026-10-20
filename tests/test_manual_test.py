@@ -117,8 +117,11 @@ PASS_RESULT = """<manual-result status="pass">
 
 
 class _FakeTmux:
-    def __init__(self):
+    def __init__(self, **_kwargs):
         self.windows: list[str] = []
+
+    async def ensure_session(self):
+        return None
 
     async def spawn_in_window(self, name, _cmd, **_kwargs):
         self.windows.append(name)
@@ -238,6 +241,134 @@ async def test_run_generation_writes_markdown_log(tmp_path, monkeypatch):
     log = (conductor_dir / "MANUAL-TEST-LOG.md").read_text(encoding="utf-8")
     assert "MANUAL_GENERATION_START" in log
     assert "MANUAL_GENERATION_END" in log
+
+
+USAGE_LIMIT = "\n".join(
+    [
+        json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-5-5"}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "error": "rate_limit",
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "Claude AI usage limit reached|1760990400"}],
+                },
+            }
+        ),
+        _result_event("Claude AI usage limit reached|1760990400", is_error=True),
+    ]
+)
+
+
+def _run_main_with(monkeypatch, conductor_dir, outputs):
+    """Run the real _manual_main against canned Claude outputs."""
+    _fake_claude(monkeypatch, outputs)
+    monkeypatch.setattr("conductor.core.tmux.TmuxManager", _FakeTmux)
+    monkeypatch.setattr(manual_test, "INFRA_RETRY_DELAY_SECS", 0)
+
+    class _Storage:
+        def conductor_dir(self, _name):
+            return conductor_dir
+
+    return _Storage()
+
+
+def test_claude_failure_classifies_infrastructure_errors():
+    worked = _assistant_text("Opened the settings page.")
+    max_turns = "\n".join([worked, _result_event(subtype="error_max_turns", is_error=True)])
+    too_long = "\n".join(
+        [
+            worked,
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "error": "invalid_request",
+                    "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Prompt is too long"}]},
+                }
+            ),
+            _result_event("Prompt is too long", is_error=True),
+        ]
+    )
+    mid_session_limit = "\n".join([worked, USAGE_LIMIT])
+
+    assert "usage limit reached" in manual_test._claude_failure(USAGE_LIMIT, 1, "")
+    assert "usage limit reached" in manual_test._claude_failure(mid_session_limit, 1, "")
+    assert manual_test._claude_failure("", 1, "Error: unknown model x\n") == "exit 1: Error: unknown model x"
+    assert manual_test._claude_failure("", 0, "") == "exit 0: no output"
+    # The session did real work and ran out of budget: an attempt, not an outage.
+    assert manual_test._claude_failure(max_turns, 1, "") == ""
+    assert manual_test._claude_failure(too_long, 1, "") == ""
+    assert manual_test._claude_failure(worked, 0, "") == ""
+
+
+@pytest.mark.asyncio
+async def test_claude_failures_pause_the_run_without_burning_scenarios(tmp_path, monkeypatch):
+    repo, conductor_dir, state = _new_state(tmp_path)
+    storage = _run_main_with(
+        monkeypatch,
+        conductor_dir,
+        [
+            (_assistant_text("Matrix updated.\n<manual-handoff/>"), 0, ""),
+            (_assistant_text(PASS_RESULT), 0, ""),
+            (USAGE_LIMIT, 1, ""),
+            (USAGE_LIMIT, 1, ""),
+            ("", 1, "API Error: 401 invalid x-api-key\n"),
+        ],
+    )
+
+    await manual_test._manual_main(state, repo, storage)
+
+    saved = load_manual_state(conductor_dir)
+    assert saved.status == "paused"
+    assert saved.paused_from == "running"
+    assert [s.status for s in saved.scenarios] == ["passed", "pending"]
+    assert saved.scenarios[1].attempts == 0
+    assert "401 invalid x-api-key" in saved.last_error
+    assert "Last error:" in format_manual_status(saved)
+    assert [g.summary for g in saved.generations][-3:] == ["infra-error"] * 3
+    assert len(_audit_events(conductor_dir, "MANUAL_INFRA_RETRY")) == 2
+    assert len(_audit_events(conductor_dir, "MANUAL_TEST_PAUSED")) == 1
+    stderr_logs = list((conductor_dir / "logs").glob("manual-stderr-*.log"))
+    assert [p.name for p in stderr_logs] == ["manual-stderr-005-scenario-1.log"]
+
+    # Resuming runs the scenario again, now that Claude is back.
+    storage = _run_main_with(monkeypatch, conductor_dir, [(_assistant_text(PASS_RESULT), 0, "")])
+    await manual_test._manual_main(saved, repo, storage)
+
+    final = load_manual_state(conductor_dir)
+    assert final.status == "completed"
+    assert final.last_error == ""
+    assert [s.status for s in final.scenarios] == ["passed", "passed"]
+    assert final.scenarios[1].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_during_coverage_keeps_the_matrix_and_reruns_coverage(tmp_path, monkeypatch):
+    repo, conductor_dir, state = _new_state(tmp_path)
+    matrix = conductor_dir / "MANUAL-TEST-SCENARIOS.md"
+    edited = matrix.read_text(encoding="utf-8") + "| 2 | pending | high | Discovered | Coverage row | Screenshot | |\n"
+    storage = _run_main_with(monkeypatch, conductor_dir, [("", 1, "")] * 3)
+    # The first coverage attempt edits the matrix before Claude fails.
+    matrix.write_text(edited, encoding="utf-8")
+
+    await manual_test._manual_main(state, repo, storage)
+
+    saved = load_manual_state(conductor_dir)
+    assert saved.status == "paused"
+    assert saved.paused_from == "coverage"
+    assert matrix.read_text(encoding="utf-8") == edited
+
+    storage = _run_main_with(
+        monkeypatch,
+        conductor_dir,
+        [(_assistant_text("<manual-handoff/>"), 0, "")] + [(_assistant_text(PASS_RESULT), 0, "")] * 3,
+    )
+    await manual_test._manual_main(saved, repo, storage)
+
+    final = load_manual_state(conductor_dir)
+    assert final.status == "completed"
+    assert [s.name for s in final.scenarios][-1] == "Coverage row"
 
 
 def test_parse_scenarios_from_table():

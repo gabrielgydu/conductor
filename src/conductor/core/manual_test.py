@@ -15,6 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +25,8 @@ from conductor.core.models import atomic_save
 from conductor.core.presets import ManualTestPolicy, load_preset
 from conductor.core.storage import StorageResolver
 
+if TYPE_CHECKING:
+    from conductor.core.tmux import TmuxManager
 
 MANUAL_STATE_FILE = "MANUAL-TEST-STATE.json"
 MANUAL_LOG_FILE = "MANUAL-TEST-LOG.md"
@@ -47,6 +50,11 @@ ALLOWED_SEVERITIES = {"high", "medium", "low", "ux"}
 ALLOWED_CATEGORIES = {"app_bug", "ux", "test_gap", "flaky", "env", "data"}
 TERMINAL_SCENARIO_STATUSES = {"passed", "failed", "blocked", "policy_violation"}
 FIXABLE_FINDING_CATEGORIES = {"app_bug", "ux"}
+
+# Claude infrastructure failures (no output, auth/model errors, usage limits)
+# are retried after a pause; this many in a row pause the whole run instead.
+MAX_CONSECUTIVE_INFRA_FAILURES = 3
+INFRA_RETRY_DELAY_SECS = 60
 
 
 class ManualEvidence(BaseModel):
@@ -141,6 +149,10 @@ class ManualTestState(BaseModel):
     plan_file: str
     preset: str | None = None
     status: str = "pending"
+    # Status to return to when a "paused" run is resumed ("coverage" or "running").
+    paused_from: str = ""
+    last_error: str = ""
+    consecutive_infra_failures: int = 0
     current_scenario_index: int = 0
     session_count: int = 0
     model: str | None = None
@@ -183,6 +195,13 @@ class ManualSignal(BaseModel):
     shortcuts: list[DataShortcut] = Field(default_factory=list)
     policy_flags: list[PolicyFlag] = Field(default_factory=list)
     raw_text: str = ""
+    # Set by _run_generation when Claude itself failed (see _claude_failure);
+    # such a generation says nothing about the scenario or finding.
+    infra_error: str = ""
+
+
+class ManualRunPaused(Exception):
+    """Stop the run, resumably: raised when Claude keeps failing to run at all."""
 
 
 def manual_state_path(conductor_dir: Path) -> Path:
@@ -493,6 +512,8 @@ def format_manual_status(state: ManualTestState) -> str:
         f"Findings: {len(state.findings)}",
         "",
     ]
+    if state.last_error:
+        lines.insert(2, f"Last error: {state.last_error}")
     for scenario in state.scenarios:
         marker = {
             "passed": "[x]",
@@ -547,6 +568,8 @@ def generate_manual_report(state: ManualTestState) -> str:
         "## Scenario Counts",
         "",
     ]
+    if state.last_error:
+        lines.insert(6, f"- Last error: {state.last_error}")
     if scenario_counts:
         for status in sorted(scenario_counts):
             lines.append(f"- {status}: {scenario_counts[status]}")
@@ -637,6 +660,22 @@ def write_manual_report(state: ManualTestState, conductor_dir: Path) -> Path:
     path = manual_report_path(conductor_dir)
     path.write_text(generate_manual_report(state), encoding="utf-8")
     return path
+
+
+def _stream_events(output: str) -> list[dict]:
+    """The JSON object events of a stream-json transcript; other lines are skipped."""
+    events: list[dict] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
 
 
 def _extract_text_from_stream_json(output: str) -> str:
@@ -1531,6 +1570,67 @@ def _write_generation_handoff(
     return path
 
 
+# API errors that say nothing about the work: the call was refused or failed.
+# Context exhaustion ("Prompt is too long", reported as invalid_request) and
+# error_max_turns are deliberately absent: those sessions did real work and ran
+# out of budget, which is an attempt like any other.
+_INFRA_API_ERRORS = {"authentication_failed", "billing_error", "rate_limit", "server_error"}
+
+
+def _clip(text: str, limit: int = 500) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def _claude_failure(output: str, exit_code: int, stderr: str) -> str:
+    """Describe a Claude infrastructure failure, or return "" for a real attempt.
+
+    It is an infrastructure failure when the model never produced a turn of its
+    own (empty output, bad model, auth error, usage limit before the first
+    turn), or when the session ended on an API error from _INFRA_API_ERRORS.
+    """
+    worked = False
+    error_kind = ""
+    error_text = ""
+    for event in _stream_events(output):
+        if event.get("type") == "assistant":
+            message = event.get("message") or {}
+            blocks = [b for b in message.get("content") or [] if isinstance(b, dict)]
+            if event.get("error") or message.get("model") == "<synthetic>":
+                error_kind = str(event.get("error") or "")
+                error_text = "\n".join(str(b.get("text", "")) for b in blocks) or error_text
+            elif any(b.get("type") in {"text", "tool_use"} for b in blocks):
+                worked = True
+        elif event.get("type") == "result" and event.get("is_error"):
+            if event.get("subtype") == "success" and isinstance(event.get("result"), str):
+                error_text = event["result"] or error_text
+
+    detail = _clip(error_text or stderr) or "no output"
+    if not worked:
+        return f"exit {exit_code}: {detail}"
+    if error_kind in _INFRA_API_ERRORS:
+        return f"{error_kind}: {detail}"
+    return ""
+
+
+def _read_generation_result(
+    exit_file: Path, output_file: Path, stderr_file: Path
+) -> tuple[int, str, str]:
+    try:
+        exit_code = int(exit_file.read_text().strip())
+    except (OSError, ValueError):
+        exit_code = 1
+    output_text = ""
+    if output_file.exists():
+        output_text = output_file.read_text(encoding="utf-8", errors="replace")
+    stderr_text = ""
+    if stderr_file.exists():
+        stderr_text = stderr_file.read_text(encoding="utf-8", errors="replace")
+        if not stderr_text.strip():
+            stderr_file.unlink()
+    return exit_code, output_text, stderr_text
+
+
 async def _run_generation(
     *,
     state: ManualTestState,
@@ -1555,12 +1655,15 @@ async def _run_generation(
         scenario_index=scenario.index if scenario else None,
     )
     state.generations.append(generation)
-    save_manual_state(state, conductor_dir)
+    # A coverage generation edits MANUAL-TEST-SCENARIOS.md itself; re-rendering
+    # it here would wipe a previous coverage attempt's matrix on retry.
+    save_manual_state(state, conductor_dir, write_markdown=write_markdown_on_finish)
 
     safe = _safe_name(state.name)
     label_safe = _safe_name(label)
     prompt_file = conductor_dir / "logs" / f"manual-prompt-{generation.index:03d}-{label_safe}.md"
     output_file = conductor_dir / "logs" / f"manual-output-{generation.index:03d}-{label_safe}.jsonl"
+    stderr_file = conductor_dir / "logs" / f"manual-stderr-{generation.index:03d}-{label_safe}.log"
     exit_file = Path(f"/tmp/conductor-manual-exit-{safe}-{generation.index:03d}-{label_safe}")
     prompt_file.write_text(prompt, encoding="utf-8")
     exit_file.unlink(missing_ok=True)
@@ -1569,11 +1672,12 @@ async def _run_generation(
     quoted_prompt = shlex.quote(str(prompt_file))
     quoted_output = shlex.quote(str(output_file))
     quoted_exit = shlex.quote(str(exit_file))
+    quoted_stderr = shlex.quote(str(stderr_file))
     filter_mod = "conductor.core.stream_filter"
     pipeline = (
         f"claude -p - --dangerously-skip-permissions "
         f"--max-turns {state.max_turns} --model {shlex.quote(model)} "
-        f"--output-format stream-json --verbose < {quoted_prompt} 2>/dev/null "
+        f"--output-format stream-json --verbose < {quoted_prompt} 2> {quoted_stderr} "
         f"| python3 -m {filter_mod} {quoted_output}; "
         f"echo ${{PIPESTATUS[0]}} > {quoted_exit}"
     )
@@ -1596,30 +1700,34 @@ async def _run_generation(
         log_file=tmux_log,
     )
     await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
-
-    try:
-        exit_code = int(exit_file.read_text().strip())
-    except (OSError, ValueError):
-        exit_code = 1
-
-    output_text = ""
-    if output_file.exists():
-        output_text = output_file.read_text(encoding="utf-8", errors="replace")
+    exit_code, output_text, stderr_text = _read_generation_result(exit_file, output_file, stderr_file)
 
     policy_flags = scan_policy_shortcuts(output_text, policy)
     signal = parse_manual_signal(output_text, policy_flags=policy_flags, policy=policy)
+    if not signal.valid:
+        signal.infra_error = _claude_failure(output_text, exit_code, stderr_text)
+    if signal.infra_error:
+        state.consecutive_infra_failures += 1
+    else:
+        state.consecutive_infra_failures = 0
     generation.completed_at = datetime.now(timezone.utc)
-    generation.summary = signal.kind or "no-signal"
+    generation.summary = "infra-error" if signal.infra_error else (signal.kind or "no-signal")
 
+    outcome = (
+        f"Claude failed ({signal.infra_error})"
+        if signal.infra_error
+        else f"signal {signal.kind}, valid={signal.valid}"
+    )
     _log(
         "MANUAL_GENERATION_END",
-        f"Generation {generation.index}: exit {exit_code}, signal {signal.kind}, valid={signal.valid}",
+        f"Generation {generation.index}: exit {exit_code}, {outcome}",
         log_path,
         audit_path,
         exit_code=exit_code,
         signal=signal.kind,
         valid=signal.valid,
         errors=signal.errors,
+        infra_error=signal.infra_error,
         auto_approved=[
             f"{flag.pattern}: {flag.value}"
             for flag in policy_flags
@@ -1630,6 +1738,35 @@ async def _run_generation(
     exit_file.unlink(missing_ok=True)
     save_manual_state(state, conductor_dir, write_markdown=write_markdown_on_finish)
     return signal, output_text
+
+
+async def _run_generation_retrying(**kwargs) -> tuple[ManualSignal, str]:
+    """Run a generation, retrying it while Claude itself fails to run.
+
+    Raises ManualRunPaused after MAX_CONSECUTIVE_INFRA_FAILURES failures in a
+    row, so a usage limit or auth error stops the run instead of being counted
+    against scenarios and findings.
+    """
+    state: ManualTestState = kwargs["state"]
+    while True:
+        signal, output_text = await _run_generation(**kwargs)
+        if not signal.infra_error:
+            return signal, output_text
+        if state.consecutive_infra_failures >= MAX_CONSECUTIVE_INFRA_FAILURES:
+            raise ManualRunPaused(
+                f"{state.consecutive_infra_failures} Claude failures in a row; "
+                f"last ({kwargs['label']}): {signal.infra_error}"
+            )
+        _log(
+            "MANUAL_INFRA_RETRY",
+            f"{kwargs['label']}: Claude failed ({signal.infra_error}); "
+            f"retrying in {INFRA_RETRY_DELAY_SECS}s",
+            kwargs["log_path"],
+            kwargs["audit_path"],
+            error=signal.infra_error,
+            consecutive=state.consecutive_infra_failures,
+        )
+        await asyncio.sleep(INFRA_RETRY_DELAY_SECS)
 
 
 def _apply_signal_to_scenario(
@@ -1742,19 +1879,23 @@ async def _fix_and_verify_finding(
     finding.status = "fixing"
     save_manual_state(state, conductor_dir)
 
-    signal, output_text = await _run_generation(
-        state=state,
-        project_dir=project_dir,
-        conductor_dir=conductor_dir,
-        tmux=tmux,
-        prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir),
-        label=f"fix-{finding.id}",
-        model=model,
-        scenario=_scenario_for_finding(state, finding),
-        log_path=log_path,
-        audit_path=audit_path,
-        policy=policy,
-    )
+    try:
+        signal, output_text = await _run_generation_retrying(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            tmux=tmux,
+            prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir),
+            label=f"fix-{finding.id}",
+            model=model,
+            scenario=_scenario_for_finding(state, finding),
+            log_path=log_path,
+            audit_path=audit_path,
+            policy=policy,
+        )
+    except ManualRunPaused:
+        finding.status = "open"
+        raise
     generation = state.generations[-1]
     if not signal.valid:
         _write_generation_handoff(
@@ -1788,7 +1929,8 @@ async def _fix_and_verify_finding(
     finding.status = "fixed"
     save_manual_state(state, conductor_dir)
 
-    verifier_signal, verifier_output = await _run_generation(
+    # A pause here leaves the finding "fixed" with its changes in the worktree.
+    verifier_signal, verifier_output = await _run_generation_retrying(
         state=state,
         project_dir=project_dir,
         conductor_dir=conductor_dir,
@@ -1876,17 +2018,107 @@ async def _manual_main(
     tmux = TmuxManager(session_name=f"conductor-manual-test-{state.name}")
     await tmux.ensure_session()
 
+    resumed = ""
+    if state.status == "paused":
+        resumed = f" (resuming after: {state.last_error})"
+        state.status = state.paused_from or "running"
+        state.paused_from = ""
+        state.last_error = ""
+        state.consecutive_infra_failures = 0
+
     _log(
         "MANUAL_TEST_START",
-        f"Starting manual-test {state.name} with {len(state.scenarios)} scenarios",
+        f"Starting manual-test {state.name} with {len(state.scenarios)} scenarios{resumed}",
         log_path,
         audit_path,
     )
 
+    try:
+        await _run_manual_phases(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            tmux=tmux,
+            plan_content=plan_content,
+            log_path=log_path,
+            audit_path=audit_path,
+            model=model,
+            policy=policy,
+        )
+    except ManualRunPaused as exc:
+        state.paused_from = state.status
+        state.status = "paused"
+        state.last_error = str(exc)
+        # A pause during coverage must not re-render the matrix coverage edited.
+        save_manual_state(state, conductor_dir, write_markdown=state.paused_from != "coverage")
+        report = write_manual_report(state, conductor_dir)
+        _log(
+            "MANUAL_TEST_PAUSED",
+            f"Manual-test paused: {exc}",
+            log_path,
+            audit_path,
+            error=str(exc),
+            report=str(report),
+        )
+        _print_banner(
+            f"MANUAL TEST PAUSED: {state.name}",
+            [
+                f"Reason: {exc}",
+                "Re-run the same `conductor manual-test` command to resume.",
+                f"Report: {report}",
+            ],
+        )
+        return
+
+    failed = sum(1 for s in state.scenarios if s.status == "failed")
+    blocked = sum(1 for s in state.scenarios if s.status == "blocked")
+    violations = sum(1 for s in state.scenarios if s.status == "policy_violation")
+    state.status = "completed" if failed == 0 and blocked == 0 and violations == 0 else "failed"
+    save_manual_state(state, conductor_dir)
+    report = write_manual_report(state, conductor_dir)
+
+    _log(
+        "MANUAL_TEST_DONE",
+        f"Manual-test finished: {state.status}; report {report}",
+        log_path,
+        audit_path,
+        report=str(report),
+    )
+    _print_banner(
+        f"MANUAL TEST COMPLETE: {state.name}",
+        [f"Status: {state.status}", f"Report: {report}"],
+    )
+
+
+def _print_banner(title: str, lines: list[str]) -> None:
+    sep = "=" * 50
+    print(f"\n{sep}", file=sys.stderr)
+    print(f"  {title}", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    print(f"{sep}\n", file=sys.stderr)
+
+
+async def _run_manual_phases(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy,
+) -> None:
+    """Coverage, then retries of open findings, then every open scenario.
+
+    Raises ManualRunPaused to stop early; state is resumable at that point.
+    """
     if state.status in {"pending", "coverage"}:
         state.status = "coverage"
         save_manual_state(state, conductor_dir, write_markdown=False)
-        signal, output_text = await _run_generation(
+        signal, output_text = await _run_generation_retrying(
             state=state,
             project_dir=project_dir,
             conductor_dir=conductor_dir,
@@ -1910,9 +2142,10 @@ async def _manual_main(
                 reason="coverage generation did not produce valid handoff signal",
                 output_text=output_text,
             )
-            state.status = "coverage"
-            save_manual_state(state, conductor_dir, write_markdown=False)
-            return
+            raise ManualRunPaused(
+                "coverage generation did not produce a valid handoff signal: "
+                + "; ".join(signal.errors)
+            )
         scenarios_text = manual_scenarios_path(conductor_dir).read_text(encoding="utf-8")
         discovered = parse_scenarios_from_markdown(scenarios_text)
         if discovered:
@@ -1953,19 +2186,25 @@ async def _manual_main(
         scenario.started_at = scenario.started_at or datetime.now(timezone.utc)
         save_manual_state(state, conductor_dir)
 
-        signal, output_text = await _run_generation(
-            state=state,
-            project_dir=project_dir,
-            conductor_dir=conductor_dir,
-            tmux=tmux,
-            prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir, policy=policy),
-            label=f"scenario-{scenario.index}",
-            model=model,
-            scenario=scenario,
-            log_path=log_path,
-            audit_path=audit_path,
-            policy=policy,
-        )
+        try:
+            signal, output_text = await _run_generation_retrying(
+                state=state,
+                project_dir=project_dir,
+                conductor_dir=conductor_dir,
+                tmux=tmux,
+                prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir, policy=policy),
+                label=f"scenario-{scenario.index}",
+                model=model,
+                scenario=scenario,
+                log_path=log_path,
+                audit_path=audit_path,
+                policy=policy,
+            )
+        except ManualRunPaused:
+            # Claude never ran the scenario; this was not an attempt.
+            scenario.attempts -= 1
+            scenario.status = "pending"
+            raise
         generation = state.generations[-1]
         _apply_signal_to_scenario(
             state=state,
@@ -1993,25 +2232,3 @@ async def _manual_main(
                 model=model,
                 policy=policy,
             )
-
-    failed = sum(1 for s in state.scenarios if s.status == "failed")
-    blocked = sum(1 for s in state.scenarios if s.status == "blocked")
-    policy = sum(1 for s in state.scenarios if s.status == "policy_violation")
-    state.status = "completed" if failed == 0 and blocked == 0 and policy == 0 else "failed"
-    save_manual_state(state, conductor_dir)
-    report = write_manual_report(state, conductor_dir)
-
-    _log(
-        "MANUAL_TEST_DONE",
-        f"Manual-test finished: {state.status}; report {report}",
-        log_path,
-        audit_path,
-        report=str(report),
-    )
-
-    sep = "=" * 50
-    print(f"\n{sep}", file=sys.stderr)
-    print(f"  MANUAL TEST COMPLETE: {state.name}", file=sys.stderr)
-    print(f"  Status: {state.status}", file=sys.stderr)
-    print(f"  Report: {report}", file=sys.stderr)
-    print(f"{sep}\n", file=sys.stderr)
