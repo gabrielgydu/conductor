@@ -23,9 +23,8 @@ from conductor.core.enums import RunStatus, IntegrationStatus
 
 @pytest.fixture(autouse=True)
 def _stub_post_merge_checks(monkeypatch):
-    """Post-merge validation writes a smoke spec into the (fake) integration
-    worktree under /tmp and reads user presets; stub it and E2E generation."""
-    from conductor.core.models import E2ETestState
+    """Post-merge validation and E2E generation would run against the (fake)
+    integration worktree; stub both."""
     from conductor.core.validation import ValidationResult
 
     monkeypatch.setattr(
@@ -33,8 +32,8 @@ def _stub_post_merge_checks(monkeypatch):
         AsyncMock(return_value=ValidationResult(passed=True, summary="stubbed")),
     )
     monkeypatch.setattr(
-        "conductor.integration.e2e.run_integration_testing",
-        AsyncMock(return_value=E2ETestState(skipped=1)),
+        "conductor.integration.e2e.generate_integration_tests",
+        AsyncMock(return_value=False),
     )
 
 

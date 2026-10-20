@@ -361,14 +361,13 @@ async def run_integration_merge(
             )
 
     try:
-        return await _integrate(state, storage, worktree_path, branch_name, eligible_runs)
+        return await _integrate(state, worktree_path, branch_name, eligible_runs)
     finally:
         await _remove_worktree(worktree_path, repo_root)
 
 
 async def _integrate(
     state: ConductorState,
-    storage,  # StorageResolver
     wt: Path,
     branch_name: str,
     eligible_runs: list[RunState],
@@ -490,6 +489,13 @@ async def _integrate(
             conflicts_unresolved=conflicts_unresolved,
         )
 
+    # --- Integration E2E tests: generated once here, run by validation ---
+    from conductor.integration.e2e import generate_integration_tests
+
+    if len(merged_runs) >= 2:
+        _print("Generating cross-feature integration tests")
+        await generate_integration_tests(state, wt, merged_runs, conflicts_resolved)
+
     # --- Post-merge validation with self-healing ---
     # The smoke check writes tests/Playwright/tests/conductor-smoke.spec.ts itself
     # when it falls back to the generated Playwright smoke test.
@@ -520,10 +526,7 @@ async def _integrate(
     ):
         _print("Committed post-merge validation fixes")
 
-    # --- Integration tests ---
-    from conductor.integration.e2e import run_integration_testing
-
-    e2e_result = await run_integration_testing(state, storage, wt)
+    e2e_result = next((c.e2e for c in vresult.checks if c.e2e is not None), None)
 
     # Commit any generated test files
     await _run_git(["add", "tests/Playwright/tests/conductor-*.spec.ts"], wt)

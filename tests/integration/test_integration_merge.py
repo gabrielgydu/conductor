@@ -758,3 +758,52 @@ async def test_validation_crash_still_publishes(real_merge_repo, tmp_path, herme
     assert result.merged_runs == [0, 1]
     assert any(c.args[0][:3] == ["gh", "pr", "create"] for c in gh.await_args_list)
     assert not (tmp_path / "worktrees" / f"integration-{project_name}").exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Integration specs are generated once, run by validation, recorded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_integration_specs_generated_once_and_results_recorded(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    from conductor.core.models import E2ETestState
+    from conductor.core.validation import CheckResult, ValidationResult
+
+    real_merge_repo.create_branch("e2e-a", {"e2e_a.txt": "a\n"})
+    real_merge_repo.create_branch("e2e-b", {"e2e_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "e2e-a"),
+        _done_run_with_branch(1, "feat-b", "e2e-b"),
+        _done_run_with_branch(2, "feat-gone", "no-such-branch"),
+    )
+    counts = E2ETestState(passed=4, failed=1)
+    order = []
+
+    async def validate(ctx, max_attempts):
+        order.append("validate")
+        return ValidationResult(
+            passed=False,
+            checks=[CheckResult("integration-tests", False, "1 failed", 0.0, e2e=counts)],
+            summary="0/1 checks passed. Failed: integration-tests",
+        )
+
+    hermetic_merge.e2e.side_effect = lambda *a, **k: order.append("generate")
+    hermetic_merge.validate.side_effect = validate
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert order == ["generate", "validate"]
+    hermetic_merge.e2e.assert_awaited_once()
+    _, _, runs, conflicts = hermetic_merge.e2e.await_args.args
+    assert [r.name for r in runs] == ["feat-a", "feat-b"]  # not the unmerged run
+    assert conflicts == []
+    assert result.e2e == counts

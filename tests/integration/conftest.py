@@ -734,7 +734,6 @@ def hermetic_merge(monkeypatch):
     import conductor.core.validation as validation_module
     import conductor.integration.e2e as e2e_module
     import conductor.integration.merge as merge_module
-    from conductor.core.models import E2ETestState
     from conductor.core.validation import ValidationResult
 
     async def _no_real_claude(*args, **kwargs):
@@ -746,9 +745,9 @@ def hermetic_merge(monkeypatch):
         monkeypatch.setattr(module, "run_claude", _no_real_claude)
 
     validate = AsyncMock(return_value=ValidationResult(passed=True, summary="stubbed"))
-    e2e = AsyncMock(return_value=E2ETestState(skipped=1))
+    e2e = AsyncMock(return_value=False)
     monkeypatch.setattr(merge_module, "validate_and_fix", validate)
-    monkeypatch.setattr(e2e_module, "run_integration_testing", e2e)
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", e2e)
     monkeypatch.setattr(merge_module, "_GH_RETRY_DELAY_S", 0)
     return SimpleNamespace(validate=validate, e2e=e2e)
 

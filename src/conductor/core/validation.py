@@ -19,7 +19,7 @@ from conductor.core.claude import run_claude
 from conductor.core.presets import CommandSpec, ValidationSettings, load_preset
 
 if TYPE_CHECKING:
-    from conductor.core.models import ConductorState
+    from conductor.core.models import ConductorState, E2ETestState
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class CheckResult:
     passed: bool
     output: str  # last 2000 chars
     duration_s: float
+    e2e: E2ETestState | None = None  # integration-tests only: the Playwright counts
 
 
 @dataclass
@@ -305,41 +306,20 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
 
 
 async def _check_integration_tests(ctx: ValidationContext) -> CheckResult:
+    """Run the conductor integration specs already in the project (the
+    integration merge generates them); skipped when there are none."""
     start = time.monotonic()
 
     # Lazy import to avoid circular imports
-    from conductor.integration.e2e import run_integration_testing  # noqa: PLC0415
+    from conductor.integration.e2e import run_integration_specs  # noqa: PLC0415
 
-    if ctx.state is None:
-        return CheckResult(
-            name="integration-tests",
-            passed=False,
-            output="ValidationContext.state is required for integration-tests check",
-            duration_s=time.monotonic() - start,
-        )
-
-    # run_integration_testing expects a storage object with a .repo_root attribute.
-    # Adapt ctx.project_dir into that interface.
-    class _StorageAdapter:
-        def __init__(self, path: Path) -> None:
-            self.repo_root = str(path)
-
-    e2e_state = await run_integration_testing(
-        ctx.state, _StorageAdapter(ctx.project_dir), ctx.project_dir
-    )
-
-    passed = e2e_state.failed == 0
-    summary_parts = [
-        f"passed={e2e_state.passed}",
-        f"failed={e2e_state.failed}",
-        f"skipped={e2e_state.skipped}",
-    ]
-    output = ", ".join(summary_parts)
+    e2e_state, output = await run_integration_specs(ctx.project_dir)
     return CheckResult(
         name="integration-tests",
-        passed=passed,
+        passed=e2e_state.failed == 0,
         output=output,
         duration_s=time.monotonic() - start,
+        e2e=e2e_state,
     )
 
 
