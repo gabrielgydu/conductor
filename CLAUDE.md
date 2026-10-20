@@ -150,7 +150,7 @@ Each loop session receives **both** the original plan (full context) and the tas
 - `src/speccer/` — spec generation loop
 - `src/runner/` — code execution runner
   - `src/runner/steer_inbox.py` — file-based steering IPC (polls `.msg` files from orchestrator)
-- `conductor`, `speccer`, `runner` — bash wrapper scripts (auto-bootstrap venv)
+- `conductor`, `speccer`, `runner` — bash wrapper scripts; `scripts/venv-run` creates, repairs and runs `.venv`
 
 ## Steering
 

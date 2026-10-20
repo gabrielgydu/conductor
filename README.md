@@ -26,7 +26,11 @@ cd /path/to/your/project
 /path/to/conductor/conductor run --name my-feature --project-dir . --no-overnight
 ```
 
-No manual venv setup needed — the `./conductor` and `./speccer` wrapper scripts auto-create a venv and install dependencies on first run.
+No manual venv setup needed: the `./conductor`, `./speccer` and `./runner` wrappers create `.venv` and install conductor into it on first run.
+
+They also repair it: a failed or interrupted install is retried on the next call, a changed `pyproject.toml` is reinstalled, and the venv is rebuilt when a Python upgrade breaks it.
+
+The venv is built with the first `python3` or `python` that is at least 3.11; set `CONDUCTOR_PYTHON` to choose another.
 
 ## Requirements
 
