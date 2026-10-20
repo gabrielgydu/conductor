@@ -109,3 +109,11 @@ def git_unstage_paths(cwd: Path, paths: list[str]) -> None:
 def git_current_sha(cwd: Path) -> str:
     result = _run(["git", "rev-parse", "HEAD"], cwd=cwd, check=False)
     return result.stdout.strip()
+
+
+def git_is_ancestor(cwd: Path, sha: str) -> bool:
+    """True if commit *sha* is HEAD or one of its ancestors."""
+    if not sha:
+        return False
+    result = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=cwd, check=False)
+    return result.returncode == 0

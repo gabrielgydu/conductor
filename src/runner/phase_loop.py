@@ -43,6 +43,7 @@ from runner.git_ops import (
     git_unstage_pre_existing,
     git_unstage_paths,
     git_current_sha,
+    git_is_ancestor,
 )
 from runner.logging import log, info, success, warn, error, header, dim, bold
 from runner.prompt import build_prompt
@@ -56,6 +57,10 @@ from runner.steer_inbox import poll_steer_inbox
 _RETRY_PAUSE_S = 2.0
 _PHASE_PAUSE_S = 3.0
 
+# Completed phases, one JSON object per line, appended as each phase ends.
+# A restart without --start-phase resumes after them (see _completed_phases).
+PHASES_DONE_FILE = "PHASES-DONE.jsonl"
+
 # Run state the runner writes into its feature dir. The orchestrator places
 # that dir inside the worktree (docs/<feature>/), so these are unstaged before
 # every commit: they describe the run, they are not part of the feature.
@@ -64,6 +69,7 @@ _RUNNER_FILES = (
     "STATS.json",
     "exit_code",
     "RUN-CONFIG.json",
+    PHASES_DONE_FILE,
     "logs",  # also holds the .pre-untracked-phase-N snapshots
     "steer_inbox",
 )
@@ -86,6 +92,71 @@ def _runner_owned_paths(project_dir: Path, feature_dir: Path, feature_name: str)
         return paths  # feature dir outside the repo (runner CLI default)
     paths.extend((rel / name).as_posix() for name in _RUNNER_FILES)
     return paths
+
+
+# ─── Phase checkpoint ───────────────────────────────────────────────────────
+
+
+def _record_phase_done(checkpoint: Path, phase: PhaseConfig, sha: str, committed: bool) -> None:
+    record = {
+        "phase": phase.number,
+        "name": phase.name,
+        "token": phase.token,
+        "sha": sha,
+        "committed": committed,
+        "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    with open(checkpoint, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _write_checkpoint(checkpoint: Path, records: list[dict]) -> None:
+    if not records:
+        checkpoint.unlink(missing_ok=True)
+        return
+    checkpoint.write_text("".join(json.dumps(r) + "\n" for r in records), "utf-8")
+
+
+def _completed_phases(cfg: RunConfig, project_dir: Path, checkpoint: Path) -> list[dict]:
+    """Checkpoint records of the leading phases that are done on this branch.
+
+    Every record must still describe this plan (same phase name and token)
+    and its commit must still be HEAD or an ancestor of it. Otherwise the
+    branch was reset or rebuilt, or the plan regenerated, since the phases
+    ran, and nothing is trusted: the run starts again from the first phase.
+    """
+    try:
+        lines = checkpoint.read_text("utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    records: dict[int, dict] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn last line after a kill
+        if isinstance(record, dict) and isinstance(record.get("phase"), int):
+            records[record["phase"]] = record
+
+    phases = {p.number: p for p in cfg.phases}
+    for number, record in records.items():
+        phase = phases.get(number)
+        if (
+            phase is None
+            or record.get("token") != phase.token
+            or record.get("name") != phase.name
+            or not git_is_ancestor(project_dir, str(record.get("sha", "")))
+        ):
+            warn(f"Phase checkpoint {checkpoint.name} does not match this branch or plan "
+                 f"(phase {number}) — ignoring it")
+            return []
+
+    done = []
+    for phase in cfg.phases:
+        if phase.number not in records:
+            break
+        done.append(records[phase.number])
+    return done
 
 
 # Gate output fed back to Claude is capped like local CI output.
@@ -465,9 +536,13 @@ async def run_phase_loop(
     cfg: RunConfig,
     feature_dir: Path,
     storage_dir: Optional[Path] = None,
-    start_phase: int = 1,
+    start_phase: int | None = None,
 ) -> int:
     """Drive Claude through all phases in cfg.
+
+    Without *start_phase*, resumes after the phases recorded as done in
+    feature_dir/PHASES-DONE.jsonl (see _completed_phases); a fresh run starts
+    at the first phase.
 
     Writes exit_code (0/1) to feature_dir when done.
     Returns the exit code.
@@ -497,8 +572,28 @@ async def run_phase_loop(
         _write_exit_code(feature_dir, 1)
         return 1
 
+    # ── Resume point ───────────────────────────────────────────────────────
+    # Restarts (infra/transient/logic retries, auto-resume) relaunch the
+    # runner without --start-phase; replaying finished phases costs a Claude
+    # session each and can sweep the interrupted phase's leftovers into an
+    # earlier phase's commit.
+    checkpoint = feature_dir / PHASES_DONE_FILE
+    done = _completed_phases(cfg, project_dir, checkpoint)
+    if start_phase is None:
+        start_phase = next(
+            (p.number for p in cfg.phases if p.number not in {r["phase"] for r in done}),
+            max((p.number for p in cfg.phases), default=0) + 1,
+        )
+        if done:
+            log(f"Phases {', '.join(str(r['phase']) for r in done)} already done "
+                f"(per {checkpoint.name}) — resuming at phase {start_phase}")
+    skipped = [r for r in done if r["phase"] < start_phase]
+    _write_checkpoint(checkpoint, skipped)
+
     exit_code = 0
-    any_committed = False
+    # Skipped phases count: without their commits a resumed run whose
+    # remaining phases change nothing would skip the end-of-run checks.
+    any_committed = any(r.get("committed") for r in skipped)
 
     for phase in cfg.phases:
         if phase.number < start_phase:
@@ -518,6 +613,8 @@ async def run_phase_loop(
         phase_duration = time.monotonic() - phase_start
         if phase_committed:
             any_committed = True
+        if phase_ok:
+            _record_phase_done(checkpoint, phase, git_current_sha(project_dir), phase_committed)
 
         phase_results.append(
             {

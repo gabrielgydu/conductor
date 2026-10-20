@@ -207,3 +207,77 @@ async def test_no_op_phase_skips_the_gate(project, tmp_path, monkeypatch):
 
     assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
     assert _commits(repo) == ["init"]
+
+
+# ─── Restarts resume after the completed phases (F44) ───────────────────────
+
+
+def leave_partial_work(repo: Path, phase: int) -> str:
+    # Interrupted mid-phase: edits on disk, no promise token.
+    (repo / f"phase{phase}_partial.py").write_text("WIP = True\n")
+    return "still working"
+
+
+async def _crash_in_phase_2(repo: Path, feature_dir: Path, monkeypatch, **cfg_overrides) -> None:
+    fake = FakeClaude(repo, [write_code_and_finish] + [leave_partial_work] * 3)
+    assert await _run(_config(repo, feature_dir, **cfg_overrides), feature_dir, fake, monkeypatch) == 1
+    assert _commits(repo) == ["Phase 1: Step 1", "init"]
+
+
+async def test_restart_resumes_at_first_incomplete_phase(project, monkeypatch):
+    repo, feature_dir = project
+    await _crash_in_phase_2(repo, feature_dir, monkeypatch)
+
+    fake = FakeClaude(repo, [write_code_and_finish])
+    assert await _run(_config(repo, feature_dir), feature_dir, fake, monkeypatch) == 0
+
+    assert fake.calls == [2]
+    assert _commits(repo) == ["Phase 2: Step 2", "Phase 1: Step 1", "init"]
+    # Phase 2's leftovers from the first attempt land in phase 2's commit.
+    assert sorted(_files_in(repo, "HEAD")) == ["phase2.py", "phase2_partial.py"]
+
+
+async def test_checkpoint_from_another_history_is_ignored(project, monkeypatch):
+    repo, feature_dir = project
+    await _crash_in_phase_2(repo, feature_dir, monkeypatch)
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")  # phase 1's commit is gone
+
+    fake = FakeClaude(repo, [write_code_and_finish, write_code_and_finish])
+    assert await _run(_config(repo, feature_dir), feature_dir, fake, monkeypatch) == 0
+
+    assert fake.calls == [1, 2]
+
+
+async def test_explicit_start_phase_overrides_checkpoint(project, monkeypatch):
+    repo, feature_dir = project
+    await _crash_in_phase_2(repo, feature_dir, monkeypatch)
+
+    fake = FakeClaude(repo, [finish_without_changes, write_code_and_finish])
+    assert await _run(_config(repo, feature_dir), feature_dir, fake, monkeypatch, start_phase=1) == 0
+
+    assert fake.calls == [1, 2]
+
+
+async def test_resumed_run_still_runs_end_of_run_checks(project, monkeypatch):
+    # Phase 1 committed before the restart; the resumed phase 2 changes
+    # nothing. The run as a whole did commit, so quick mode's end-of-run
+    # checks must not be skipped as "all phases were no-ops".
+    repo, feature_dir = project
+    overrides = {"quick": True, "local_ci_enabled": True, "local_ci_command": "make ci"}
+    await _crash_in_phase_2(repo, feature_dir, monkeypatch, **overrides)
+    (repo / "phase2_partial.py").unlink()
+
+    import runner.local_checks as local_checks
+
+    checks: list[bool] = []
+
+    async def failing_checks(*_args, **kwargs):
+        checks.append(kwargs.get("full_mode", False))
+        return False
+
+    monkeypatch.setattr(local_checks, "run_local_checks", failing_checks)
+    fake = FakeClaude(repo, [finish_without_changes])
+    assert await _run(_config(repo, feature_dir, **overrides), feature_dir, fake, monkeypatch) == 1
+
+    assert fake.calls == [2]
+    assert checks == [True]
