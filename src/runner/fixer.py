@@ -30,6 +30,7 @@ from runner.logging import log, warn, error, dim
 _MAX_PROMPT_CHARS = 100_000
 _MAX_REVIEW_THREADS = 15
 _CI_INITIAL_WAIT = 30   # seconds before first poll
+_FIX_WORKTREE_ROOT = Path("/tmp")
 
 
 # ─── Data structures ─────────────────────────────────────────────────────────
@@ -359,8 +360,8 @@ def get_unresolved_threads(pr_number: int, owner: str, repo: str, cwd: Path) -> 
     return [n for n in nodes if not n.get("isResolved", True)]
 
 
-def resolve_thread(thread_id: str, cwd: Path) -> None:
-    """Resolve a single review thread via GraphQL mutation."""
+def resolve_thread(thread_id: str, cwd: Path) -> bool:
+    """Resolve a single review thread via GraphQL mutation. True if GitHub confirms it."""
     query = """
     mutation($threadId: ID!) {
       resolveReviewThread(input: {threadId: $threadId}) {
@@ -368,7 +369,9 @@ def resolve_thread(thread_id: str, cwd: Path) -> None:
       }
     }
     """
-    _graphql(query, {"threadId": thread_id}, cwd)
+    data = _graphql(query, {"threadId": thread_id}, cwd)
+    thread = ((data.get("data") or {}).get("resolveReviewThread") or {}).get("thread") or {}
+    return thread.get("isResolved") is True
 
 
 def get_ci_failure_logs(pr_number: int, owner: str, repo: str, cwd: Path, skip_patterns: str = "coverage|Coverage|codecov|Codecov") -> str:
@@ -416,7 +419,12 @@ def build_fix_prompt(
     cfg: FixerConfig,
     ci_logs: str,
     threads: list[dict],
-) -> str:
+) -> tuple[str, list[dict]]:
+    """Return the fix prompt and the review threads it actually shows Claude.
+
+    Threads past _MAX_REVIEW_THREADS, or cut off by the prompt size cap, are
+    not shown and must not be resolved on Claude's behalf.
+    """
     phase_label = ",".join(str(p) for p in sorted(cfg.adopted_phases))
 
     prompt = (
@@ -436,6 +444,7 @@ def build_fix_prompt(
     if ci_logs:
         prompt += f"\n=== CI FAILURES ===\n{ci_logs}\n\nFix the CI failures above. Read the error messages carefully, find the relevant files, and make the corrections.\n"
 
+    shown: list[tuple[dict, int]] = []  # (thread, prompt length once its block is in)
     if threads:
         display_threads = threads[:_MAX_REVIEW_THREADS]
         omitted = max(0, len(threads) - _MAX_REVIEW_THREADS)
@@ -452,6 +461,7 @@ def build_fix_prompt(
                     author = c.get("author", {}).get("login", "?")
                     body = c.get("body", "")
                     prompt += f"[{author}]: {body}\n"
+                shown.append((t, len(prompt)))
 
         if omitted:
             prompt += f"\n({omitted} more threads omitted — address the above first)\n"
@@ -466,7 +476,7 @@ def build_fix_prompt(
         log(f"Prompt too large ({len(prompt)} chars) — truncating by {overflow} chars")
         prompt = prompt[:_MAX_PROMPT_CHARS] + f"\n\n... (prompt truncated — {overflow} chars removed. Focus on the issues shown above.)\n"
 
-    return prompt
+    return prompt, [t for t, end in shown if end <= _MAX_PROMPT_CHARS]
 
 
 # ─── Worktree helpers ─────────────────────────────────────────────────────────
@@ -645,7 +655,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
     status_file = log_dir / f".fixer-status-phase-{cfg.phase}"
 
     fix_branch = f"fix/{cfg.branch}-phase-{cfg.phase}"
-    worktree_dir = Path(f"/tmp/conductor-fix-{cfg.feature_name}-phase-{cfg.phase}-{os.getpid()}")
+    worktree_dir = _FIX_WORKTREE_ROOT / f"conductor-fix-{cfg.feature_name}-phase-{cfg.phase}-{os.getpid()}"
 
     # Step 1: Supersede older fixers (async mode only)
     if not cfg.sync_mode:
@@ -757,7 +767,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
     write_fixer_status(status_file, "fixing", cfg.phase, cfg.adopted_phases)
 
     # Step 5: build prompt
-    prompt = build_fix_prompt(cfg, ci_logs, threads)
+    prompt, shown_threads = build_fix_prompt(cfg, ci_logs, threads)
 
     # Step 6: setup working directory
     if cfg.sync_mode:
@@ -824,6 +834,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
         return
 
     # Step 10: create fix PR (async mode only)
+    fixes_reachable = True  # the pushed fixes can reach cfg.branch
     if not cfg.sync_mode:
         log(f"Creating fix PR targeting {cfg.branch}...")
         pr_result = subprocess.run(
@@ -848,18 +859,23 @@ async def run_fixer(cfg: FixerConfig) -> None:
             log(f"Fix PR created: {pr_result.stdout.strip()}")
         else:
             log(f"Fix PR creation failed: {pr_result.stderr.strip()}")
+            fixes_reachable = False
 
-    # Step 11: resolve review threads
-    if threads:
-        log(f"Resolving {len(threads)} review threads...")
-        for t in threads:
+    # Step 11: resolve the review threads Claude was shown
+    if shown_threads and not fixes_reachable:
+        warn(f"Leaving {len(shown_threads)} review thread(s) open — no fix PR carries the changes")
+    elif shown_threads:
+        if len(shown_threads) < len(threads):
+            log(f"Leaving {len(threads) - len(shown_threads)} review thread(s) open — not shown to Claude")
+        log(f"Resolving {len(shown_threads)} review threads...")
+        for t in shown_threads:
             tid = t.get("id", "")
-            if tid:
-                try:
-                    resolve_thread(tid, cwd)
-                    log(f"  Resolved thread {tid}")
-                except Exception as exc:
-                    warn(f"  Could not resolve thread {tid}: {exc}")
+            if not tid:
+                continue
+            if resolve_thread(tid, cwd):
+                log(f"  Resolved thread {tid}")
+            else:
+                warn(f"  Could not resolve thread {tid}")
 
     # Step 12: cleanup worktree
     if not cfg.sync_mode:
