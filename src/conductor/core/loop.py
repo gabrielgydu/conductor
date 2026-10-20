@@ -15,7 +15,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 from conductor.core.claude import ClaudeResult, resolve_model, run_claude
-from conductor.core.launch import stream_filter_pipe
+from conductor.core.launch import claude_session_script
 from conductor.core.logging import live_log
 from conductor.core.models import atomic_save, load_state
 from conductor.core.presets import load_preset
@@ -452,26 +452,14 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         prompt_file = Path(f"/tmp/conductor-loop-prompt-{state.name}-{task.index}")
         prompt_file.write_text(prompt, encoding="utf-8")
 
-        # Build claude command
-        claude_cmd = (
-            f"claude -p - "
-            f"--dangerously-skip-permissions "
-            f"--max-turns {state.max_turns} "
-            f"--model {model} "
-            f"--output-format stream-json "
-            f"--verbose "
-            f"< {prompt_file}"
-        )
-
-        # Pipe through stream_filter: pretty-prints to terminal + saves raw json to file
-        wrapped_cmd = (
-            f"cd {cwd} && {claude_cmd} 2>/dev/null "
-            f"| {stream_filter_pipe(output_file)}; "
-            f"echo ${{PIPESTATUS[0]}} > {exit_file}"
+        # Claude piped through stream_filter: pretty-prints to the pane + saves raw json to file
+        script = claude_session_script(
+            cwd=cwd, prompt_file=prompt_file, output_file=output_file,
+            exit_file=exit_file, model=model, max_turns=state.max_turns,
         )
 
         log_file = storage.tmux_log(state.name, f"task-{task.index}_session-{state.session_count}")
-        await tmux.spawn_in_window(window_name, wrapped_cmd, cwd=str(cwd), detached=True, log_file=log_file)
+        await tmux.spawn_in_window(window_name, script, cwd=str(cwd), detached=True, log_file=log_file)
 
         # Wait for completion (with zombie/stall detection)
         _log("CLAUDE_RUNNING", f"Claude running in window '{window_name}'", log_path, audit_path)
