@@ -544,17 +544,27 @@ def test_signal_parser_still_rejects_work_after_the_tag_and_conflicting_tags():
     assert ambiguous.errors == ["expected exactly one manual signal tag, found: manual-finding, manual-pass"]
 
 
-def test_signal_parser_uses_the_last_result_block_matching_the_tag():
+def test_signal_parser_uses_the_first_result_block_matching_the_tag():
     finding_then_pass = FINDING_RESULT + "\n" + PASS_RESULT.replace("<manual-pass/>", "") + "\n<manual-finding/>"
     draft_then_pass = FINDING_RESULT.replace("Save button", "Draft") + "\nActually it works.\n" + PASS_RESULT
+    # Real sessions list several findings this way; only one is recorded per generation.
+    two_findings = (
+        FINDING_RESULT
+        + "\n"
+        + FINDING_RESULT.replace("Save button does nothing", "Cancel button does nothing")
+        + "\n<manual-finding/>"
+    )
 
     finding = parse_manual_signal(finding_then_pass)
     passed = parse_manual_signal(draft_then_pass)
+    first_finding = parse_manual_signal(two_findings)
 
     assert finding.valid is True
     assert finding.title == "Save button does nothing"
     assert passed.valid is True
     assert passed.kind == "pass"
+    assert first_finding.valid is True
+    assert first_finding.title == "Save button does nothing"
 
 
 def test_blocked_reason_ignores_nested_shortcut_reason():

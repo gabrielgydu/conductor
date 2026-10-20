@@ -775,7 +775,9 @@ def _manual_result_block(text: str, kind: str | None = None) -> tuple[str, str |
     """The first <manual-result> whose status is *kind*, else the first one.
 
     Sessions sometimes draft a result of another kind before the final one,
-    or report a finding and then summarise with a pass block.
+    or report a finding and then summarise with a pass block. Several blocks
+    of the same kind have so far been several findings, of which only the
+    first is recorded.
     """
     blocks: list[tuple[str, str | None]] = []
     for match in re.finditer(r"<manual-result\b([^>]*)>(.*?)</manual-result>", text, re.DOTALL | re.I):
