@@ -110,3 +110,35 @@ async def test_unchanged_learnings_are_reviewed_once(project, monkeypatch):
 
     assert len(fake.prompts) == 1
     assert (project.wt / "CLAUDE.md").read_text().count("- A rule.") == 1
+
+
+# ---------------------------------------------------------------------------
+# Overnight audit report
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audit_report_uses_the_template_and_the_auto_answers(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    calls = home / "brain-calls"
+    calls.mkdir(parents=True)
+    (calls / "answer-questions-0-0-1.json").write_text(json.dumps({
+        "questions": "### Q1: Soft delete?", "response": "### Q1\nYes, soft delete.",
+    }))
+    stage = StageState(name="s0", spec_mode="full", status=StageStatus.DONE)
+    run = RunState(index=0, name="feat", description="d", stages=[stage], status=RunStatus.DONE)
+    state = ConductorState(project_name="p", runs=[run])
+    storage = SimpleNamespace(
+        brain_calls_dir=lambda name: calls,
+        conductor_dir=lambda name: home,
+    )
+    fake = _FakeClaude("# Overnight Audit Report\n\n## Summary\nFine.")
+    monkeypatch.setattr(brain, "run_claude", fake)
+
+    await orch._generate_audit_report(state, storage)
+
+    prompt = fake.prompts[0]
+    assert "## Decisions & Auto-Answers" in prompt  # the template's report structure
+    assert "### Q1: Soft delete?" in prompt and "Yes, soft delete." in prompt
+    [report] = home.glob("OVERNIGHT-AUDIT-*.md")
+    assert report.read_text().startswith("# Overnight Audit Report")

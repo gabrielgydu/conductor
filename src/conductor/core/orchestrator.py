@@ -18,7 +18,7 @@ from pathlib import Path
 
 import conductor.core.tmux as _tmux_module
 from conductor.core import brain
-from conductor.core.claude import resolve_model, run_claude
+from conductor.core.claude import resolve_model
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.logging import live_log
 from conductor.core.models import ConductorState, RunState, StageState, atomic_save
@@ -3071,80 +3071,97 @@ async def _review_learnings(
     )
 
 
-async def _generate_audit_report(
-    state: ConductorState,
-    storage: StorageResolver,
-    log_path: Path | None = None,
-    audit_path: Path | None = None,
-) -> None:
-    """Generate an overnight audit report via brain."""
-    _log("POST_RUN", "Generating overnight audit report", log_path, audit_path)
+AUDIT_TIMEOUT_S = 600.0
 
-    context_parts: list[str] = []
 
-    # State summary
+def _audit_context(
+    state: ConductorState, storage: StorageResolver, log_path: Path | None
+) -> str:
+    """What the overnight audit needs: outcomes, log, auto-answers, diagnoses."""
     import json as _json
 
     summary = {
         "project_name": state.project_name,
+        "integration": state.integration.model_dump(mode="json") if state.integration else None,
         "runs": [
             {
                 "name": r.name,
                 "status": str(r.status),
                 "current_stage": r.current_stage,
                 "stages": [
-                    {"name": s.name, "status": str(s.status), "retries": s.retries}
+                    {
+                        "name": s.name,
+                        "status": str(s.status),
+                        "retries": s.retries,
+                        "infra_retries": s.infra_retries,
+                        "transient_retries": s.transient_retries,
+                        "question_rounds": s.question_rounds,
+                        "started_at": s.started_at.isoformat() if s.started_at else None,
+                        "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                        "last_error": s.last_error,
+                    }
                     for s in r.stages
                 ],
             }
             for r in state.runs
         ],
     }
-    context_parts.append("## Run State\n" + _json.dumps(summary, indent=2))
+    parts = ["## Run State\n" + _json.dumps(summary, indent=2)]
 
-    # Conductor log
-    if log_path and log_path.exists():
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        context_parts.append(
-            "## Conductor Log (last 100 lines)\n" + "\n".join(lines[-100:])
-        )
+    if log_path is not None and log_path.exists():
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        parts.append("## Conductor Log (last 150 lines)\n" + "\n".join(lines[-150:]))
 
-    no_tools = (
-        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
-        "Tool calls will be REJECTED and will waste your only turn.\n\n"
-    )
-    context = no_tools + "\n\n".join(context_parts)
-    result = await run_claude(context, model=resolve_model("sonnet"), max_turns=1)
+    calls_dir = storage.brain_calls_dir(state.project_name)
+    for kind, keep in (("answer-questions", 8), ("diagnose-*", 5)):
+        files = sorted(calls_dir.glob(f"{kind}-*.json"), key=lambda p: p.stat().st_mtime)
+        for call in files[-keep:]:
+            try:
+                data = _json.loads(call.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            question = data.get("questions")
+            parts.append(
+                f"## Brain call {call.name}\n"
+                + (f"### Questions\n{str(question)[:3000]}\n### Answer\n" if question else "")
+                + str(data.get("response", ""))[:3000]
+            )
 
-    response_text = ""
-    for line in result.output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = _json.loads(line)
-        except _json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if event.get("type") == "assistant":
-            content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        response_text = block.get("text", "")
-                        break
-            elif isinstance(content, str):
-                response_text = content
-            if response_text:
-                break
+    for run in state.runs:
+        for stage in run.stages:
+            if not stage.worktree:
+                continue
+            fname = run.name + stage.feature_suffix
+            docs = Path(stage.worktree) / "docs" / fname
+            learnings = docs / "LEARNINGS.md"
+            if learnings.is_file():
+                parts.append(f"## Learnings: {fname}\n" + _tail(learnings, 80))
+            activity = docs / "activity.log"
+            if activity.is_file():
+                parts.append(f"## Activity Log: {fname} (last 30 lines)\n" + _tail(activity, 30))
+    return "\n\n".join(parts)
 
-    from datetime import datetime as _dt
 
-    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
-    conductor_dir = storage.conductor_dir(state.project_name)
-    report_file = conductor_dir / f"OVERNIGHT-AUDIT-{ts}.md"
-    report_file.write_text(response_text, encoding="utf-8")
+async def _generate_audit_report(
+    state: ConductorState,
+    storage: StorageResolver,
+    log_path: Path | None = None,
+    audit_path: Path | None = None,
+) -> None:
+    """Write an audit report of the run (overnight-audit-prompt.md) to the conductor dir."""
+    _log("POST_RUN", "Generating overnight audit report", log_path, audit_path)
+
+    prompt = brain.render_prompt("overnight-audit", _audit_context(state, storage, log_path))
+    reply = await brain.ask(prompt, model=resolve_model("sonnet"), timeout_s=AUDIT_TIMEOUT_S)
+    if not reply.ok:
+        _log("POST_RUN", f"Audit report failed: {reply.detail}", log_path, audit_path)
+        return
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    report_file = storage.conductor_dir(state.project_name) / f"OVERNIGHT-AUDIT-{ts}.md"
+    report_file.write_text(reply.text + "\n", encoding="utf-8")
 
     _log(
         "POST_RUN",
