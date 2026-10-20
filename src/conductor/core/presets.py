@@ -126,6 +126,10 @@ class ManualTestPolicy:
     fatal_patterns: list[FatalPattern] = field(default_factory=list)
     check_commands: list[CheckCommandRule] = field(default_factory=list)
     blocked_reason_words: list[str] = field(default_factory=lambda: ["data", "fixture", "record", "account"])
+    # When true (the default), non-fatal scanner flags (DB CLI, test routes, mutating
+    # HTTP, ...) are accepted without a <shortcut> declaration and only recorded in
+    # the audit log. Set false for the strict contract. Fatal patterns always apply.
+    auto_approve_shortcuts: bool = True
 
 
 class Preset(ABC):
@@ -260,7 +264,14 @@ def _parse_validation(raw: dict) -> ValidationSettings:
 def _parse_manual_test(raw: dict) -> ManualTestPolicy:
     _check_unknown(
         raw,
-        {"policy_text", "coverage_focus", "fatal_patterns", "check_commands", "blocked_reason_words"},
+        {
+            "policy_text",
+            "coverage_focus",
+            "fatal_patterns",
+            "check_commands",
+            "blocked_reason_words",
+            "auto_approve_shortcuts",
+        },
         where="[manual_test]",
     )
     policy = ManualTestPolicy(
@@ -293,6 +304,10 @@ def _parse_manual_test(raw: dict) -> ManualTestPolicy:
         policy.check_commands.append(rule)
     if "blocked_reason_words" in raw:
         policy.blocked_reason_words = [str(w) for w in raw["blocked_reason_words"]]
+    if "auto_approve_shortcuts" in raw:
+        if not isinstance(raw["auto_approve_shortcuts"], bool):
+            raise ValueError("[manual_test] auto_approve_shortcuts must be true or false")
+        policy.auto_approve_shortcuts = raw["auto_approve_shortcuts"]
     return policy
 
 

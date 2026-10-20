@@ -298,6 +298,16 @@ def test_manual_test_policy(demo):
     assert policy.check_commands[0].path_prefix == "backend/"
     assert policy.check_commands[0].suffixes == [".php"]
     assert policy.check_commands[1].argv == ["make", "e2e", "{path}"]
+    assert policy.auto_approve_shortcuts is True
+
+
+def test_manual_test_auto_approve_shortcuts(presets_dir):
+    _write(presets_dir / "strict.toml", "[manual_test]\nauto_approve_shortcuts = false\n")
+    assert load_preset("strict").manual_test.auto_approve_shortcuts is False
+
+    _write(presets_dir / "bad.toml", '[manual_test]\nauto_approve_shortcuts = "yes"\n')
+    with pytest.raises(ValueError, match="auto_approve_shortcuts"):
+        load_preset("bad")
 
 
 def test_manual_test_rejects_invalid_regex(presets_dir):

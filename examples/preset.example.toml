@@ -89,6 +89,11 @@ Include the admin settings pages and every notification template flow.
 """
 # Words that make a "blocked" reason count as "only missing data" (rejected).
 blocked_reason_words = ["data", "fixture", "record", "account"]
+# DB CLI calls, test routes, mutating HTTP, fixture commands and browser-storage
+# writes are accepted undeclared and recorded in the audit log (default true).
+# Set false to require an approved <shortcut> declaration for each of them.
+# Fatal patterns always apply.
+auto_approve_shortcuts = true
 
 # Tool inputs matching a fatal pattern fail validation with no override.
 [[manual_test.fatal_patterns]]

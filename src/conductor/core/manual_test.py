@@ -799,15 +799,18 @@ _MUTATING_SQL = re.compile(
 )
 
 
-def _is_auto_approved(flag: "PolicyFlag") -> bool:
-    """Auto-approve all non-fatal policy flags.
+def _is_auto_approved(flag: "PolicyFlag", policy: ManualTestPolicy | None = None) -> bool:
+    """True when *flag* does not need an approved ``<shortcut>`` declaration.
 
-    Only fatal flags (the preset's ``[[manual_test.fatal_patterns]]``) remain
-    enforced. Everything else — DB commands, test routes, mutating HTTP,
-    fixture commands, browser storage — is auto-approved because the tester
-    operates entirely within the dev environment.
+    Fatal flags (the preset's ``[[manual_test.fatal_patterns]]``) are never
+    approved. Every other flag — DB commands, test routes, mutating HTTP,
+    fixture commands, browser storage — is approved by default, because the
+    tester works inside a dev environment. A preset can demand an approved
+    DataShortcut for each of them with ``auto_approve_shortcuts = false``.
     """
-    return not flag.fatal_reason
+    if flag.fatal_reason:
+        return False
+    return (policy or ManualTestPolicy()).auto_approve_shortcuts
 
 
 def _iter_tool_inputs(output: str) -> list[str]:
@@ -1017,7 +1020,7 @@ def parse_manual_signal(
     missing_shortcuts = [
         flag
         for flag in signal.policy_flags
-        if not _is_auto_approved(flag)
+        if not _is_auto_approved(flag, policy)
         and not any(_shortcut_covers_flag(shortcut, flag) for shortcut in signal.shortcuts)
     ]
     if missing_shortcuts:
@@ -1617,6 +1620,11 @@ async def _run_generation(
         signal=signal.kind,
         valid=signal.valid,
         errors=signal.errors,
+        auto_approved=[
+            f"{flag.kind}: {flag.value}"
+            for flag in policy_flags
+            if _is_auto_approved(flag, policy)
+        ],
     )
 
     exit_file.unlink(missing_ok=True)
@@ -1711,6 +1719,25 @@ async def _fix_and_verify_finding(
         return
 
     preexisting_files = set(_git_changed_files(project_dir))
+    # Browser tooling leaves untracked snapshots behind; anything else that is
+    # already dirty would be mixed into (or hidden from) the fixer's commit.
+    dirty_files = sorted(f for f in preexisting_files if not _is_test_artifact(f))
+    if dirty_files:
+        finding.status = "open"
+        finding.verification.append(
+            "Skipped automatic fix: worktree has pre-existing changes "
+            f"({_format_files_for_log(dirty_files)}); commit or stash them first"
+        )
+        _log(
+            "MANUAL_FIX_SKIPPED",
+            f"{finding.id}: worktree has pre-existing changes",
+            log_path,
+            audit_path,
+            finding_id=finding.id,
+            files=dirty_files,
+        )
+        save_manual_state(state, conductor_dir)
+        return
 
     finding.status = "fixing"
     save_manual_state(state, conductor_dir)

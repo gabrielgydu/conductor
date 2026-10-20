@@ -58,6 +58,7 @@ POLICY = ManualTestPolicy(
         CheckCommandRule(argv=["make", "e2e", "{path}"], suffixes=[".spec.ts", ".spec.js"]),
     ],
     blocked_reason_words=["data", "fixture", "customer", "cart"],
+    auto_approve_shortcuts=False,
 )
 
 
@@ -324,8 +325,12 @@ def test_policy_scanner_requires_approved_shortcut_for_flagged_tool_use():
     )
 
     flags = scan_policy_shortcuts(f"{tool_event}\n{text_without_shortcut}")
-    invalid = parse_manual_signal(f"{tool_event}\n{text_without_shortcut}", policy_flags=flags)
-    valid = parse_manual_signal(f"{tool_event}\n{text_with_shortcut}", policy_flags=flags)
+    invalid = parse_manual_signal(
+        f"{tool_event}\n{text_without_shortcut}", policy_flags=flags, policy=POLICY
+    )
+    valid = parse_manual_signal(
+        f"{tool_event}\n{text_with_shortcut}", policy_flags=flags, policy=POLICY
+    )
 
     assert flags
     assert invalid.valid is False
@@ -448,11 +453,59 @@ def test_policy_scanner_flags_test_routes_without_shortcut():
     )
 
     flags = scan_policy_shortcuts(f"{tool_event}\n{result_event}")
-    signal = parse_manual_signal(f"{tool_event}\n{result_event}", policy_flags=flags)
+    signal = parse_manual_signal(f"{tool_event}\n{result_event}", policy_flags=flags, policy=POLICY)
 
     assert flags
     assert signal.valid is False
     assert "DataShortcut" in "; ".join(signal.errors)
+
+
+def test_policy_scanner_auto_approve_is_default_and_keeps_fatal_patterns():
+    def tool(command):
+        return json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "name": "bash", "input": {"command": command}}]
+                },
+            }
+        )
+
+    result = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<manual-result status=\"pass\"><evidence><db_readback>row exists</db_readback></evidence></manual-result><manual-pass/>",
+                    }
+                ]
+            },
+        }
+    )
+    relaxed = ManualTestPolicy(
+        auto_approve_shortcuts=True, fatal_patterns=POLICY.fatal_patterns
+    )
+
+    undeclared = tool("mysql -e 'insert into fixtures values (1)'") + "\n" + result
+    forbidden = tool("mysql -e 'update tenants set useNewCheckout=1'") + "\n" + result
+
+    strict_signal = parse_manual_signal(
+        undeclared, policy_flags=scan_policy_shortcuts(undeclared, POLICY), policy=POLICY
+    )
+    relaxed_signal = parse_manual_signal(
+        undeclared, policy_flags=scan_policy_shortcuts(undeclared, relaxed), policy=relaxed
+    )
+    relaxed_fatal = parse_manual_signal(
+        forbidden, policy_flags=scan_policy_shortcuts(forbidden, relaxed), policy=relaxed
+    )
+
+    assert ManualTestPolicy().auto_approve_shortcuts is True
+    assert strict_signal.valid is False
+    assert relaxed_signal.valid is True
+    assert relaxed_fatal.valid is False
+    assert "toggled through the admin UI" in "; ".join(relaxed_fatal.errors)
 
 
 def test_status_and_report_output(tmp_path):
@@ -663,6 +716,66 @@ async def test_fix_and_verify_skips_when_worktree_is_dirty(tmp_path, monkeypatch
     assert calls == []
     assert finding.status == "open"
     assert "pre-existing changes" in finding.verification[0]
+    assert "app/src/Unrelated.php" in finding.verification[0]
+
+
+@pytest.mark.asyncio
+async def test_fix_and_verify_ignores_preexisting_test_artifacts(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan = tmp_path / "plan.md"
+    plan.write_text(PLAN_TABLE, encoding="utf-8")
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
+    state = initialize_manual_state(
+        name="checkout-manual",
+        project_dir=repo,
+        plan_file=plan,
+        conductor_dir=conductor_dir,
+    )
+    finding = ManualFinding(
+        id="MT-001",
+        scenario_index=0,
+        severity="medium",
+        category="app_bug",
+        title="Send button fails",
+        reproduction=["Open checkout preview", "Click send"],
+        expected="Email sends",
+        actual="Send fails",
+        evidence=ManualEvidence(screenshots=["artifacts/screenshots/fail.png"]),
+    )
+    state.findings.append(finding)
+    snapshot = ".playwright-mcp/page-2026-05-02.yaml"
+    calls = []
+
+    async def fake_run_generation(**kwargs):
+        calls.append(kwargs["label"])
+        state.generations.append(
+            manual_test.ManualGeneration(
+                index=len(state.generations) + 1,
+                started_at=manual_test.datetime.now(manual_test.timezone.utc),
+            )
+        )
+        return manual_test.parse_manual_signal("<manual-handoff/>"), ""
+
+    monkeypatch.setattr(manual_test, "_run_generation", fake_run_generation)
+    # Only the browser snapshot exists before and after: the fixer runs, changes nothing.
+    monkeypatch.setattr(manual_test, "_git_changed_files", lambda _cwd: [snapshot])
+
+    await manual_test._fix_and_verify_finding(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=object(),
+        plan_content=PLAN_TABLE,
+        finding=finding,
+        log_path=conductor_dir / "MANUAL-TEST-LOG.md",
+        audit_path=conductor_dir / "MANUAL-TEST-AUDIT.jsonl",
+        model="sonnet",
+    )
+
+    assert calls == ["fix-MT-001"]
+    assert finding.status == "open"
+    assert finding.verification == ["Fixer produced no new file changes"]
 
 
 def test_manual_test_cli_init_status_report(tmp_path):
