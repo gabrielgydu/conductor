@@ -6,6 +6,31 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+PLAYWRIGHT_CONFIGS = (
+    "playwright.config.ts",
+    "playwright.config.js",
+    "playwright.config.mjs",
+    "playwright.config.cjs",
+)
+
+
+def playwright_unavailable(project_dir: Path) -> str | None:
+    """Why conductor's generated Playwright tests cannot run in *project_dir*.
+
+    Returns None when they can: a Playwright config at the project root and
+    @playwright/test installed in its node_modules. Conductor never installs
+    the harness or starts a server, so without them a generated test can only
+    fail, and no code fix would change that.
+    """
+    if not any((project_dir / name).is_file() for name in PLAYWRIGHT_CONFIGS):
+        return (
+            "no smoke test configured: set [validation] smoke_command in the preset"
+            " or add a playwright.config at the project root"
+        )
+    if not (project_dir / "node_modules" / "@playwright" / "test").is_dir():
+        return f"@playwright/test is not installed in {project_dir / 'node_modules'}"
+    return None
+
 
 def discover_frontend_routes(project_dir: Path) -> list[str]:
     """Parse Vue Router config to extract route paths."""

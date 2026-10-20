@@ -61,13 +61,20 @@ class ValidationResult:
 
 
 async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
-    """Run command, return (exit_code, combined_output_last_2000_chars)."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd),
-    )
+    """Run command, return (exit_code, combined_output_last_2000_chars).
+
+    A command that cannot be started (missing binary or cwd) is reported as
+    exit 127 instead of raising.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+        )
+    except OSError as exc:
+        return 127, f"cannot run {cmd[0]}: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -259,8 +266,22 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
             duration_s=time.monotonic() - start,
         )
 
-    # Generic fallback: generate and run Playwright smoke test
-    from conductor.core.smoke_test import generate_smoke_test  # noqa: PLC0415
+    # Generic fallback, opt-in: a generated Playwright smoke test, run only when
+    # the project has a Playwright setup (see playwright_unavailable).
+    from conductor.core.smoke_test import (  # noqa: PLC0415
+        generate_smoke_test,
+        playwright_unavailable,
+    )
+
+    reason = playwright_unavailable(ctx.project_dir)
+    if reason:
+        logger.warning("Smoke check skipped: %s", reason)
+        return CheckResult(
+            name="smoke",
+            passed=True,
+            output=f"skipped: {reason}",
+            duration_s=time.monotonic() - start,
+        )
 
     smoke_src = generate_smoke_test(ctx.project_dir)
     spec_path = (
@@ -269,8 +290,9 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
     spec_path.parent.mkdir(parents=True, exist_ok=True)
     spec_path.write_text(smoke_src, encoding="utf-8")
 
+    # --no: never let npx download Playwright
     exit_code, output = await _run_cmd(
-        ["npx", "playwright", "test", str(spec_path)],
+        ["npx", "--no", "playwright", "test", str(spec_path)],
         cwd=ctx.project_dir,
         timeout=300,
     )

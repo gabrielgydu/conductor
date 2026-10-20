@@ -731,3 +731,30 @@ async def test_failing_hooks_do_not_drop_a_resolved_run(real_merge_repo, tmp_pat
     assert _show(real_merge_repo, f"{branch}:e.txt") == "e\n"
     files = _show(real_merge_repo, f"{branch}:").split()
     assert "other.txt" not in files
+
+
+# ---------------------------------------------------------------------------
+# Test 12: A crash in validation does not cost the push, the PR or cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_crash_still_publishes(real_merge_repo, tmp_path, hermetic_merge):
+    real_merge_repo.create_branch("vc-a", {"vc_a.txt": "a\n"})
+    real_merge_repo.create_branch("vc-b", {"vc_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "vc-a"),
+        _done_run_with_branch(1, "feat-b", "vc-b"),
+    )
+    hermetic_merge.validate.side_effect = FileNotFoundError("npx")
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX
+    assert result.merged_runs == [0, 1]
+    assert any(c.args[0][:3] == ["gh", "pr", "create"] for c in gh.await_args_list)
+    assert not (tmp_path / "worktrees" / f"integration-{project_name}").exists()

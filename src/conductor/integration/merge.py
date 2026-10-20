@@ -20,6 +20,7 @@ from conductor.core.models import (
 )
 from conductor.core.validation import (
     ValidationContext,
+    ValidationResult,
     commit_validation_fixes,
     validate_and_fix,
 )
@@ -499,7 +500,12 @@ async def _integrate(
         feature_name=state.project_name,
         state=state,
     )
-    vresult = await validate_and_fix(vctx, max_attempts=3)
+    try:
+        vresult = await validate_and_fix(vctx, max_attempts=3)
+    except Exception as exc:
+        # The merged runs are still worth publishing: push and PR go ahead.
+        logger.exception("Post-merge validation crashed")
+        vresult = ValidationResult(passed=False, summary=f"validation crashed: {exc}")
     validation_passed = vresult.passed
     validation_msg = vresult.summary
     if validation_passed:

@@ -16,6 +16,7 @@ from conductor.core.validation import (
     ValidationContext,
     ValidationResult,
     commit_validation_fixes,
+    run_validation,
     validate_and_fix,
 )
 
@@ -64,6 +65,71 @@ def _fix_loop_mocks(monkeypatch, repo: Path) -> AsyncMock:
     monkeypatch.setattr(validation, "run_validation", fake_validation)
     monkeypatch.setattr(validation, "run_claude", claude)
     return claude
+
+
+# ---------------------------------------------------------------------------
+# Smoke check: opt-in
+# ---------------------------------------------------------------------------
+
+_SPEC = Path("tests/Playwright/tests/conductor-smoke.spec.ts")
+
+
+@pytest.mark.asyncio
+async def test_smoke_without_any_setup_is_skipped(tmp_path, monkeypatch):
+    run_cmd = AsyncMock(return_value=(1, "must not run"))
+    monkeypatch.setattr(validation, "_run_cmd", run_cmd)
+
+    ctx = ValidationContext(project_dir=tmp_path, stage="integration", feature_name="p")
+    result = await run_validation(ctx, checks=["smoke"])
+
+    assert result.passed
+    [smoke] = result.checks
+    assert smoke.output.startswith("skipped: no smoke test configured")
+    run_cmd.assert_not_awaited()
+    assert not (tmp_path / _SPEC).exists()
+
+
+@pytest.mark.asyncio
+async def test_smoke_skips_when_playwright_is_not_installed(tmp_path, monkeypatch):
+    """A config alone is not enough: npx would download Playwright or fail, and an
+    Opus fix session cannot install it."""
+    (tmp_path / "playwright.config.ts").write_text("export default {};\n")
+    run_cmd = AsyncMock(return_value=(1, "must not run"))
+    monkeypatch.setattr(validation, "_run_cmd", run_cmd)
+
+    ctx = ValidationContext(project_dir=tmp_path, stage="integration", feature_name="p")
+    result = await run_validation(ctx, checks=["smoke"])
+
+    [smoke] = result.checks
+    assert smoke.passed
+    assert "@playwright/test is not installed" in smoke.output
+    run_cmd.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_smoke_runs_generated_spec_with_a_playwright_setup(tmp_path, monkeypatch):
+    (tmp_path / "playwright.config.ts").write_text("export default {};\n")
+    (tmp_path / "node_modules" / "@playwright" / "test").mkdir(parents=True)
+    run_cmd = AsyncMock(return_value=(0, "1 passed"))
+    monkeypatch.setattr(validation, "_run_cmd", run_cmd)
+
+    ctx = ValidationContext(project_dir=tmp_path, stage="integration", feature_name="p")
+    result = await run_validation(ctx, checks=["smoke"])
+
+    assert result.passed
+    assert (tmp_path / _SPEC).is_file()
+    assert run_cmd.await_args.args[0] == [
+        "npx", "--no", "playwright", "test", str(tmp_path / _SPEC)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_cmd_reports_a_missing_binary_instead_of_raising(tmp_path):
+    exit_code, output = await validation._run_cmd(
+        ["conductor-no-such-binary"], cwd=tmp_path, timeout=5
+    )
+    assert exit_code == 127
+    assert "conductor-no-such-binary" in output
 
 
 # ---------------------------------------------------------------------------
