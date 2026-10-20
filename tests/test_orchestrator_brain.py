@@ -224,6 +224,24 @@ async def test_failure_diagnosis_sends_contract_and_speccer_evidence(tmp_path, m
     assert state.runs[0].stages[0].retries == 1
 
 
+@pytest.mark.parametrize(
+    ("last_error", "raised"),
+    [
+        ("speccer-run produced no output for 30 min; conductor stopped it", False),
+        ("conductor itself raised while advancing the stage: OSError: disk full", True),
+    ],
+)
+def test_failure_context_shows_what_conductor_recorded_as_is(tmp_path, last_error, raised):
+    """An inactivity stop or a bad run.sh is not presented as a conductor crash."""
+    state = _failed_spec_state(tmp_path)
+    state.runs[0].stages[0].last_error = last_error
+
+    context = orch._failure_context(state, 0, 0, _storage(tmp_path), 0, 3)
+
+    assert f"## Recorded by Conductor\n{last_error}" in context
+    assert ("raised" in context) is raised
+
+
 @pytest.mark.asyncio
 async def test_failure_diagnosis_without_verdict_retries_while_budget_remains(
     tmp_path, monkeypatch

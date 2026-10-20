@@ -2314,10 +2314,7 @@ def _failure_context(
         f"exit code {stage.last_exit_code if stage.last_exit_code is not None else 'unknown'}"
     ]
     if stage.last_error:
-        parts.append(
-            "## Orchestrator Error\nConductor itself raised while advancing this "
-            f"stage:\n{stage.last_error}"
-        )
+        parts.append(f"## Recorded by Conductor\n{stage.last_error}")
 
     fail_log = _runner_fail_log(storage, state.project_name, fname)
     window_log = _latest_window_log(storage, state.project_name, fname)
@@ -3101,6 +3098,7 @@ def _record_advance_error(
     """
     run = state.runs[run_idx]
     error = f"{type(exc).__name__}: {exc}"
+    raised = f"conductor itself raised while advancing the stage: {error}"
     tb = "".join(traceback.format_exception(exc))
     stage_idx = run.current_stage
     stage = run.stages[stage_idx] if stage_idx < len(run.stages) else None
@@ -3115,15 +3113,15 @@ def _record_advance_error(
     elif stage.status == StageStatus.BLOCKED:
         # Blocking the stage raised (stopping its runner, say). Block the run
         # here, or every iteration would run into the same error.
-        stage.last_error = error
+        stage.last_error = raised
         run.status = RunStatus.BLOCKED
         outcome = "run blocked without stopping its runner or containers"
     elif stage.status in (StageStatus.FAILED, StageStatus.STALLED):
-        stage.last_error = error
+        stage.last_error = raised
         stage.status = StageStatus.BLOCKED
         outcome = "stage blocked (failure handling itself raised)"
     else:
-        stage.last_error = error
+        stage.last_error = raised
         stage.status = StageStatus.FAILED
         outcome = "stage failed"
 

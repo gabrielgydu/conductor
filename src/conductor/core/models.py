@@ -59,8 +59,9 @@ class StageState(BaseModel):
     first_transient_failure_ts: datetime | None = None
     backoff_until: datetime | None = None
     last_exit_code: int | None = None
-    # Error that made the orchestrator itself fail this stage (an exception
-    # while advancing it), shown to the failure diagnosis.
+    # Why conductor itself failed or stopped this stage (an exception while
+    # advancing it, a silent speccer step, an unusable run.sh), shown to the
+    # failure diagnosis.
     last_error: str | None = None
     # Consecutive speccer runs that exited non-zero and left the spec waiting
     # for input, plus auto-answers that did not answer every question. Reset
