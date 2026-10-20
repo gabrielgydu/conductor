@@ -465,16 +465,28 @@ def _release_stale_worktrees(
     removed (other worktrees, e.g. on an unmounted disk, are left alone).
 
     If *branch* is checked out in a worktree that does exist at another path,
-    that worktree is returned so the caller reuses it instead.
+    that worktree is returned so the caller reuses it instead, unless it is
+    the repository's own checkout: a stage never works in that.
     """
     target = wt_path.resolve()
     ref = f"refs/heads/{branch}"
-    for entry in _registered_worktrees(project_dir):
+    entries = _registered_worktrees(project_dir)
+    # git lists the main working tree first.
+    own_checkouts = {project_dir.resolve()} | {
+        Path(e["worktree"]).resolve() for e in entries[:1] if e.get("worktree")
+    }
+    for entry in entries:
         path = Path(entry.get("worktree", ""))
         if path.resolve() != target and entry.get("branch") != ref:
             continue
         if path.exists():
             if entry.get("branch") == ref and path.resolve() != target:
+                if path.resolve() in own_checkouts:
+                    raise RuntimeError(
+                        f"{branch} is checked out in {path}, the repository's own "
+                        "checkout; switch it to another branch so the stage gets "
+                        "a worktree of its own"
+                    )
                 _log(
                     "WORKTREE_CREATE",
                     f"{branch} is already checked out at {path} — reusing it",

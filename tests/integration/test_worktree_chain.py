@@ -320,6 +320,22 @@ def test_reuses_worktree_after_worktrees_base_changed(
     assert state.runs[0].stages[0].worktree == old_wt
 
 
+def test_branch_checked_out_in_the_main_checkout_is_not_adopted(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    """Never run a stage in the user's own checkout, even on the stage's branch."""
+    repo = tmp_git_repo
+    state = _one_stage_state("proj", get_default_branch(repo))
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "conductor/proj/auth/main"], cwd=repo, check=True
+    )
+
+    with pytest.raises(RuntimeError, match="the repository's own checkout"):
+        create_worktree(state, 0, 0, repo, tmp_path / "worktrees")
+
+    assert state.runs[0].stages[0].worktree is None
+
+
 # ---------------------------------------------------------------------------
 # Runs with several dependencies
 # ---------------------------------------------------------------------------
