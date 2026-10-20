@@ -728,15 +728,47 @@ def _cmd_go(args):
     if not has_runs:
         _phase(2, 3, "Planning...")
         _cmd_plan(args)
+        # go turns quick mode on for a project it plans; on resume the saved
+        # setting stands unless --quick/--no-quick is given.
+        if args.quick is None:
+            args.quick = True
     else:
         _phase(2, 3, "Planning", skip=True)
 
     # Phase 3: Run
-    # Handle --no-quick override (go defaults quick=True)
-    if getattr(args, "no_quick", False):
-        args.quick = False
     _phase(3, 3, "Running...")
     _cmd_run(args)
+
+
+def _run_overrides(args) -> dict:
+    """The run/go settings given on the command line, as ConductorState fields.
+
+    A flag that is left out keeps the value saved in state, so a resume
+    without flags does not reset anything. Overnight is the exception: it is
+    on unless --no-overnight is given.
+    """
+    overrides: dict = {"overnight": not getattr(args, "no_overnight", False)}
+    if getattr(args, "quick", None) is not None:
+        overrides["quick"] = args.quick
+    if getattr(args, "max_parallel", None) is not None:
+        overrides["max_parallel"] = args.max_parallel
+    if getattr(args, "worktrees_base", None):
+        overrides["worktrees_base"] = str(Path(args.worktrees_base).resolve())
+    return overrides
+
+
+def _run_override_flags(overrides: dict) -> list[str]:
+    """`run` arguments that reproduce *overrides* in the tmux re-exec."""
+    flags = []
+    if not overrides["overnight"]:
+        flags.append("--no-overnight")
+    if "quick" in overrides:
+        flags.append("--quick" if overrides["quick"] else "--no-quick")
+    if "max_parallel" in overrides:
+        flags.extend(["--max-parallel", str(overrides["max_parallel"])])
+    if "worktrees_base" in overrides:
+        flags.extend(["--worktrees-base", overrides["worktrees_base"]])
+    return flags
 
 
 def _cmd_run(args):
@@ -751,23 +783,9 @@ def _cmd_run(args):
 
     state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
 
-    # Set overnight flag (default ON, --no-overnight disables)
-    if hasattr(state, "overnight"):
-        state.overnight = not getattr(args, "no_overnight", False)
-
-    # Set quick flag
-    if getattr(args, "quick", False):
-        state.quick = True
-
-    # Set max_parallel from CLI
-    cli_max_parallel = getattr(args, "max_parallel", None)
-    if cli_max_parallel is not None:
-        state.max_parallel = cli_max_parallel
-
-    # Set worktrees_base from CLI (overrides preset default)
-    cli_wt_base = getattr(args, "worktrees_base", None)
-    if cli_wt_base:
-        state.worktrees_base = str(Path(cli_wt_base).resolve())
+    overrides = _run_overrides(args)
+    for field, value in overrides.items():
+        setattr(state, field, value)
 
     inside_tmux = getattr(args, "inside_tmux", False)
 
@@ -775,14 +793,7 @@ def _cmd_run(args):
         # Re-exec inside tmux session
         conductor_bin = str(Path(__file__).resolve().parents[2] / "conductor")
         reexec = [conductor_bin, "run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path)]
-        if getattr(args, "no_overnight", False):
-            reexec.append("--no-overnight")
-        if getattr(args, "quick", False):
-            reexec.append("--quick")
-        if cli_max_parallel is not None:
-            reexec.extend(["--max-parallel", str(state.max_parallel)])
-        if cli_wt_base:
-            reexec.extend(["--worktrees-base", state.worktrees_base])
+        reexec.extend(_run_override_flags(overrides))
 
         _launch_in_tmux(
             f"conductor-{state.project_name}",
@@ -1375,17 +1386,23 @@ def main():
     p_go.add_argument("--preset", default="base", help="Preset name (default: base, auto-detected)")
     p_go.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_go.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
-    p_go.add_argument("--quick", action="store_true", default=True, help="Quality gate only between phases; full CI+review at end (default: on)")
-    p_go.add_argument("--no-quick", action="store_true", help="Disable quick mode (run full CI+review between phases)")
-    p_go.add_argument("--max-parallel", type=int, default=1, help="Max parallel runs (default: 1)")
+    p_go.add_argument(
+        "--quick", action=argparse.BooleanOptionalAction, default=None,
+        help="Quality gate only between phases; full CI+review at end "
+        "(default: on when go plans the project, else the saved setting)",
+    )
+    p_go.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project)")
     p_go.add_argument("--worktrees-base", default=None, help="Base directory for worktrees")
     p_go.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
     p_run = subparsers.add_parser("run", help="Execute the orchestration loop")
     _add_common(p_run)
     p_run.add_argument("--no-overnight", action="store_true", help="Disable auto-answering speccer questions")
-    p_run.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end of run")
-    p_run.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: 1, 0=unlimited)")
+    p_run.add_argument(
+        "--quick", action=argparse.BooleanOptionalAction, default=None,
+        help="Quality gate only between phases; full CI+review at end of run (default: the saved setting, off for a new project)",
+    )
+    p_run.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project; 0=unlimited)")
     p_run.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../worktrees)")
     p_run.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 

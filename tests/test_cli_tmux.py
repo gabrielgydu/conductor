@@ -180,3 +180,23 @@ def test_cleanup_kills_a_finished_session(project, fake_tmux):
     assert code == 0
     assert "Killed stale tmux session: conductor-foo" in out
     assert "conductor-foo" not in fake_tmux.sessions
+
+
+def _reexec_argv(fake_tmux: FakeTmux) -> list[str]:
+    new = next(c for c in fake_tmux.calls if c[0] == "new-session")
+    return shlex.split(shlex.split(new[new.index("-n") + 2])[2])
+
+
+def test_go_reexec_forwards_only_the_flags_given(project, fake_tmux, execvp):
+    from conductor.core.storage import StorageResolver
+
+    StorageResolver(project).conductor_brief("foo").write_text("## Goal\nShip the health endpoint today.\n")
+
+    _, _, code = _run_main(["go", "--name", "foo", "--project-dir", str(project), "--no-quick"])
+
+    assert code == 0
+    argv = _reexec_argv(fake_tmux)
+    assert "--no-quick" in argv
+    assert "--quick" not in argv
+    # go has no --max-parallel default any more, so a resume keeps the saved value
+    assert "--max-parallel" not in argv
