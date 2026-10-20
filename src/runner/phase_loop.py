@@ -36,9 +36,9 @@ from runner.git_ops import (
     git_stage_all,
     git_has_staged_changes,
     git_commit,
-    git_push,
     git_snapshot_untracked,
     git_unstage_pre_existing,
+    git_unstage_paths,
     git_current_sha,
 )
 from runner.logging import log, info, success, warn, error, header, dim, bold
@@ -48,6 +48,41 @@ from runner.steer_inbox import poll_steer_inbox
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+
+# Pauses between retries and between phases (patched to 0 in tests).
+_RETRY_PAUSE_S = 2.0
+_PHASE_PAUSE_S = 3.0
+
+# Run state the runner writes into its feature dir. The orchestrator places
+# that dir inside the worktree (docs/<feature>/), so these are unstaged before
+# every commit: they describe the run, they are not part of the feature.
+_RUNNER_FILES = (
+    "activity.log",
+    "STATS.json",
+    "exit_code",
+    "RUN-CONFIG.json",
+    "logs",  # also holds the .pre-untracked-phase-N snapshots
+    "steer_inbox",
+)
+
+
+def _runner_owned_paths(project_dir: Path, feature_dir: Path, feature_name: str) -> list[str]:
+    """Repo-relative paths that must never be committed by a phase.
+
+    Besides the run state above this is docs/<feature>/LEARNINGS.md. Like the
+    speccer's PRD, design and prompt files next to it (kept out of commits by
+    the untracked snapshot), it is conductor working material: post-run reads
+    it from the worktree and folds it into CLAUDE.md, which is what gets
+    committed. Without this it was committed only when Claude happened to
+    create it during a phase.
+    """
+    paths = [(Path("docs") / feature_name / "LEARNINGS.md").as_posix()]
+    try:
+        rel = feature_dir.resolve().relative_to(project_dir.resolve())
+    except ValueError:
+        return paths  # feature dir outside the repo (runner CLI default)
+    paths.extend((rel / name).as_posix() for name in _RUNNER_FILES)
+    return paths
 
 
 def _promise_tag(token: str) -> str:
@@ -221,6 +256,7 @@ async def _run_phase(
 
     # Snapshot pre-existing untracked files so we don't commit them
     pre_untracked = git_snapshot_untracked(project_dir, untracked_snapshot)
+    runner_owned = _runner_owned_paths(project_dir, feature_dir, cfg.feature_name)
 
     cwd_str = str(project_dir)
     max_turns = 200  # generous; Claude controls its own turn budget
@@ -301,7 +337,7 @@ async def _run_phase(
             # No token — restart iteration
             fix_context = ""
             log(f"Iteration {iteration} done — no promise token, restarting...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(_RETRY_PAUSE_S)
             continue
 
         # ── Promise token detected ─────────────────────────────────────────
@@ -310,6 +346,7 @@ async def _run_phase(
 
         git_stage_all(project_dir)
         git_unstage_pre_existing(project_dir, pre_untracked)
+        git_unstage_paths(project_dir, runner_owned)
 
         if not git_has_staged_changes(project_dir):
             # No changes to commit — phase is complete with no-op
@@ -334,7 +371,7 @@ async def _run_phase(
                 "Fix the issues above. The commit was rejected by a pre-commit hook.\n"
                 "Do NOT simply bypass the hook — fix the root cause.\n"
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(_RETRY_PAUSE_S)
             continue
 
         success(f"Committed: {commit_msg}")
@@ -448,7 +485,7 @@ async def run_phase_loop(
 
         # Brief pause between phases
         if phase.number < len(cfg.phases):
-            await asyncio.sleep(3)
+            await asyncio.sleep(_PHASE_PAUSE_S)
 
     # ── End-of-run local checks (quick mode: deferred to here) ──────────
     if exit_code == 0 and cfg.quick and not any_committed:

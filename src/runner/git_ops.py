@@ -93,18 +93,17 @@ def git_snapshot_untracked(cwd: Path, snapshot_file: Path) -> set[str]:
 
 def git_unstage_pre_existing(cwd: Path, pre_existing: set[str]) -> None:
     """Unstage files that were already untracked before this phase."""
-    if not pre_existing:
+    git_unstage_paths(cwd, sorted(pre_existing))
+
+
+def git_unstage_paths(cwd: Path, paths: list[str]) -> None:
+    """Unstage *paths* (files or directories relative to cwd).
+
+    Paths that match nothing are fine; errors are ignored.
+    """
+    if not paths:
         return
-    result = subprocess.run(
-        ["git", "reset", "HEAD", "--"] + sorted(pre_existing),
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        close_fds=True,
-    )
-    _ = result  # ignore errors; files may not exist
+    _run(["git", "reset", "-q", "HEAD", "--"] + list(paths), cwd=cwd, check=False)
 
 
 def git_current_sha(cwd: Path) -> str:
