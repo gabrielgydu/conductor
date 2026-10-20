@@ -1557,7 +1557,11 @@ def build_fixer_prompt(
     plan_content: str,
     finding: ManualFinding,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
+    policy = policy or ManualTestPolicy()
+    # The fixer's commands are checked against the preset's fatal patterns too.
+    project_rules = f"\n## Project Rules\n\n{policy.policy_text}\n" if policy.policy_text else ""
     evidence = _format_evidence_lines(finding.evidence) if finding.evidence else []
     attempts = [attempt for attempt in finding.fix_attempts if attempt.outcome]
     previous = ""
@@ -1596,7 +1600,7 @@ Do not commit; Conductor commits the fix once a verifier generation confirms it.
 
 Summarize the changed files and the checks you ran, then put <manual-handoff/> on
 the last line, with nothing after it.
-{previous}
+{project_rules}{previous}
 ## Original Plan
 
 {plan_content}
@@ -2331,7 +2335,7 @@ async def _fix_and_verify_finding(
             project_dir=project_dir,
             conductor_dir=conductor_dir,
             tmux=tmux,
-            prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir),
+            prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir, policy=policy),
             label=f"fix-{finding.id}",
             model=model,
             scenario=_scenario_for_finding(state, finding),

@@ -1658,6 +1658,18 @@ async def test_resumed_fixed_finding_without_recorded_files_is_reopened(tmp_path
     assert "fix's files are unknown" in finding.verification[-1]
 
 
+@pytest.mark.asyncio
+async def test_fixer_is_told_the_project_rules_it_is_checked_against(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    prompts: list[str] = []
+    _script_generations(monkeypatch, state, [("No change needed.\n<manual-handoff/>", None)], prompts)
+
+    await _fix(repo, conductor_dir, state, finding, POLICY)
+
+    assert "## Project Rules" in prompts[0]
+    assert "NEVER change them via SQL" in prompts[0]
+
+
 def test_git_changed_files_includes_staged_files(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
