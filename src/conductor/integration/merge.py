@@ -412,7 +412,7 @@ async def _integrate(
         # Try clean merge
         rc, out, err = await _run_git([*_MERGE, branch], wt)
         if rc == 0:
-            _print(f"  ✓ Clean merge")
+            _print("  ✓ Clean merge")
             merged_runs.append(run)
             continue
 

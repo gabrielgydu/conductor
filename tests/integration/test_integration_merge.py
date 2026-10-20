@@ -55,6 +55,17 @@ def _worktree_list(repo: Path) -> str:
     ).stdout
 
 
+def _install_failing_hooks(repo: Path, hooks: Path) -> None:
+    """Point the repo (and its worktrees) at hooks that all exit 1."""
+    hooks.mkdir()
+    for hook in ("pre-commit", "pre-merge-commit", "commit-msg"):
+        (hooks / hook).write_text("#!/bin/sh\nexit 1\n")
+        (hooks / hook).chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(hooks)], check=True
+    )
+
+
 def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
     """State whose integration worktree lives under tmp_path, not /tmp."""
     return ConductorState(
@@ -691,15 +702,7 @@ async def test_failing_hooks_do_not_drop_a_resolved_run(real_merge_repo, tmp_pat
 
     _modify_delete_conflict(real_merge_repo)
     real_merge_repo.create_branch("md-e", {"e.txt": "e\n"})
-    hooks = tmp_path / "hooks"
-    hooks.mkdir()
-    for hook in ("pre-commit", "pre-merge-commit", "commit-msg"):
-        (hooks / hook).write_text("#!/bin/sh\nexit 1\n")
-        (hooks / hook).chmod(0o755)
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "config", "core.hooksPath", str(hooks)],
-        check=True,
-    )
+    _install_failing_hooks(real_merge_repo.path, tmp_path / "hooks")
     project_name = _project_name(tmp_path)
     state = _make_state(
         tmp_path,
