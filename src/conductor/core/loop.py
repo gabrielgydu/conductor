@@ -679,6 +679,8 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
                     log_path, audit_path, task_index=task.index,
                 )
             else:
+                # Nothing is left uncommitted, so an earlier rejection no longer applies
+                task.commit_error = None
                 if partial_hash:
                     _log("PARTIAL_COMMIT", f"Partial commit: {partial_hash}", log_path, audit_path)
             if task.attempts >= _MAX_ATTEMPTS_PER_TASK:

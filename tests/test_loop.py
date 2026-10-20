@@ -264,6 +264,24 @@ async def test_rejected_wip_commit_leaves_work_for_the_next_session(repo, claude
     assert "WIP" not in _git(repo, "log", "--format=%s")
 
 
+async def test_wip_commit_clears_an_earlier_rejection(repo, claude, tmux):
+    """Once the work is committed, later prompts must not quote the stale hook output."""
+    claude.script([
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "TODO\n"}},
+        {"events": [say("ran out of turns")], "write": {"notes.txt": "fixed\n"}},
+        {"events": [say("<task-completed/>")], "write": {"notes.txt": "done\n"}},
+    ])
+    state = make_state(repo, ONE_TASK)
+    lint_hook(repo)
+
+    saved, _ = await run_loop(state, repo)
+
+    assert "LINT FAILED" in claude.calls[1]["prompt"]
+    assert "Commit Rejected" not in claude.calls[2]["prompt"]
+    assert _git(repo, "log", "--format=%s").splitlines()[:2] == ["Add notes", "WIP: Add notes"]
+    assert (saved.tasks[0].status, saved.tasks[0].commit_error) == ("completed", None)
+
+
 async def test_commit_that_keeps_failing_fails_the_task(repo, claude, tmux):
     claude.script([{"events": [say("<task-completed/>")], "write": {"notes.txt": "TODO\n"}}])
     state = make_state(repo, ONE_TASK + "- [ ] **Second** — another task\n")
