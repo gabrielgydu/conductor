@@ -11,7 +11,6 @@ Implementation details:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import signal
@@ -23,8 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 from conductor.core.claude import run_claude
-from runner.git_ops import git_has_any_changes, git_commit, git_push, git_current_sha
-from runner.logging import log, warn, error, dim
+from runner.git_ops import git_has_any_changes, git_commit, git_current_sha
+from runner.logging import log, warn, error
 
 
 _MAX_PROMPT_CHARS = 100_000

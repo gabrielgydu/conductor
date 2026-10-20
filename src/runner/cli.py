@@ -86,7 +86,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_fixer(args: argparse.Namespace) -> int:
     from runner.fixer import run_fixer, FixerConfig
-    from runner.logging import error
 
     if args.storage_dir:
         storage_dir = Path(args.storage_dir)
@@ -119,7 +118,7 @@ def _cmd_fixer(args: argparse.Namespace) -> int:
 
 def _cmd_generate_run_sh(args: argparse.Namespace) -> int:
     """Generate a thin run.sh that invokes the Python runner."""
-    from runner.logging import log, error
+    from runner.logging import log
     import shutil
 
     if args.storage_dir:

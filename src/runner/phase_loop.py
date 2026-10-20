@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from conductor.core.claude import run_claude, run_claude_steerable
 from conductor.core.presets import GateResult, Preset, load_preset
 from conductor.core.stats import (
     StatsEntry,
@@ -45,7 +44,7 @@ from runner.git_ops import (
     git_current_sha,
     git_is_ancestor,
 )
-from runner.logging import log, info, success, warn, error, header, dim, bold
+from runner.logging import log, success, warn, error, header, dim
 from runner.prompt import build_prompt
 from runner.steerable import SteerableSession
 from runner.steer_inbox import poll_steer_inbox
