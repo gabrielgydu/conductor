@@ -1485,6 +1485,65 @@ async def test_pause_during_a_fix_stashes_it_without_using_up_an_attempt(tmp_pat
     assert manual_test._should_fix_finding(finding) is True
 
 
+@pytest.mark.asyncio
+async def test_resume_verifies_a_fix_whose_verification_was_cut_short(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    state.status = "running"
+    state.scenarios[1].status = "passed"
+
+    def killed():
+        raise KeyboardInterrupt  # Ctrl-C, or tmux kill-session, while verify-MT-001 runs
+
+    _script_generations(monkeypatch, state, [(FIXER_HANDOFF, _edit(repo, "<?php // fixed\n")), (PASS_RESULT, killed)])
+    with pytest.raises(KeyboardInterrupt):
+        await _fix(repo, conductor_dir, state, finding)
+
+    resumed = load_manual_state(conductor_dir)
+    assert resumed.findings[0].status == "fixed"
+    calls = _script_generations(monkeypatch, resumed, [(PASS_RESULT, None)])
+
+    await manual_test._run_manual_phases(
+        state=resumed,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=object(),
+        plan_content=PLAN_TABLE,
+        log_path=manual_test.manual_log_path(conductor_dir),
+        audit_path=manual_test.manual_audit_path(conductor_dir),
+        model="sonnet",
+        policy=ManualTestPolicy(),
+    )
+
+    assert calls == ["verify-MT-001"]
+    assert resumed.findings[0].status == "verified"
+    assert len(resumed.findings[0].fix_commits) == 1
+    assert resumed.scenarios[0].status == "passed"
+    assert _committed_files(repo) == ["app/Foo.php"]
+
+
+@pytest.mark.asyncio
+async def test_resumed_fixed_finding_without_recorded_files_is_reopened(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    finding.status = "fixed"  # state written before fix attempts were recorded
+    calls = _script_generations(monkeypatch, state, [])
+
+    await manual_test._resume_verification(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=object(),
+        plan_content=PLAN_TABLE,
+        finding=finding,
+        log_path=manual_test.manual_log_path(conductor_dir),
+        audit_path=manual_test.manual_audit_path(conductor_dir),
+        model="sonnet",
+    )
+
+    assert calls == []
+    assert finding.status == "open"
+    assert "fix's files are unknown" in finding.verification[-1]
+
+
 def test_git_changed_files_includes_staged_files(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

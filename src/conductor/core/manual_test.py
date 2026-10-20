@@ -16,7 +16,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -2300,7 +2300,7 @@ async def _fix_and_verify_finding(
             finding=finding,
             attempt=attempt,
             outcome=outcome,
-            preexisting_files=preexisting_files,
+            files=_fixer_changed_files(project_dir, preexisting_files),
             log_path=log_path,
             audit_path=audit_path,
         )
@@ -2352,10 +2352,106 @@ async def _fix_and_verify_finding(
         fail(_clip("Focused checks failed: " + " / ".join(failed_checks), 600))
         return
 
+    # Persisted with attempt.files, so a run that stops before the verifier
+    # finishes verifies this fix on resume (_resume_verification).
     finding.status = "fixed"
     save_manual_state(state, conductor_dir)
+    await _verify_and_commit(
+        state=state,
+        project_dir=project_dir,
+        conductor_dir=conductor_dir,
+        tmux=tmux,
+        plan_content=plan_content,
+        finding=finding,
+        fix_files=fixer_files,
+        fail=fail,
+        log_path=log_path,
+        audit_path=audit_path,
+        model=model,
+        policy=policy,
+    )
 
-    # A pause here leaves the finding "fixed" with its changes in the worktree.
+
+async def _resume_verification(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    finding: ManualFinding,
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy | None = None,
+) -> None:
+    """Verify a "fixed" finding whose verification never finished (killed or paused run)."""
+    attempt = finding.fix_attempts[-1] if finding.fix_attempts else None
+    if attempt is None or not attempt.files:
+        # Fixed before fix files were recorded: there is nothing safe to commit.
+        finding.status = "open"
+        finding.verification.append(
+            "Verification was interrupted and the fix's files are unknown; "
+            "check the worktree for its changes"
+        )
+        save_manual_state(state, conductor_dir)
+        return
+
+    def fail(outcome: str) -> None:
+        pending = set(_git_changed_files(project_dir))
+        _shelve_failed_fix(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            finding=finding,
+            attempt=attempt,
+            outcome=outcome,
+            files=[path for path in attempt.files if path in pending],
+            log_path=log_path,
+            audit_path=audit_path,
+        )
+
+    _log(
+        "FINDING_FIX_RETRY",
+        f"Verifying {finding.id} after an interrupted verification: {finding.title}",
+        log_path,
+        audit_path,
+        finding_id=finding.id,
+        files=attempt.files,
+    )
+    await _verify_and_commit(
+        state=state,
+        project_dir=project_dir,
+        conductor_dir=conductor_dir,
+        tmux=tmux,
+        plan_content=plan_content,
+        finding=finding,
+        fix_files=attempt.files,
+        fail=fail,
+        log_path=log_path,
+        audit_path=audit_path,
+        model=model,
+        policy=policy,
+    )
+
+
+async def _verify_and_commit(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    finding: ManualFinding,
+    fix_files: list[str],
+    fail: Callable[[str], None],
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy | None = None,
+) -> None:
+    """Rerun the finding's scenario on the fix; commit it if it passes, else *fail*."""
+    # A pause here leaves the finding "fixed"; resume verifies it again.
     verifier_signal, verifier_output = await _run_generation_retrying(
         state=state,
         project_dir=project_dir,
@@ -2383,14 +2479,14 @@ async def _fix_and_verify_finding(
             scenario.completed_at = datetime.now(timezone.utc)
 
         try:
-            commit_hash = _commit_verified_finding(project_dir, finding, fixer_files)
+            commit_hash = _commit_verified_finding(project_dir, finding, fix_files)
         except subprocess.CalledProcessError as exc:
             commit_hash = None
             error = _process_error_text(exc)
             # Verification did pass, so the status stays; the fix is left
             # unstaged in the worktree for the user to commit.
             finding.verification.append(
-                f"Commit failed, fix left uncommitted ({_format_files_for_log(fixer_files)}): {error}"
+                f"Commit failed, fix left uncommitted ({_format_files_for_log(fix_files)}): {error}"
             )
             _log(
                 "MANUAL_COMMIT_FAILED",
@@ -2398,7 +2494,7 @@ async def _fix_and_verify_finding(
                 log_path,
                 audit_path,
                 finding_id=finding.id,
-                files=fixer_files,
+                files=fix_files,
                 error=error,
             )
         if commit_hash:
@@ -2437,11 +2533,11 @@ def _shelve_failed_fix(
     finding: ManualFinding,
     attempt: ManualFixAttempt,
     outcome: str,
-    preexisting_files: set[str],
+    files: list[str],
     log_path: Path,
     audit_path: Path,
 ) -> None:
-    """End a failed fix attempt: stash its changes and reopen (or give up on) the finding.
+    """End a failed fix attempt: stash its *files* and reopen (or give up on) the finding.
 
     The fixer only runs on a tree without other changes, so its changes are
     exactly the non-artifact files that changed since. Stashing them gives
@@ -2449,7 +2545,6 @@ def _shelve_failed_fix(
     the attempt recoverable, and lets the next fixer prompt point at it.
     An interrupted attempt is reopened without counting against the limit.
     """
-    files = _fixer_changed_files(project_dir, preexisting_files)
     if files:
         attempt.files = files
         try:
@@ -2656,7 +2751,22 @@ async def _run_manual_phases(
         state.status = "running"
         save_manual_state(state, conductor_dir)
 
-    # Fix existing open findings from prior runs before processing new scenarios.
+    # Finish verifications a stopped run left behind, then retry open findings
+    # from prior runs, before processing new scenarios.
+    for finding in list(state.findings):
+        if finding.status == "fixed":
+            await _resume_verification(
+                state=state,
+                project_dir=project_dir,
+                conductor_dir=conductor_dir,
+                tmux=tmux,
+                plan_content=plan_content,
+                finding=finding,
+                log_path=log_path,
+                audit_path=audit_path,
+                model=model,
+                policy=policy,
+            )
     for finding in list(state.findings):
         if _should_fix_finding(finding):
             _log(
