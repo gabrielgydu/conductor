@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -85,13 +86,13 @@ class BashTmux:
 
     def __init__(self, session_name: str = "conductor") -> None:
         self.session_name = session_name
-        self.windows: list[str] = []
+        self.scripts: list[str] = []
 
     async def ensure_session(self) -> None:
         pass
 
     async def spawn_in_window(self, name, cmd, *, cwd=None, detached=False, log_file=None) -> None:
-        self.windows.append(name)
+        self.scripts.append(cmd)
         _run_window(cmd, cwd, log_file)
 
     async def is_window_alive(self, name: str) -> bool:
@@ -189,3 +190,21 @@ async def test_default_model_reaches_claude_verbatim(repo, claude, tmux):
     assert saved.tasks[0].status == "completed"
     session_end = [e for e in events if e.get("event") == "SESSION_END"]
     assert [e["exit_code"] for e in session_end] == [0]
+
+
+async def test_session_files_live_in_the_loop_dir(repo, claude, tmux):
+    """/tmp/conductor-loop-*-<name>-<idx> collided across projects using one loop name."""
+    claude.script([{
+        "events": [say("<task-completed/>")], "stderr": "cli warning", "write": {"notes.txt": "n\n"},
+    }])
+
+    _, events = await run_loop(make_state(repo, ONE_TASK), repo)
+
+    session_dir = StorageResolver(repo).conductor_dir("fix") / "session"
+    words = list(shlex.shlex(tmux[0].scripts[0], posix=True, punctuation_chars=True))
+    for name in ("task-0-prompt.md", "task-0-output.jsonl", "task-0-exit", "task-0-stderr.log"):
+        assert str(session_dir / name) in words
+    assert "/tmp/conductor-loop-" not in tmux[0].scripts[0]
+    (session_end,) = [e for e in events if e["event"] == "SESSION_END"]
+    assert session_end["stderr_tail"] == "cli warning"
+    assert list(session_dir.iterdir()) == []  # removed after the session

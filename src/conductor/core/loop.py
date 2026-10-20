@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -377,6 +378,63 @@ async def _wait_for_exit(
 
 
 # ---------------------------------------------------------------------------
+# Session files
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SessionFiles:
+    """Files one Claude session reads and writes, in the loop's conductor dir.
+
+    They used to live in /tmp keyed by loop name only, so two projects
+    running a loop with the same name overwrote each other's files.
+    """
+
+    prompt: Path
+    output: Path
+    exit: Path
+    stderr: Path
+
+    @classmethod
+    def create(cls, session_dir: Path, task_index: int, prompt: str) -> _SessionFiles:
+        """Clear leftovers from an earlier session and write *prompt*."""
+        session_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"task-{task_index}"
+        files = cls(
+            prompt=session_dir / f"{stem}-prompt.md",
+            output=session_dir / f"{stem}-output.jsonl",
+            exit=session_dir / f"{stem}-exit",
+            stderr=session_dir / f"{stem}-stderr.log",
+        )
+        files.remove()
+        files.prompt.write_text(prompt, encoding="utf-8")
+        return files
+
+    def exit_code(self) -> int:
+        try:
+            return int(self.exit.read_text().strip())
+        except (ValueError, OSError):
+            return 1
+
+    def output_text(self) -> str:
+        try:
+            return self.output.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def stderr_tail(self, lines: int = 20) -> str:
+        try:
+            text = self.stderr.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return "\n".join(text.strip().splitlines()[-lines:])
+
+    def remove(self) -> None:
+        for f in (self.prompt, self.output, self.exit, self.stderr):
+            f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Loop runner (tmux-based)
 # ---------------------------------------------------------------------------
 
@@ -393,6 +451,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
     state_path = storage.conductor_dir(state.name) / "LOOP-STATE.json"
     log_path = storage.conductor_dir(state.name) / "LOOP-LOG.md"
     audit_path = storage.conductor_dir(state.name) / "LOOP-AUDIT.jsonl"
+    session_dir = storage.conductor_dir(state.name) / "session"
 
     preset = load_preset(state.preset, project_dir)
     tmux = TmuxManager(session_name=f"conductor-loop-{state.name}")
@@ -443,19 +502,13 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         # Run Claude via tmux
         model = resolve_model(state.model or preset.config.model or "opus")
         window_name = f"task-{task.index}"
-        exit_file = Path(f"/tmp/conductor-loop-exit-{state.name}-{task.index}")
-        output_file = Path(f"/tmp/conductor-loop-output-{state.name}-{task.index}")
-        exit_file.unlink(missing_ok=True)
-        output_file.unlink(missing_ok=True)
-
-        # Write prompt to temp file
-        prompt_file = Path(f"/tmp/conductor-loop-prompt-{state.name}-{task.index}")
-        prompt_file.write_text(prompt, encoding="utf-8")
+        files = _SessionFiles.create(session_dir, task.index, prompt)
 
         # Claude piped through stream_filter: pretty-prints to the pane + saves raw json to file
         script = claude_session_script(
-            cwd=cwd, prompt_file=prompt_file, output_file=output_file,
-            exit_file=exit_file, model=model, max_turns=state.max_turns,
+            cwd=cwd, prompt_file=files.prompt, output_file=files.output,
+            exit_file=files.exit, stderr_file=files.stderr,
+            model=model, max_turns=state.max_turns,
         )
 
         log_file = storage.tmux_log(state.name, f"task-{task.index}_session-{state.session_count}")
@@ -464,23 +517,17 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         # Wait for completion (with zombie/stall detection)
         _log("CLAUDE_RUNNING", f"Claude running in window '{window_name}'", log_path, audit_path)
 
-        await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
+        await _wait_for_exit(files.exit, files.output, tmux, window_name, log_path, audit_path)
 
         # Read results
-        try:
-            exit_code = int(exit_file.read_text().strip())
-        except (ValueError, OSError):
-            exit_code = 1
-
-        output_text = ""
-        if output_file.exists():
-            output_text = output_file.read_text(encoding="utf-8", errors="replace")
+        exit_code = files.exit_code()
+        output_text = files.output_text()
 
         _log(
             "SESSION_END",
             f"Session {state.session_count} exit {exit_code}",
             log_path, audit_path,
-            exit_code=exit_code, task_index=task.index,
+            exit_code=exit_code, task_index=task.index, stderr_tail=files.stderr_tail(),
         )
 
         # Check for task signal
@@ -527,9 +574,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         state.updated_at = datetime.now(timezone.utc)
         atomic_save(state, state_path)
 
-        # Cleanup temp files
-        for f in [prompt_file, exit_file, output_file]:
-            f.unlink(missing_ok=True)
+        files.remove()
 
     # Done
     completed = sum(1 for t in state.tasks if t.status == "completed")
