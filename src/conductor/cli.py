@@ -333,6 +333,13 @@ def _unlock_project(storage: StorageResolver, name: str) -> None:
     release_project_lock(storage.conductor_dir(name))
 
 
+def _non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {value}")
+    return value
+
+
 # ─── Presets ─────────────────────────────────────────────────────────────────
 
 
@@ -1115,7 +1122,8 @@ def _cmd_log(args):
         sys.exit(0)
 
     lines = log_path.read_text(encoding="utf-8").splitlines()
-    for line in lines[-args.tail :]:
+    # lines[-0:] would be the whole log
+    for line in lines[max(len(lines) - args.tail, 0) :]:
         print(line)
 
 
@@ -1652,7 +1660,7 @@ def main():
 
     p_log = subparsers.add_parser("log", help="Show conductor log")
     _add_common(p_log)
-    p_log.add_argument("--tail", type=int, default=50)
+    p_log.add_argument("--tail", type=_non_negative_int, default=50, help="Number of lines to show (default: 50)")
 
     p_cleanup = subparsers.add_parser("cleanup", help="Clean up worktrees and branches")
     _add_common(p_cleanup)
