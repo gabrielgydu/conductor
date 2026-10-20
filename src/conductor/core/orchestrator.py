@@ -1310,13 +1310,19 @@ def generate_run_config(
             name=phase_names.get(num_str, f"Phase {num}"),
             prompt_file=prompt_file,
             token=phase_tokens.get(num_str, f"PHASE_{num}_COMPLETE"),
+            model=preset_config.phase_models.get(num) or None,
         ))
 
-    # Extract model if present
+    # Models: the preset wins over run.sh, whose values the generate step
+    # always writes as the speccer default ("opus").
     model_match = re.search(r'CONDUCTOR_MODEL\s*=\s*"([^"]+)"', text)
-    model = model_match.group(1) if model_match else ""
+    model = preset_config.model or (model_match.group(1) if model_match else "")
     fix_model_match = re.search(r'CONDUCTOR_FIX_MODEL\s*=\s*"([^"]+)"', text)
-    fix_model = fix_model_match.group(1) if fix_model_match else model
+    fix_model = (
+        preset_config.fix_model
+        or (fix_model_match.group(1) if fix_model_match else "")
+        or model
+    )
 
     cfg = RunConfig(
         feature_name=feature_name,
@@ -1329,6 +1335,8 @@ def generate_run_config(
         max_gate_retries=preset_config.max_gate_retries,
         steerable=True,
         quick=quick,
+        # Off for every stage on purpose (commit 96c31cd): the preset's
+        # local_ci_enabled is not honoured on the run path.
         local_ci_enabled=False,
         local_ci_command=preset_config.local_ci_command,
         local_ci_full_command=preset_config.local_ci_full_command,
