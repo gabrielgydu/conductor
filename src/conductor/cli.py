@@ -253,6 +253,22 @@ def _kill_stale_tmux_session(session: str) -> bool:
     return True
 
 
+def _forwarded_env() -> list[str]:
+    """`-e NAME=VALUE` options for the variables the re-exec'd conductor must see.
+
+    A command started by an already running tmux server gets the server's
+    environment, not ours: without these, `CONDUCTOR_HOME=... conductor run`
+    would read the state in one place and run from another. Values end up in
+    tmux's argv, so only non-secret variables are forwarded.
+    """
+    names = sorted(k for k in os.environ if k.startswith("CONDUCTOR_")) + ["PATH", "PYTHONPATH"]
+    opts: list[str] = []
+    for name in names:
+        if name in os.environ:
+            opts += ["-e", f"{name}={os.environ[name]}"]
+    return opts
+
+
 def _launch_in_tmux(
     session: str, window: str, argv: list[str], log_file: Path, *, login_shell: bool = False
 ) -> None:
@@ -263,7 +279,7 @@ def _launch_in_tmux(
     # One tmux invocation, so remain-on-exit and the log pipe are in place even
     # when the command exits immediately.
     r = _tmux(
-        "new-session", "-d", "-s", session, "-n", window,
+        "new-session", "-d", "-s", session, *_forwarded_env(), "-n", window,
         f"{shell} {shlex.quote(shlex.join(argv))}",
         ";", "set-option", "-t", target, "remain-on-exit", "on",
         ";", "pipe-pane", "-t", target, f"cat >> {shlex.quote(str(log_file))}",

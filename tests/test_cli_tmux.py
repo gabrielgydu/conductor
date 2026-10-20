@@ -144,3 +144,21 @@ def test_go_reexec_forwards_only_the_flags_given(project, fake_tmux, execvp):
     assert "--quick" not in argv
     # go has no --max-parallel default any more, so a resume keeps the saved value
     assert "--max-parallel" not in argv
+
+
+def test_new_session_gets_the_callers_conductor_env_and_path(project, fake_tmux, execvp, monkeypatch):
+    # A tmux server that is already running would otherwise start the command
+    # with its own environment: the inner run would read another CONDUCTOR_HOME.
+    monkeypatch.setenv("CONDUCTOR_PRESETS_DIR", "/presets with space")
+    monkeypatch.setenv("PATH", "/opt/claude/bin:/usr/bin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+
+    _, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project)])
+
+    assert code == 0
+    new = next(c for c in fake_tmux.calls if c[0] == "new-session")
+    opts = list(new[: new.index("-n")])
+    forwarded = {opts[i + 1] for i, o in enumerate(opts) if o == "-e"}
+    assert "CONDUCTOR_PRESETS_DIR=/presets with space" in forwarded
+    assert "PATH=/opt/claude/bin:/usr/bin" in forwarded
+    assert not any(v.startswith("ANTHROPIC_") for v in forwarded)  # never put secrets in argv
