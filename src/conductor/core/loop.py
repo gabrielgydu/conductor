@@ -15,6 +15,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 from conductor.core.claude import ClaudeResult, resolve_model, run_claude
+from conductor.core.launch import stream_filter_pipe
 from conductor.core.logging import live_log
 from conductor.core.models import atomic_save, load_state
 from conductor.core.presets import load_preset
@@ -463,10 +464,9 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
         )
 
         # Pipe through stream_filter: pretty-prints to terminal + saves raw json to file
-        filter_mod = "conductor.core.stream_filter"
         wrapped_cmd = (
             f"cd {cwd} && {claude_cmd} 2>/dev/null "
-            f"| python3 -m {filter_mod} {output_file}; "
+            f"| {stream_filter_pipe(output_file)}; "
             f"echo ${{PIPESTATUS[0]}} > {exit_file}"
         )
 

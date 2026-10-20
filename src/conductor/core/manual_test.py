@@ -19,6 +19,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from conductor.core.claude import resolve_model
+from conductor.core.launch import stream_filter_pipe
 from conductor.core.logging import live_log
 from conductor.core.models import atomic_save
 from conductor.core.presets import ManualTestPolicy, load_preset
@@ -1567,14 +1568,12 @@ async def _run_generation(
     output_file.unlink(missing_ok=True)
 
     quoted_prompt = shlex.quote(str(prompt_file))
-    quoted_output = shlex.quote(str(output_file))
     quoted_exit = shlex.quote(str(exit_file))
-    filter_mod = "conductor.core.stream_filter"
     pipeline = (
         f"claude -p - --dangerously-skip-permissions "
         f"--max-turns {state.max_turns} --model {shlex.quote(model)} "
         f"--output-format stream-json --verbose < {quoted_prompt} 2>/dev/null "
-        f"| python3 -m {filter_mod} {quoted_output}; "
+        f"| {stream_filter_pipe(output_file)}; "
         f"echo ${{PIPESTATUS[0]}} > {quoted_exit}"
     )
     wrapped_cmd = f"bash -lc {shlex.quote(pipeline)}"
