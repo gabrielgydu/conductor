@@ -1,6 +1,10 @@
 """Stream filter: reads stream-json from stdin, pretty-prints to stdout, saves raw json to file.
 
 Usage: claude -p - ... | python3 -m conductor.core.stream_filter OUTPUT_FILE
+
+OUTPUT_FILE receives every byte of stdin, whatever happens to the display:
+callers read the session's events, the final result event above all, from it.
+Uses only the standard library, so it can also run as a plain script.
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ _YELLOW = "\033[33m"
 _MAGENTA = "\033[35m"
 _GRAY = "\033[90m"
 _GREEN_BOLD = "\033[1;32m"
+_RED_BOLD = "\033[1;31m"
 _RESET = "\033[0m"
 
 _ctx_max = 200_000
@@ -114,9 +119,49 @@ def _format_event(event: dict) -> None:
 
     if t == "result":
         ts = _ts()
-        subtype = event.get("subtype", "")
-        sys.stdout.write(f"{ts}{_GREEN_BOLD}{subtype}{_RESET}\n")
+        label, summary, error_text = describe_result(event)
+        color = _RED_BOLD if event.get("is_error") else _GREEN_BOLD
+        sys.stdout.write(f"{ts}{color}{label}{_RESET}{_DIM}{summary}{_RESET}\n")
+        if error_text:
+            sys.stdout.write(f"{ts}  {error_text}\n")
         sys.stdout.flush()
+
+
+def describe_result(event: dict) -> tuple[str, str, str]:
+    """Display parts of a result event: (label, " (2 turns, $0.0015, 3.0s)", error text).
+
+    The CLI reports some failures (not logged in, unknown model) with subtype
+    "success" and is_error set; those are labelled "error". The error text is
+    the result text or the `errors` list, and empty unless is_error is set.
+    """
+    is_error = bool(event.get("is_error"))
+    label = str(event.get("subtype") or "")
+    if is_error and label in ("", "success"):
+        label = "error"
+
+    details = []
+    turns = event.get("num_turns")
+    if isinstance(turns, int):
+        details.append(f"{turns} turn{'' if turns == 1 else 's'}")
+    cost = event.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        details.append(f"${cost:.4f}")
+    duration_ms = event.get("duration_ms")
+    if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+        details.append(f"{duration_ms / 1000:.1f}s")
+    summary = f" ({', '.join(details)})" if details else ""
+
+    error_text = ""
+    if is_error:
+        result = event.get("result")
+        errors = event.get("errors")
+        if isinstance(result, str) and result.strip():
+            error_text = result.strip()
+        elif isinstance(errors, list):
+            error_text = "; ".join(str(e) for e in errors)
+        if len(error_text) > 500:
+            error_text = error_text[:500] + "…"
+    return label, summary, error_text
 
 
 def main() -> None:
@@ -125,23 +170,44 @@ def main() -> None:
         sys.exit(1)
 
     output_path = sys.argv[1]
+    display = True
 
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        for line in sys.stdin:
-            # Save raw json to file
-            out_f.write(line)
+    # Binary in and out: the file gets Claude's bytes unchanged, and an
+    # undecodable byte cannot stop the copy.
+    with open(output_path, "wb") as out_f:
+        for raw in sys.stdin.buffer:
+            # Save raw json to file before anything else can go wrong.
+            out_f.write(raw)
             out_f.flush()
 
-            # Parse and pretty-print
-            stripped = line.strip()
+            if not display:
+                continue
+            stripped = raw.strip()
             if not stripped:
                 continue
             try:
                 event = json.loads(stripped)
-                if isinstance(event, dict):
-                    _format_event(event)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            # The display is best effort. An event shape the printer does not
+            # expect, or a terminal that went away, must not end the filter:
+            # Claude would get a broken pipe and the rest of the stream,
+            # result event included, would never reach OUTPUT_FILE.
+            try:
+                _format_event(event)
+            except OSError:
+                display = False  # the terminal went away; keep copying
+            except Exception as exc:  # noqa: BLE001
+                _warn(f"cannot display a {event.get('type')!r} event: {exc!r}")
+
+
+def _warn(message: str) -> None:
+    try:
+        print(f"stream_filter: {message}", file=sys.stderr)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

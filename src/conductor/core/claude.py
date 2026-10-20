@@ -6,9 +6,13 @@ import json
 import sys
 import time
 from asyncio.subprocess import PIPE
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Callable
+
+# Re-exported: callers resolve aliases through conductor.core.claude.
+from conductor.core.model_catalog import resolve_model as resolve_model  # noqa: PLC0414
+from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -20,6 +24,7 @@ _YELLOW = "\033[33m"
 _MAGENTA = "\033[35m"
 _GRAY = "\033[90m"
 _GREEN_BOLD = "\033[1;32m"
+_RED_BOLD = "\033[1;31m"
 _RESET = "\033[0m"
 
 
@@ -145,53 +150,175 @@ def progress_on_event(event: dict) -> None:
         sys.stderr.flush()
         return
 
-    # Result event — show bold green subtype
+    # Result event — subtype in bold green, or bold red with the CLI's message on an error
     if t == "result":
+        # Imported here, not at module scope: loop mode and manual-test run
+        # `python3 -m conductor.core.stream_filter`, and runpy warns when
+        # importing the conductor.core package has already loaded it.
+        from conductor.core.stream_filter import describe_result
+
         ts = _ts()
-        subtype = event.get("subtype", "")
+        label, summary, error_text = describe_result(event)
         if color:
-            sys.stderr.write(f"{ts}{_GREEN_BOLD}{subtype}{_RESET}\n")
+            c = _RED_BOLD if event.get("is_error") else _GREEN_BOLD
+            sys.stderr.write(f"{ts}{c}{label}{_RESET}{_DIM}{summary}{_RESET}\n")
         else:
-            sys.stderr.write(f"{ts}{subtype}\n")
+            sys.stderr.write(f"{ts}{label}{summary}\n")
+        if error_text:
+            sys.stderr.write(f"{ts}  {error_text}\n")
         sys.stderr.flush()
 
 
 @dataclass
 class ClaudeResult:
     exit_code: int
-    output: str
+    output: str  # raw stdout: the stream-json lines
     tokens_used: dict[str, int] | None
-    cost: float | None
+    cost: float | None  # the CLI's own total_cost_usd; None if it reported none
     duration: float
+    # The stream-json `result` event (the last one), or None if none arrived.
+    result_event: dict | None = None
+    # The last few KB of the CLI's stderr. Worth logging on a failure, though
+    # the CLI reports most errors (auth, unknown model) in the result event.
+    stderr: str = ""
+    # True when run_claude's timeout_s expired and the CLI was stopped.
+    timed_out: bool = False
+
+    @property
+    def is_error(self) -> bool:
+        """True when the CLI flagged its result as an error.
+
+        Not logged in, an unknown model and error_max_turns all set it. The CLI
+        exits 1 for those too, but `failed` checks both rather than rely on that.
+        """
+        return bool(self.result_event and self.result_event.get("is_error"))
+
+    @property
+    def failed(self) -> bool:
+        """True when the run did not succeed: non-zero exit, error result or timeout."""
+        return self.exit_code != 0 or self.is_error or self.timed_out
+
+    @property
+    def subtype(self) -> str | None:
+        """The result subtype: "success", "error_max_turns", ..."""
+        return self.result_event.get("subtype") if self.result_event else None
+
+    @property
+    def num_turns(self) -> int | None:
+        return self.result_event.get("num_turns") if self.result_event else None
+
+    @property
+    def result_text(self) -> str | None:
+        """The session's final text; for an error result, the CLI's error message."""
+        text = self.result_event.get("result") if self.result_event else None
+        return text if isinstance(text, str) else None
+
+    @property
+    def model_usage(self) -> dict[str, dict]:
+        """Per-model token counts and costUSD (`modelUsage`), keyed by model ID."""
+        usage = self.result_event.get("modelUsage") if self.result_event else None
+        return usage if isinstance(usage, dict) else {}
 
 
-def _extract_tokens_from_stdout(stdout_text: str) -> dict[str, int] | None:
-    """Parse stream-json stdout and return token usage from the result event."""
-    for line in stdout_text.splitlines():
-        line = line.strip()
-        if not line:
+def _tokens_used(result_event: dict | None) -> dict[str, int] | None:
+    """ClaudeResult.tokens_used from a result event; None if it carries no usage."""
+    if not result_event or not isinstance(result_event.get("usage"), dict):
+        return None
+    tokens = result_token_stats(result_event)
+    return {
+        "input_tokens": tokens.input,
+        "output_tokens": tokens.output,
+        "cache_read_input_tokens": tokens.cache_read,
+        "cache_creation_input_tokens": tokens.cache_write,
+    }
+
+
+# Max bytes per stdout line: stream-json lines carry whole tool results.
+_STREAM_LIMIT = 10 * 1024 * 1024
+# How much of the CLI's stderr a ClaudeResult keeps.
+_STDERR_TAIL_BYTES = 4096
+# How long a terminated CLI gets to exit before it is killed.
+_TERMINATE_GRACE_S = 5.0
+
+
+async def _write_prompt(proc: asyncio.subprocess.Process, prompt: str) -> None:
+    """Write the prompt to stdin and close it.
+
+    Like communicate(), ignore a broken pipe: if claude exits before reading
+    its whole prompt (bad flag, auth failure), its exit code reports that.
+    """
+    try:
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    proc.stdin.close()
+    try:
+        await proc.stdin.wait_closed()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+async def _drain_stderr(proc: asyncio.subprocess.Process, tail: bytearray) -> None:
+    """Read stderr to EOF so the CLI never blocks on it, keeping the last bytes."""
+    while chunk := await proc.stderr.read(4096):
+        tail += chunk
+        del tail[:-_STDERR_TAIL_BYTES]
+
+
+async def _read_stdout(
+    proc: asyncio.subprocess.Process,
+    lines: list[str],
+    on_event: Callable[[dict], None] | None,
+) -> None:
+    """Collect stdout lines until EOF, handing each JSON object to on_event."""
+    callback_failed = False
+    while True:
+        try:
+            raw = await proc.stdout.readline()
+        except ValueError:
+            # A line over _STREAM_LIMIT. readline() has discarded what it had
+            # buffered; the rest of that line may come back as a non-JSON
+            # fragment, which every consumer skips. Carry on rather than lose
+            # the session.
+            sys.stderr.write(f"run_claude: skipped a stdout line over {_STREAM_LIMIT} bytes\n")
+            continue
+        if not raw:
+            return
+        line = raw.decode("utf-8", errors="replace")
+        lines.append(line)
+        stripped = line.strip()
+        if on_event is None or not stripped:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            event = json.loads(stripped)
+        except ValueError:
             continue
         if not isinstance(event, dict):
             continue
-        if event.get("type") == "result":
-            # usage may be top-level on the result event or nested under result
-            usage = event.get("usage")
-            if not isinstance(usage, dict):
-                result_val = event.get("result", {})
-                if isinstance(result_val, dict):
-                    usage = result_val.get("usage")
-            if isinstance(usage, dict):
-                return {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-                }
-    return None
+        try:
+            on_event(event)
+        except Exception as exc:  # noqa: BLE001
+            # Progress output is best effort; it must not cost the session.
+            if not callback_failed:
+                callback_failed = True
+                sys.stderr.write(f"run_claude: on_event callback failed, continuing: {exc!r}\n")
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    """Stop the CLI if it is still running (SIGTERM, then SIGKILL) and reap it."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), _TERMINATE_GRACE_S)
+            return
+        except TimeoutError:
+            proc.kill()
+    except ProcessLookupError:
+        pass  # exited on its own in the meantime
+    await proc.wait()
 
 
 async def run_claude(
@@ -203,11 +330,18 @@ async def run_claude(
     append_args: list[str] | None = None,
     cwd: str | None = None,
     on_event: Callable[[dict], None] | object = _USE_DEFAULT,
+    timeout_s: float | None = None,
 ) -> ClaudeResult:
     """Run claude CLI non-interactively, passing prompt via stdin.
 
     By default, streams live progress to stderr (tool calls, text, context usage).
-    Pass on_event=None to suppress output, or a custom callback.
+    Pass on_event=None to suppress output, or a custom callback; an exception in
+    the callback is reported once and does not stop the run.
+
+    timeout_s bounds the whole run. When it expires the CLI is stopped and the
+    result has timed_out=True, a non-zero exit code and the output so far.
+    However run_claude ends (returns, raises or is cancelled), the CLI process
+    has been stopped and reaped by then.
     """
     # Resolve sentinel to default progress printer
     if on_event is _USE_DEFAULT:
@@ -233,68 +367,48 @@ async def run_claude(
         stderr=PIPE,
         cwd=cwd,
         close_fds=True,
-        limit=10 * 1024 * 1024,  # 10MB line buffer (Claude JSON lines can be large)
+        limit=_STREAM_LIMIT,
     )
 
-    if on_event is None:
-        # Original non-streaming path
-        stdout_bytes, _stderr_bytes = await proc.communicate(prompt.encode("utf-8"))
-        duration = time.monotonic() - start
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-    else:
-        # Streaming path: write prompt, close stdin, then read stdout line by line.
-        # Like communicate(), ignore a broken stdin pipe: if claude exits before
-        # reading its whole prompt (bad flag, auth failure), report its exit code
-        # instead of raising BrokenPipeError.
+    lines: list[str] = []
+    stderr_tail = bytearray()
+    timed_out = False
+    # Feed stdin while reading stdout and stderr, so no pipe can fill up and
+    # deadlock whatever order the CLI reads and writes in.
+    io_tasks = [
+        asyncio.create_task(_write_prompt(proc, prompt)),
+        asyncio.create_task(_drain_stderr(proc, stderr_tail)),
+        asyncio.create_task(_read_stdout(proc, lines, on_event)),
+    ]
+    try:
+        async with asyncio.timeout(timeout_s) as deadline:
+            await asyncio.gather(*io_tasks)
+            await proc.wait()
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        timed_out = True
+    finally:
         try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        proc.stdin.close()
-        try:
-            await proc.stdin.wait_closed()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            await _stop(proc)
+        finally:
+            for task in io_tasks:
+                task.cancel()
+            await asyncio.gather(*io_tasks, return_exceptions=True)
+    duration = time.monotonic() - start
 
-        # Drain stderr in background to avoid pipe deadlock
-        async def _drain_stderr():
-            while True:
-                chunk = await proc.stderr.read(4096)
-                if not chunk:
-                    break
-
-        stderr_task = asyncio.create_task(_drain_stderr())
-
-        lines: list[str] = []
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace")
-            lines.append(line)
-            stripped = line.strip()
-            if stripped:
-                try:
-                    event = json.loads(stripped)
-                    if isinstance(event, dict):
-                        on_event(event)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-        await stderr_task
-        await proc.wait()
-        duration = time.monotonic() - start
-        stdout_text = "".join(lines)
-
-    tokens = _extract_tokens_from_stdout(stdout_text)
+    stdout_text = "".join(lines)
+    result_event = find_result_event(stdout_text)
 
     return ClaudeResult(
         exit_code=proc.returncode or 0,
         output=stdout_text,
-        tokens_used=tokens,
-        cost=None,
+        tokens_used=_tokens_used(result_event),
+        cost=result_cost_usd(result_event),
         duration=duration,
+        result_event=result_event,
+        stderr=stderr_tail.decode("utf-8", errors="replace"),
+        timed_out=timed_out,
     )
 
 
@@ -470,26 +584,3 @@ async def run_claude_steerable(
     await proc.stdin.drain()
 
     return SteerableSession(proc, start)
-
-
-def resolve_model(name: str) -> str:
-    """Resolve short model names to full Claude model IDs."""
-    _MODEL_MAP = {
-        "opus": "claude-opus-4-8[1m]",
-        "opus-200k": "claude-opus-4-8",
-        "sonnet": "claude-sonnet-4-6",
-        "haiku": "claude-haiku-4-5",
-    }
-    return _MODEL_MAP.get(name, name)
-
-
-def calculate_cost(tokens: dict[str, int] | None) -> float | None:
-    """Calculate cost from token usage. Returns None if tokens is None."""
-    if not tokens:
-        return None
-    # Pricing per million tokens (as of 2025)
-    input_cost = tokens.get("input_tokens", 0) * 15.0 / 1_000_000
-    output_cost = tokens.get("output_tokens", 0) * 75.0 / 1_000_000
-    cache_read_cost = tokens.get("cache_read_input_tokens", 0) * 1.5 / 1_000_000
-    cache_write_cost = tokens.get("cache_creation_input_tokens", 0) * 18.75 / 1_000_000
-    return input_cost + output_cost + cache_read_cost + cache_write_cost
