@@ -11,7 +11,6 @@ Implementation details:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import signal
@@ -23,13 +22,14 @@ from pathlib import Path
 from typing import Optional
 
 from conductor.core.claude import run_claude
-from runner.git_ops import git_has_any_changes, git_commit, git_push, git_current_sha
-from runner.logging import log, warn, error, dim
+from runner.git_ops import git_has_any_changes, git_commit, git_current_sha
+from runner.logging import log, warn, error
 
 
 _MAX_PROMPT_CHARS = 100_000
 _MAX_REVIEW_THREADS = 15
 _CI_INITIAL_WAIT = 30   # seconds before first poll
+_FIX_WORKTREE_ROOT = Path("/tmp")
 
 
 # ─── Data structures ─────────────────────────────────────────────────────────
@@ -74,10 +74,12 @@ def _gh(args: list[str], cwd: Path) -> str:
 
 
 def _gh_safe(args: list[str], cwd: Path, default: str = "") -> str:
-    """Run gh CLI and return stdout; return default on error."""
+    """Run gh CLI and return stdout; log the failure and return default on error."""
     try:
         return _gh(args, cwd)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip().splitlines()
+        warn(f"gh {' '.join(args[:2])} failed (exit {exc.returncode}): {detail[0] if detail else 'no output'}")
         return default
 
 
@@ -220,6 +222,45 @@ def _is_skip_check(name: str, skip_patterns: str) -> bool:
     return bool(re.search(skip_patterns, name))
 
 
+# `gh pr checks --json` fields. `bucket` is gh's own grouping of `state` into
+# pass / fail / pending / skipping / cancel; matching raw states by hand missed
+# TIMED_OUT, ERROR, WAITING and friends. (detailsUrl is not a field here — it
+# belongs to `gh pr view`'s statusCheckRollup — and made gh exit 1.)
+_CHECK_FIELDS = "name,state,bucket,link"
+
+
+def _pr_checks(pr_number: int, cwd: Path) -> list[dict]:
+    """Checks reported on the PR; empty when there are none or gh failed."""
+    result = subprocess.run(
+        ["gh", "pr", "checks", str(pr_number), "--json", _CHECK_FIELDS],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    # Exit 8 means "checks pending"; the JSON is still printed.
+    if result.returncode in (0, 8):
+        try:
+            checks = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            checks = None
+        if isinstance(checks, list):
+            return [c for c in checks if isinstance(c, dict)]
+    stderr = result.stderr.strip()
+    if "no checks reported" not in stderr:
+        warn(f"gh pr checks {pr_number} failed (exit {result.returncode}): {stderr[:300]}")
+    return []
+
+
+def _blocking_failures(checks: list[dict], skip_patterns: str) -> list[dict]:
+    """Failed checks that block the PR (one rule for waiting and for log gathering)."""
+    return [
+        c for c in checks
+        if c.get("bucket") == "fail" and not _is_skip_check(c.get("name", ""), skip_patterns)
+    ]
+
+
 def wait_for_ci(
     pr_number: int,
     cwd: Path,
@@ -238,27 +279,17 @@ def wait_for_ci(
     waited = _CI_INITIAL_WAIT
 
     while waited < max_wait:
-        raw = _gh_safe(
-            ["pr", "checks", str(pr_number), "--json", "state,name"],
-            cwd,
-            default="[]",
-        )
-        try:
-            checks = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            checks = []
+        checks = _pr_checks(pr_number, cwd)
 
         if checks:
-            states = {c.get("state", "UNKNOWN") for c in checks}
-            pending = any(s in ("PENDING", "IN_PROGRESS", "QUEUED") for s in states)
+            pending = any(c.get("bucket") == "pending" for c in checks)
 
             if not pending:
                 log(f"CI completed after {waited}s")
-                failed = [c["name"] for c in checks if c.get("state") == "FAILURE"]
-                blocking = [n for n in failed if not _is_skip_check(n, skip_patterns)]
+                blocking = _blocking_failures(checks, skip_patterns)
                 if blocking:
-                    for n in blocking:
-                        log(f"  BLOCKING: {n}")
+                    for c in blocking:
+                        log(f"  BLOCKING: {c.get('name')} ({c.get('state')})")
                     return "CI_FAILED"
                 return "CI_PASSED"
         else:
@@ -328,8 +359,8 @@ def get_unresolved_threads(pr_number: int, owner: str, repo: str, cwd: Path) -> 
     return [n for n in nodes if not n.get("isResolved", True)]
 
 
-def resolve_thread(thread_id: str, cwd: Path) -> None:
-    """Resolve a single review thread via GraphQL mutation."""
+def resolve_thread(thread_id: str, cwd: Path) -> bool:
+    """Resolve a single review thread via GraphQL mutation. True if GitHub confirms it."""
     query = """
     mutation($threadId: ID!) {
       resolveReviewThread(input: {threadId: $threadId}) {
@@ -337,27 +368,15 @@ def resolve_thread(thread_id: str, cwd: Path) -> None:
       }
     }
     """
-    _graphql(query, {"threadId": thread_id}, cwd)
+    data = _graphql(query, {"threadId": thread_id}, cwd)
+    thread = ((data.get("data") or {}).get("resolveReviewThread") or {}).get("thread") or {}
+    return thread.get("isResolved") is True
 
 
 def get_ci_failure_logs(pr_number: int, owner: str, repo: str, cwd: Path, skip_patterns: str = "coverage|Coverage|codecov|Codecov") -> str:
     """Return CI failure annotation text, or empty string if none."""
-    raw = _gh_safe(
-        ["pr", "checks", str(pr_number), "--json", "state,name,detailsUrl"],
-        cwd,
-        default="[]",
-    )
-    try:
-        checks = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return ""
-
-    failed_names = [
-        c["name"]
-        for c in checks
-        if c.get("state") == "FAILURE" and not _is_skip_check(c.get("name", ""), skip_patterns)
-    ]
-    if not failed_names:
+    failed = _blocking_failures(_pr_checks(pr_number, cwd), skip_patterns)
+    if not failed:
         return ""
 
     # Get head SHA for annotations
@@ -367,8 +386,10 @@ def get_ci_failure_logs(pr_number: int, owner: str, repo: str, cwd: Path, skip_p
     )
 
     logs_parts: list[str] = []
-    for check_name in failed_names:
-        logs_parts.append(f"=== FAILED CHECK: {check_name} ===")
+    for check in failed:
+        check_name = check.get("name", "")
+        link = f" ({check['link']})" if check.get("link") else ""
+        logs_parts.append(f"=== FAILED CHECK: {check_name}{link} ===")
         if head_sha:
             annotations = _gh_safe(
                 [
@@ -397,7 +418,12 @@ def build_fix_prompt(
     cfg: FixerConfig,
     ci_logs: str,
     threads: list[dict],
-) -> str:
+) -> tuple[str, list[dict]]:
+    """Return the fix prompt and the review threads it actually shows Claude.
+
+    Threads past _MAX_REVIEW_THREADS, or cut off by the prompt size cap, are
+    not shown and must not be resolved on Claude's behalf.
+    """
     phase_label = ",".join(str(p) for p in sorted(cfg.adopted_phases))
 
     prompt = (
@@ -417,6 +443,7 @@ def build_fix_prompt(
     if ci_logs:
         prompt += f"\n=== CI FAILURES ===\n{ci_logs}\n\nFix the CI failures above. Read the error messages carefully, find the relevant files, and make the corrections.\n"
 
+    shown: list[tuple[dict, int]] = []  # (thread, prompt length once its block is in)
     if threads:
         display_threads = threads[:_MAX_REVIEW_THREADS]
         omitted = max(0, len(threads) - _MAX_REVIEW_THREADS)
@@ -433,6 +460,7 @@ def build_fix_prompt(
                     author = c.get("author", {}).get("login", "?")
                     body = c.get("body", "")
                     prompt += f"[{author}]: {body}\n"
+                shown.append((t, len(prompt)))
 
         if omitted:
             prompt += f"\n({omitted} more threads omitted — address the above first)\n"
@@ -447,7 +475,7 @@ def build_fix_prompt(
         log(f"Prompt too large ({len(prompt)} chars) — truncating by {overflow} chars")
         prompt = prompt[:_MAX_PROMPT_CHARS] + f"\n\n... (prompt truncated — {overflow} chars removed. Focus on the issues shown above.)\n"
 
-    return prompt
+    return prompt, [t for t, end in shown if end <= _MAX_PROMPT_CHARS]
 
 
 # ─── Worktree helpers ─────────────────────────────────────────────────────────
@@ -468,8 +496,7 @@ def _git_run(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
 def _worktree_add(project_dir: Path, worktree_dir: Path, fix_branch: str, base_branch: str) -> bool:
     """Create a worktree with a new fix branch based on base_branch. Returns True on success."""
     # Clean up stale worktree/branch if they exist
-    _git_run(["worktree", "remove", str(worktree_dir)], project_dir, check=False)
-    _git_run(["branch", "-D", fix_branch], project_dir, check=False)
+    _worktree_remove(project_dir, worktree_dir, fix_branch)
     result = _git_run(
         ["worktree", "add", str(worktree_dir), "-b", fix_branch, base_branch],
         project_dir,
@@ -479,8 +506,14 @@ def _worktree_add(project_dir: Path, worktree_dir: Path, fix_branch: str, base_b
 
 
 def _worktree_remove(project_dir: Path, worktree_dir: Path, fix_branch: str) -> None:
-    """Remove worktree and delete local fix branch."""
-    _git_run(["worktree", "remove", str(worktree_dir)], project_dir, check=False)
+    """Remove worktree and delete local fix branch.
+
+    --force: the worktree is often dirty here (Claude failed mid-edit, or a
+    commit was rejected). Without it the removal failed, the branch stayed
+    checked out there, and every later fixer run for the phase failed on
+    `worktree add -b` because the branch already existed.
+    """
+    _git_run(["worktree", "remove", "--force", str(worktree_dir)], project_dir, check=False)
     _git_run(["branch", "-D", fix_branch], project_dir, check=False)
 
 
@@ -626,7 +659,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
     status_file = log_dir / f".fixer-status-phase-{cfg.phase}"
 
     fix_branch = f"fix/{cfg.branch}-phase-{cfg.phase}"
-    worktree_dir = Path(f"/tmp/conductor-fix-{cfg.feature_name}-phase-{cfg.phase}-{os.getpid()}")
+    worktree_dir = _FIX_WORKTREE_ROOT / f"conductor-fix-{cfg.feature_name}-phase-{cfg.phase}-{os.getpid()}"
 
     # Step 1: Supersede older fixers (async mode only)
     if not cfg.sync_mode:
@@ -724,6 +757,11 @@ async def run_fixer(cfg: FixerConfig) -> None:
     ci_logs = ""
     if ci_result == "CI_FAILED":
         ci_logs = get_ci_failure_logs(cfg.pr_number, owner, repo, cwd, cfg.skip_patterns)
+        if not ci_logs:
+            error("CI failed, but the failing checks could not be read")
+            if not threads:
+                write_fixer_status(status_file, "error", cfg.phase, cfg.adopted_phases, "CI failed but failure details unavailable")
+                return
 
     if not ci_logs and not threads:
         log("No issues found — CI passed and no review comments")
@@ -733,7 +771,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
     write_fixer_status(status_file, "fixing", cfg.phase, cfg.adopted_phases)
 
     # Step 5: build prompt
-    prompt = build_fix_prompt(cfg, ci_logs, threads)
+    prompt, shown_threads = build_fix_prompt(cfg, ci_logs, threads)
 
     # Step 6: setup working directory
     if cfg.sync_mode:
@@ -800,6 +838,7 @@ async def run_fixer(cfg: FixerConfig) -> None:
         return
 
     # Step 10: create fix PR (async mode only)
+    fixes_reachable = True  # the pushed fixes can reach cfg.branch
     if not cfg.sync_mode:
         log(f"Creating fix PR targeting {cfg.branch}...")
         pr_result = subprocess.run(
@@ -824,18 +863,23 @@ async def run_fixer(cfg: FixerConfig) -> None:
             log(f"Fix PR created: {pr_result.stdout.strip()}")
         else:
             log(f"Fix PR creation failed: {pr_result.stderr.strip()}")
+            fixes_reachable = False
 
-    # Step 11: resolve review threads
-    if threads:
-        log(f"Resolving {len(threads)} review threads...")
-        for t in threads:
+    # Step 11: resolve the review threads Claude was shown
+    if shown_threads and not fixes_reachable:
+        warn(f"Leaving {len(shown_threads)} review thread(s) open — no fix PR carries the changes")
+    elif shown_threads:
+        if len(shown_threads) < len(threads):
+            log(f"Leaving {len(threads) - len(shown_threads)} review thread(s) open — not shown to Claude")
+        log(f"Resolving {len(shown_threads)} review threads...")
+        for t in shown_threads:
             tid = t.get("id", "")
-            if tid:
-                try:
-                    resolve_thread(tid, cwd)
-                    log(f"  Resolved thread {tid}")
-                except Exception as exc:
-                    warn(f"  Could not resolve thread {tid}: {exc}")
+            if not tid:
+                continue
+            if resolve_thread(tid, cwd):
+                log(f"  Resolved thread {tid}")
+            else:
+                warn(f"  Could not resolve thread {tid}")
 
     # Step 12: cleanup worktree
     if not cfg.sync_mode:

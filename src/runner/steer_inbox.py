@@ -10,6 +10,20 @@ from runner.steerable import SteerableSession
 logger = logging.getLogger("runner.steer_inbox")
 
 
+def clear_steer_inbox(inbox: Path) -> None:
+    """Delete messages left from before this runner started.
+
+    Called once per runner start, not per session: the orchestrator may write
+    a message while no session is live (between iterations, during a commit
+    or the quality gate), and the next session must still receive it.
+    """
+    try:
+        for stale in inbox.glob("*.msg"):
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 async def poll_steer_inbox(
     inbox: Path,
     session: SteerableSession,
@@ -17,22 +31,15 @@ async def poll_steer_inbox(
 ) -> None:
     """Poll inbox directory for .msg files, send contents to session, delete after sending.
 
-    Clears stale .msg files on startup. Runs until cancelled.
-    Handles FileNotFoundError gracefully if inbox dir does not exist yet.
+    Runs until cancelled. Messages already waiting when it starts are
+    delivered too. Handles a missing inbox dir and unreadable entries.
     Files are sorted by name so timestamp-prefixed filenames are processed in order.
     """
-    # Clear any stale messages that pre-date this session
-    try:
-        for stale in sorted(inbox.glob("*.msg")):
-            stale.unlink(missing_ok=True)
-    except FileNotFoundError:
-        pass
-
     while True:
         await asyncio.sleep(interval)
         try:
             msg_files = sorted(inbox.glob("*.msg"))
-        except FileNotFoundError:
+        except OSError:
             continue
 
         for msg_file in msg_files:
@@ -40,6 +47,9 @@ async def poll_steer_inbox(
                 content = msg_file.read_text(encoding="utf-8")
             except FileNotFoundError:
                 # Raced with another consumer — skip
+                continue
+            except OSError as exc:
+                logger.warning("Skipping unreadable steering message %s: %s", msg_file.name, exc)
                 continue
 
             try:

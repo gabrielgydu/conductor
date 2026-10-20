@@ -69,16 +69,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.max_iterations:
         cfg.max_iterations = args.max_iterations
 
-    start_phase = args.start_phase or 1
-
-    log(f"runner: feature={args.feature} start_phase={start_phase} feature_dir={feature_dir}")
+    log(f"runner: feature={args.feature} start_phase={args.start_phase or 'auto'} feature_dir={feature_dir}")
 
     return asyncio.run(
         run_phase_loop(
             cfg=cfg,
             feature_dir=feature_dir,
             storage_dir=storage_dir,
-            start_phase=start_phase,
+            start_phase=args.start_phase,
         )
     )
 
@@ -88,7 +86,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_fixer(args: argparse.Namespace) -> int:
     from runner.fixer import run_fixer, FixerConfig
-    from runner.logging import error
 
     if args.storage_dir:
         storage_dir = Path(args.storage_dir)
@@ -121,7 +118,7 @@ def _cmd_fixer(args: argparse.Namespace) -> int:
 
 def _cmd_generate_run_sh(args: argparse.Namespace) -> int:
     """Generate a thin run.sh that invokes the Python runner."""
-    from runner.logging import log, error
+    from runner.logging import log
     import shutil
 
     if args.storage_dir:
@@ -169,7 +166,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--preset", default=None, help="Preset name (overrides RUN-CONFIG)")
     p_run.add_argument("--model", default=None, help="Model override")
     p_run.add_argument("--storage-dir", default=None, help="Feature storage directory (overrides default)")
-    p_run.add_argument("--start-phase", type=int, default=None, help="Start from this phase number (1-based)")
+    p_run.add_argument(
+        "--start-phase", type=int, default=None,
+        help="Start from this phase number (1-based); default: after the phases already done",
+    )
     p_run.add_argument("--no-fixer", action="store_true", help="Disable fixer even if enabled in config")
     p_run.add_argument("--quick", action="store_true", help="Quality gate only between phases; full CI+review at end")
     p_run.add_argument("--max-iterations", type=int, default=None, help="Override max iterations per phase")

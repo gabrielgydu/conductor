@@ -78,35 +78,45 @@ def git_snapshot_untracked(cwd: Path, snapshot_file: Path) -> set[str]:
         log(dim(f"  Reusing untracked snapshot ({len(existing)} files)"))
         return existing
 
-    result = _run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        cwd=cwd,
-        check=False,
-    )
-    files = {
-        line for line in result.stdout.splitlines() if line.strip()
-    }
+    files = git_untracked_files(cwd)
     snapshot_file.write_text("\n".join(sorted(files)), "utf-8")
     log(dim(f"  Saved untracked snapshot ({len(files)} files)"))
     return files
 
 
+def git_untracked_files(cwd: Path) -> set[str]:
+    """Untracked, non-ignored files (repo-relative)."""
+    result = _run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=cwd,
+        check=False,
+    )
+    return {line for line in result.stdout.splitlines() if line.strip()}
+
+
 def git_unstage_pre_existing(cwd: Path, pre_existing: set[str]) -> None:
     """Unstage files that were already untracked before this phase."""
-    if not pre_existing:
+    git_unstage_paths(cwd, sorted(pre_existing))
+
+
+def git_unstage_paths(cwd: Path, paths: list[str]) -> None:
+    """Unstage *paths* (files or directories relative to cwd).
+
+    Paths that match nothing are fine; errors are ignored.
+    """
+    if not paths:
         return
-    result = subprocess.run(
-        ["git", "reset", "HEAD", "--"] + sorted(pre_existing),
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        close_fds=True,
-    )
-    _ = result  # ignore errors; files may not exist
+    _run(["git", "reset", "-q", "HEAD", "--"] + list(paths), cwd=cwd, check=False)
 
 
 def git_current_sha(cwd: Path) -> str:
     result = _run(["git", "rev-parse", "HEAD"], cwd=cwd, check=False)
     return result.stdout.strip()
+
+
+def git_is_ancestor(cwd: Path, sha: str) -> bool:
+    """True if commit *sha* is HEAD or one of its ancestors."""
+    if not sha:
+        return False
+    result = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=cwd, check=False)
+    return result.returncode == 0
