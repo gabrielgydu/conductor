@@ -11,7 +11,7 @@ import subprocess
 
 import pytest
 
-from conductor.core.tmux import TmuxManager
+from conductor.core.tmux import TmuxManager, session_target, window_target
 
 
 class TmuxRecorder:
@@ -86,3 +86,39 @@ async def test_pipe_pane_quotes_log_file(recorder, tmp_path):
     # pipe-pane runs its command with /bin/sh -c
     _run(["sh", "-c", pipe_pane[-1]], input="hello\n", text=True)
     assert log_file.read_text() == "hello\n"
+
+
+async def test_every_tmux_target_is_exact(recorder, tmp_path):
+    """Bare names prefix-match: conductor-foo would hit conductor-foobar, run0:api run0:api-exec."""
+    tmux = TmuxManager("conductor-foo")
+    tmux.session_exists()
+    await tmux.ensure_session()
+    await tmux.spawn_in_window("run0:api", "true", log_file=tmp_path / "w.log")
+    await tmux.spawn_runner_in_window("run0:api", "true", exit_file=tmp_path / "conductor-exit-a")
+    await tmux.is_window_alive("run0:api")
+    await tmux.is_runner_idle("run0:api")
+    await tmux.has_active_children("run0:api")
+    await tmux.send_keys("run0:api", "C-c")
+    await tmux.capture_pane("run0:api")
+    await tmux.kill_window("run0:api")
+    await tmux.kill_session()
+
+    targets = {(c[0], c[c.index("-t") + 1]) for c in recorder.calls if "-t" in c}
+    assert targets == {
+        ("has-session", "=conductor-foo"),
+        ("kill-session", "=conductor-foo"),
+        ("list-windows", "=conductor-foo"),
+        # without the colon tmux reads a new-window target as a window name
+        ("new-window", "=conductor-foo:"),
+        ("kill-window", "=conductor-foo:=run0:api"),
+        ("set-option", "=conductor-foo:=run0:api"),
+        ("pipe-pane", "=conductor-foo:=run0:api"),
+        ("list-panes", "=conductor-foo:=run0:api"),
+        ("send-keys", "=conductor-foo:=run0:api"),
+        ("capture-pane", "=conductor-foo:=run0:api"),
+    }
+
+
+def test_target_helpers():
+    assert session_target("conductor-loop-x") == "=conductor-loop-x"
+    assert window_target("conductor-x", "run0:backend") == "=conductor-x:=run0:backend"

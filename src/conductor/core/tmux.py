@@ -27,6 +27,27 @@ def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
     return len(pids) >= depth
 
 
+def session_target(session: str) -> str:
+    """Exact-match ``-t`` target for *session*.
+
+    A bare name falls back to prefix and fnmatch matching when no session has
+    exactly that name, so ``conductor-foo`` would resolve to a live
+    ``conductor-foobar``. For ``new-window -t`` append a colon
+    (``session_target(s) + ":"``): without it tmux reads the target as a
+    window, and the ``=`` only makes the window match exact.
+    """
+    return f"={session}"
+
+
+def window_target(session: str, window: str) -> str:
+    """Exact-match ``-t`` target for *window* in *session* (both names exact).
+
+    ``=session:window`` alone still lets ``run0:api`` resolve to a sibling
+    ``run0:api-exec`` when ``run0:api`` itself is gone.
+    """
+    return f"={session}:={window}"
+
+
 class TmuxManager:
     def __init__(self, session_name: str = "conductor") -> None:
         self._session_name = session_name
@@ -40,9 +61,12 @@ class TmuxManager:
             check=check,
         )
 
+    def _window(self, name: str) -> str:
+        return window_target(self._session_name, name)
+
     def session_exists(self) -> bool:
         """Check if the tmux session exists."""
-        r = self._run_tmux("has-session", "-t", self._session_name, check=False)
+        r = self._run_tmux("has-session", "-t", session_target(self._session_name), check=False)
         return r.returncode == 0
 
     async def ensure_session(self) -> None:
@@ -57,7 +81,7 @@ class TmuxManager:
         """Tee all pane output to a log file via tmux pipe-pane."""
         log_file.parent.mkdir(parents=True, exist_ok=True)
         self._run_tmux(
-            "pipe-pane", "-t", f"{self._session_name}:{window_name}",
+            "pipe-pane", "-t", self._window(window_name),
             f"cat >> {shlex.quote(str(log_file))}",
             check=False,
         )
@@ -65,7 +89,7 @@ class TmuxManager:
     def _set_remain_on_exit(self, window_name: str) -> None:
         """Keep window open after command exits."""
         self._run_tmux(
-            "set-option", "-t", f"{self._session_name}:{window_name}",
+            "set-option", "-t", self._window(window_name),
             "remain-on-exit", "on",
             check=False,
         )
@@ -82,9 +106,9 @@ class TmuxManager:
         unquoted ``[1m]`` model ID is a failing glob and ``$PIPESTATUS``
         does not exist.
         """
-        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
+        self._run_tmux("kill-window", "-t", self._window(name), check=False)
 
-        args = ["new-window", "-t", self._session_name, "-n", name]
+        args = ["new-window", "-t", f"{session_target(self._session_name)}:", "-n", name]
         if detached:
             args.insert(1, "-d")
         if cwd:
@@ -163,7 +187,7 @@ class TmuxManager:
     async def is_window_alive(self, name: str) -> bool:
         """Check if a tmux window exists."""
         r = self._run_tmux(
-            "list-windows", "-t", self._session_name,
+            "list-windows", "-t", session_target(self._session_name),
             "-F", "#{window_name}",
             check=False,
         )
@@ -188,7 +212,7 @@ class TmuxManager:
     async def get_pane_pid(self, name: str) -> int | None:
         """Get PID of the process in the tmux pane."""
         r = self._run_tmux(
-            "list-panes", "-t", f"{self._session_name}:{name}",
+            "list-panes", "-t", self._window(name),
             "-F", "#{pane_pid}",
             check=False,
         )
@@ -202,17 +226,17 @@ class TmuxManager:
     async def send_keys(self, name: str, keys: str) -> None:
         """Send keys to a tmux pane (e.g., Ctrl-C)."""
         self._run_tmux(
-            "send-keys", "-t", f"{self._session_name}:{name}",
+            "send-keys", "-t", self._window(name),
             keys, check=False,
         )
 
     async def kill_window(self, name: str) -> None:
         """Kill a tmux window."""
-        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
+        self._run_tmux("kill-window", "-t", self._window(name), check=False)
 
     async def kill_session(self) -> None:
         """Kill the tmux session."""
-        self._run_tmux("kill-session", "-t", self._session_name, check=False)
+        self._run_tmux("kill-session", "-t", session_target(self._session_name), check=False)
 
     async def has_active_children(self, name: str, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
         """Check if the pane has a healthy process tree.
@@ -228,7 +252,7 @@ class TmuxManager:
     async def capture_pane(self, name: str, lines: int = 20) -> str:
         """Capture the last N lines from a tmux pane."""
         r = self._run_tmux(
-            "capture-pane", "-t", f"{self._session_name}:{name}",
+            "capture-pane", "-t", self._window(name),
             "-p", "-S", f"-{lines}",
             check=False,
         )
