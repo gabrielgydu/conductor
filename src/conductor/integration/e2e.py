@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
 from conductor.core.claude import run_claude
@@ -187,7 +187,7 @@ async def run_integration_specs(worktree_path: Path) -> tuple[E2ETestState, str]
             continue
         try:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), _SPEC_TIMEOUT_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             total_failed += 1
