@@ -543,4 +543,6 @@ When **all domains are fully spec'd** and pass the self-audit checklist, output:
 
 <promise>SPEC_COMPLETE</promise>
 
+Output exactly one promise token, as the last line of your final message. The CLI reads only that final message, so do not write either token anywhere else: not in earlier messages, not in files, and not in anything you send to a subagent.
+
 **CRITICAL:** Only output SPEC_COMPLETE when EVERY domain has ALL applicable sections filled out at production-ready depth. If even one domain is shallow, keep speccing.

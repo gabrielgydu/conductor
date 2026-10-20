@@ -349,10 +349,22 @@ def build_generate_prompt(
 # Text extraction from Claude stream-json output
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _extract_text_from_output(output: str) -> str:
-    """Extract assistant text content from stream-json output."""
+def _final_message_text(output: str) -> str:
+    """Return the text of the session's final top-level assistant message.
+
+    The CLI reports it as the ``result`` of the last ``result`` event. A
+    session that waits for a background subagent ends more than one turn and
+    the CLI emits one result per turn, in order, so the last one wins. If the
+    stream has no result event, fall back to the last top-level assistant
+    event that carries text.
+
+    Events with a ``parent_tool_use_id`` come from subagents and are skipped,
+    and tool inputs and results are never read: a promise token quoted in a
+    file the agent wrote, or in a reviewer's reply, is not the agent's verdict.
+    """
     import json
-    parts: list[str] = []
+    result_text: str | None = None
+    last_text = ""
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -361,19 +373,27 @@ def _extract_text_from_output(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or event.get("parent_tool_use_id"):
             continue
-        if event.get("type") == "assistant":
+        if event.get("type") == "result":
+            result = event.get("result")
+            result_text = result if isinstance(result, str) else ""
+        elif event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            parts.append(text)
-            elif isinstance(content, str):
-                parts.append(content)
-    return "\n".join(parts)
+            if isinstance(content, str):
+                texts = [content]
+            elif isinstance(content, list):
+                texts = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+            else:
+                texts = []
+            text = "\n".join(t for t in texts if t)
+            if text:
+                last_text = text
+    return result_text if result_text is not None else last_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -385,12 +405,17 @@ _TOKEN_NEEDS_INPUT = "<promise>SPEC_NEEDS_INPUT</promise>"
 
 
 def _detect_promise(text: str) -> str | None:
-    """Return 'COMPLETE', 'NEEDS_INPUT', or None."""
-    if _TOKEN_COMPLETE in text:
-        return "COMPLETE"
-    if _TOKEN_NEEDS_INPUT in text:
-        return "NEEDS_INPUT"
-    return None
+    """Return 'COMPLETE', 'NEEDS_INPUT', or None.
+
+    When both tokens appear, the last one is the verdict: an agent that
+    writes "I can't emit SPEC_COMPLETE yet" and then ends with NEEDS_INPUT
+    has questions.
+    """
+    complete = text.rfind(_TOKEN_COMPLETE)
+    needs_input = text.rfind(_TOKEN_NEEDS_INPUT)
+    if complete == -1 and needs_input == -1:
+        return None
+    return "COMPLETE" if complete > needs_input else "NEEDS_INPUT"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -668,12 +693,7 @@ async def _cmd_run_async(
         )
 
     # ── Detect promise token ─────────────────────────────────────────────────
-    claude_text = _extract_text_from_output(result.output)
-
-    promise = _detect_promise(claude_text)
-    # Fallback: also check raw output in case stream format differs
-    if promise is None:
-        promise = _detect_promise(result.output)
+    promise = _detect_promise(_final_message_text(result.output))
 
     if promise == "COMPLETE":
         # Gate: reject SPEC_COMPLETE if any [NEEDS CLARIFICATION] markers remain
@@ -721,7 +741,7 @@ async def _cmd_run_async(
         # No token — revert status
         update_status(spec_dir, pre_status)
         _log(f"{_RED}{_BOLD}No promise token detected{_RESET}")
-        _log("Claude finished without emitting SPEC_NEEDS_INPUT or SPEC_COMPLETE.")
+        _log("Claude's final message contains neither SPEC_NEEDS_INPUT nor SPEC_COMPLETE.")
         _log(f"Status reverted to {pre_status}. You may need to run again.")
         sys.exit(1)
 
