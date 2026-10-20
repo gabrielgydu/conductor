@@ -608,3 +608,71 @@ async def test_no_mergeable_run_fails_without_publishing(
     assert result.merged_runs == []
     hermetic_merge.validate.assert_not_awaited()
     gh.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Conflict markers never reach the branch
+# ---------------------------------------------------------------------------
+
+
+def _modify_delete_conflict(repo) -> None:
+    """md-a edits other.txt and app.txt line 2; md-d deletes other.txt and edits
+    the same line, so -X theirs cannot settle it (modify/delete)."""
+    git = ["git", "-C", str(repo.path)]
+    (repo.path / "app.txt").write_text("l1\nl2\nl3\n")
+    (repo.path / "other.txt").write_text("other\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "base files"], check=True)
+    repo.create_branch("md-a", {"app.txt": "l1\nA\nl3\n", "other.txt": "other, edited\n"})
+    subprocess.run([*git, "checkout", "-q", "-b", "md-d", "main"], check=True)
+    subprocess.run([*git, "rm", "-q", "other.txt"], check=True)
+    (repo.path / "app.txt").write_text("l1\nD\nl3\n")
+    subprocess.run([*git, "commit", "-q", "-am", "md-d"], check=True)
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+
+
+@pytest.mark.parametrize(
+    "claude_leaves",
+    [
+        pytest.param(None, id="claude-fails"),
+        # Claude drops only the opening markers; ======= and >>>>>>> remain.
+        pytest.param("l1\nA\n=======\nD\n>>>>>>> md-d\nl3\n", id="partial-markers"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unresolved_conflicts_are_left_out_not_committed(
+    real_merge_repo, tmp_path, claude_leaves
+):
+    from conductor.core.claude import ClaudeResult
+
+    _modify_delete_conflict(real_merge_repo)
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "md-a"),
+        _done_run_with_branch(1, "feat-d", "md-d"),
+    )
+
+    async def fake_claude(prompt, **kwargs):
+        if claude_leaves is None:
+            return ClaudeResult(exit_code=1, output="", tokens_used=None, cost=None, duration=0)
+        (Path(kwargs["cwd"]) / "app.txt").write_text(claude_leaves)
+        (Path(kwargs["cwd"]) / "other.txt").unlink()
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    with patch("conductor.integration.merge.run_claude", side_effect=fake_claude):
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0]
+    assert sorted(c.file for c in result.conflicts_unresolved) == ["app.txt", "other.txt"]
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:app.txt") == "l1\nA\nl3\n"
+    assert _show(real_merge_repo, f"{branch}:other.txt") == "other, edited\n"
+    log = _show(real_merge_repo, branch)
+    assert "Partial merge" not in log

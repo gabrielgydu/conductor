@@ -42,11 +42,6 @@ def _print(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_conflict_markers(content: str) -> bool:
-    """Return True if content contains git conflict markers."""
-    return "<<<<<<<" in content
-
-
 def _build_pr_body(
     merged_runs: list[RunState],
     conflicts_resolved: list[ConflictRecord],
@@ -155,6 +150,34 @@ async def _runs_touching(path: str, runs: list[RunState], start: str, cwd: Path)
     return names
 
 
+async def _abort_merge(cwd: Path) -> None:
+    """Abort the merge in progress and drop untracked files the attempt left
+    (Claude's scratch files), so the next merge starts from a clean tree."""
+    await _run_git(["merge", "--abort"], cwd)
+    await _run_git(["clean", "-fdq"], cwd)
+
+
+async def _conflicts_cleared(cwd: Path, files: list[str]) -> bool:
+    """Stage *files* and report whether git considers their conflicts resolved.
+
+    Resolved means no unmerged index entry is left and none of the lines the
+    merge adds relative to HEAD is a conflict marker (<<<<<<<, |||||||,
+    ======= or >>>>>>> at a line start, as `git diff --check` reports them).
+    Markers already present in HEAD (git docs, test fixtures) do not count,
+    and deleting a file that was modified on one side and deleted on the
+    other is a valid resolution.
+    """
+    for f in files:
+        # Per file: a path already removed from index and tree fails to stage
+        # (nothing to do) and must not stop the others from being staged.
+        await _run_git(["add", "-A", "--", f], cwd)
+    rc, unmerged, _ = await _run_git(["ls-files", "--unmerged", "--", *files], cwd)
+    if rc != 0 or unmerged.strip():
+        return False
+    _, check, _ = await _run_git(["diff", "--cached", "--check", "HEAD", "--", *files], cwd)
+    return "leftover conflict marker" not in check
+
+
 # ---------------------------------------------------------------------------
 # DAG ordering
 # ---------------------------------------------------------------------------
@@ -204,7 +227,11 @@ async def resolve_conflicts_with_claude(
     run_description: str,
     cwd: Path,
 ) -> bool:
-    """Use Claude to resolve git merge conflicts. Returns True if all resolved."""
+    """Use Claude to resolve git merge conflicts in *cwd*.
+
+    Returns True when every file is resolved (see _conflicts_cleared); the
+    resolution is then staged.
+    """
     if not conflicting_files:
         return True
 
@@ -216,7 +243,7 @@ async def resolve_conflicts_with_claude(
                     encoding="utf-8", errors="replace"
                 )
             except FileNotFoundError:
-                return False
+                content = "(not in the working tree: deleted on one side of the merge)"
             file_sections.append(f"### {file_path}\n```\n{content}\n```")
 
         files_block = "\n\n".join(file_sections)
@@ -231,6 +258,8 @@ async def resolve_conflicts_with_claude(
             "## Instructions\n"
             "- Edit each file to resolve the conflicts\n"
             "- Remove ALL conflict markers (<<<<<<, ======, >>>>>>)\n"
+            "- A file modified on one side and deleted on the other: keep it (edited)"
+            " or delete it, whichever preserves both sides' intent\n"
             "- Preserve the intent of both sides where possible\n"
             "- If unclear, prefer the incoming changes (theirs)"
         )
@@ -245,17 +274,7 @@ async def resolve_conflicts_with_claude(
         if result.exit_code != 0:
             return False
 
-        for file_path in conflicting_files:
-            try:
-                content = (cwd / file_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except FileNotFoundError:
-                return False
-            if _has_conflict_markers(content):
-                return False
-
-        return True
+        return await _conflicts_cleared(cwd, conflicting_files)
 
     except FileNotFoundError:
         return False
@@ -374,7 +393,7 @@ async def _integrate(
         conflicting = _get_conflicting_files(wt)
         if not conflicting:
             # Not a conflict (unrelated histories, untracked files in the way, ...)
-            await _run_git(["merge", "--abort"], wt)
+            await _abort_merge(wt)
             reason = next((ln.strip() for ln in (err + out).splitlines() if ln.strip()), "")
             skip(run, f"git merge failed: {reason or f'exit {rc}'}")
             continue
@@ -405,7 +424,7 @@ async def _integrate(
         # Last resort: -X theirs keeps this run's side of every conflicting
         # hunk and drops the integration branch's (the earlier runs') side.
         # Recorded as unresolved so the status and PR cannot claim a clean merge.
-        await _run_git(["merge", "--abort"], wt)
+        await _abort_merge(wt)
         rc, _, _ = await _run_git(["merge", "-X", "theirs", branch, "--no-edit"], wt)
         if rc == 0:
             _print(f"  ! Claude could not resolve; -X theirs overwrote: {', '.join(conflicting)}")
@@ -427,32 +446,21 @@ async def _integrate(
             merged_runs.append(run)
             continue
 
-        # -X theirs failed too (modify/delete, rename): re-merge without a
-        # strategy and commit whatever we have
-        await _run_git(["merge", "--abort"], wt)
-        await _run_git(["merge", branch, "--no-edit"], wt)
-        await _run_git(["add", "."], wt)
-        await _run_git(
-            [
-                "commit",
-                "--no-verify",
-                "--no-edit",
-                "-m",
-                f"Partial merge: {run.name}",
-            ],
-            wt,
-        )
+        # -X theirs failed too (modify/delete, rename): leave the run out
+        # rather than commit conflict markers.
+        await _abort_merge(wt)
         for f in conflicting:
             conflicts_unresolved.append(
                 ConflictRecord(
                     file=f,
                     feature_a=", ".join(earlier[f]) or branch_name,
                     feature_b=run.name,
-                    description="Claude could not resolve conflict",
+                    description=(
+                        f"neither Claude nor -X theirs could resolve it; {run.name} not merged"
+                    ),
                 )
             )
-        has_partial = True
-        merged_runs.append(run)
+        skip(run, f"unresolved conflicts in {', '.join(conflicting)}")
 
     has_partial = has_partial or bool(not_merged)
     _print(f"Merged {len(merged_runs)} of {len(eligible_runs)} runs")

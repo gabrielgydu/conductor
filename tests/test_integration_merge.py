@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from conductor.integration.merge import (
-    _has_conflict_markers,
     _build_pr_body,
     integration_worktree_path,
 )
@@ -42,16 +41,6 @@ def _stub_post_merge_checks(monkeypatch):
 # ---------------------------------------------------------------------------
 # Helper tests (Step 2)
 # ---------------------------------------------------------------------------
-
-
-def test_has_conflict_markers_true():
-    content = "some code\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n"
-    assert _has_conflict_markers(content) is True
-
-
-def test_has_conflict_markers_false():
-    content = "def foo():\n    return 42\n"
-    assert _has_conflict_markers(content) is False
 
 
 def test_integration_worktree_path_sits_next_to_the_run_worktrees():
@@ -363,23 +352,24 @@ async def test_claude_resolution_fallback(storage, tmp_path):
 
 @pytest.mark.asyncio
 async def test_claude_failure_partial(storage):
+    """Claude and -X theirs both fail on run 1: it is left out, never committed
+    with conflict markers."""
     from conductor.integration.merge import run_integration_merge
 
     run0 = _make_run(0, "feat-a")
     run1 = _make_run(1, "feat-b")
     state = _make_state(run0, run1)
+    commits = []
 
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
         args_str = " ".join(str(a) for a in args)
-        if (
-            "merge" in args_str
-            and "abort" not in args_str
-            and ("feature/run-" in args_str)
-        ):
+        if "merge" in args_str and "feature/run-1" in args_str:
             proc.returncode = 1
         else:
             proc.returncode = 0
+        if "commit" in args:
+            commits.append(args)
         proc.communicate = AsyncMock(return_value=(b"", b""))
         return proc
 
@@ -396,7 +386,10 @@ async def test_claude_failure_partial(storage):
                 result = await run_integration_merge(state, storage)
 
     assert result.status == IntegrationStatus.PARTIAL
-    assert len(result.conflicts_unresolved) > 0
+    assert result.merged_runs == [0]
+    [record] = result.conflicts_unresolved
+    assert record.description.endswith("feat-b not merged")
+    assert not any("Partial merge" in " ".join(c) for c in commits)
 
 
 @pytest.mark.asyncio

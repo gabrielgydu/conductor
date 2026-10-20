@@ -45,6 +45,12 @@ def _project_name(tmp_path: Path) -> str:
     return f"it{abs(hash(str(tmp_path))) % 999999:06d}"
 
 
+def _show(repo: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", ref], capture_output=True, text=True
+    ).stdout
+
+
 def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
     """State whose integration worktree lives under tmp_path, not /tmp."""
     return ConductorState(
@@ -244,15 +250,11 @@ async def test_partial_merge(real_merge_repo, tmp_path):
 
     assert result.status == IntegrationStatus.PARTIAL
     assert len(result.conflicts_unresolved) > 0
+    # The unresolvable run is left out instead of being committed with markers
+    assert result.merged_runs == [0]
 
-    # Integration branch still exists (partial commit was made)
-    branch_name = f"integration/{project_name}"
-    branches = subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert branch_name in branches
+    shared = _show(real_merge_repo.path, f"integration/{project_name}:shared.txt")
+    assert shared == "version from partial-a\n"
 
 
 # ---------------------------------------------------------------------------
