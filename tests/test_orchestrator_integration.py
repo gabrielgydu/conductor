@@ -340,10 +340,19 @@ async def test_run_finished_in_a_later_session_is_integrated(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_integration_that_failed_before_merging_is_retried(tmp_path):
+@pytest.mark.parametrize(
+    "first_attempt",
+    [
+        {"merge_error": RuntimeError("no network")},
+        # merge.py reports a failed `git worktree add` this way, without raising
+        {"merge_result": IntegrationState(status="failed", branch="integration/test-proj")},
+    ],
+    ids=["raised", "returned"],
+)
+async def test_integration_that_failed_before_merging_is_retried(tmp_path, first_attempt):
     state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
     with _patch_storage(tmp_path), _patch_create_worktree(tmp_path):
-        state, merge, _ = await _session(state, merge_error=RuntimeError("no network"))
+        state, merge, _ = await _session(state, **first_attempt)
         assert state.integration.status == "failed"
         state, merge, _ = await _session(
             state, merge_result=IntegrationState(status="done", branch="integration/test-proj")

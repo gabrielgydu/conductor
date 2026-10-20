@@ -209,7 +209,11 @@ async def _integrate(
             state.integration = IntegrationState(status=IntegrationStatus.FAILED, branch="")
             message = f"Integration merge failed: {exc}"
         else:
-            result.considered_runs = done
+            # merge.py returns FAILED with nothing merged when it cannot even
+            # set up the integration worktree; leave considered_runs empty so
+            # _integration_due retries that like a raised error.
+            if result.status != IntegrationStatus.FAILED or result.merged_runs:
+                result.considered_runs = done
             state.integration = result
             message = f"Integration merge status={result.status}"
             if previous is not None and previous.pr_url and previous.pr_url != result.pr_url:
