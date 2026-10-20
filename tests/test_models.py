@@ -21,7 +21,7 @@ from conductor.core.models import (
 
 def test_conductor_state_defaults():
     state = ConductorState(project_name="default-proj")
-    assert state.check_interval_s == 900
+    assert state.check_interval_s == 120
     assert state.runs == []
 
 

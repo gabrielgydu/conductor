@@ -63,6 +63,18 @@ def _make_storage() -> MagicMock:
     return MagicMock()
 
 
+def _write_activity_log(wt: Path, fname: str, lines: list[str]) -> Path:
+    """Write activity.log where the runner writes it.
+
+    The orchestrator launches the runner with --storage-dir {wt}/docs/{fname}
+    and the runner appends to <storage-dir>/activity.log.
+    """
+    activity_log = wt / "docs" / fname / "activity.log"
+    activity_log.parent.mkdir(parents=True, exist_ok=True)
+    activity_log.write_text("\n".join(lines), encoding="utf-8")
+    return activity_log
+
+
 # ---------------------------------------------------------------------------
 # compute_progress_hash — hashes last 20 lines only
 # ---------------------------------------------------------------------------
@@ -76,15 +88,11 @@ def test_compute_progress_hash_uses_last_20_lines(tmp_path):
 
     # Create activity log with 40 distinct lines
     fname = "run-0"
-    activity_log = tmp_path / f"activity-{fname}-001.log"
     first_20 = [f"line-{i:03d}" for i in range(20)]
     last_20 = [f"line-{i:03d}" for i in range(20, 40)]
-    activity_log.write_text("\n".join(first_20 + last_20), encoding="utf-8")
+    _write_activity_log(wt, fname, first_20 + last_20)
 
-    import glob as _glob
-
-    with patch("glob.glob", return_value=[str(activity_log)]):
-        h = compute_progress_hash(state, 0, 0, _make_storage())
+    h = compute_progress_hash(state, 0, 0, _make_storage())
 
     expected = hashlib.md5("\n".join(last_20).encode()).hexdigest()
     assert h == expected
@@ -97,20 +105,14 @@ def test_compute_progress_hash_different_first_same_last_equal(tmp_path):
     stage.status = StageStatus.EXECUTING
 
     fname = "run-0"
-    log_a = tmp_path / f"activity-{fname}-a.log"
-    log_b = tmp_path / f"activity-{fname}-b.log"
-
     tail = [f"tail-line-{i}" for i in range(20)]
-    log_a.write_text("\n".join(["different-prefix"] + tail), encoding="utf-8")
-    log_b.write_text("\n".join(tail), encoding="utf-8")
 
-    import glob as _glob
+    _write_activity_log(wt, fname, ["different-prefix"] + tail)
+    ha = compute_progress_hash(state, 0, 0, _make_storage())
+    _write_activity_log(wt, fname, tail)
+    hb = compute_progress_hash(state, 0, 0, _make_storage())
 
-    with patch("glob.glob", return_value=[str(log_a)]):
-        ha = compute_progress_hash(state, 0, 0, _make_storage())
-    with patch("glob.glob", return_value=[str(log_b)]):
-        hb = compute_progress_hash(state, 0, 0, _make_storage())
-
+    assert ha is not None
     assert ha == hb
 
 
@@ -118,8 +120,8 @@ def test_compute_progress_hash_no_activity_log_returns_none(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     state.runs[0].stages[0].status = StageStatus.EXECUTING
 
-    with patch("glob.glob", return_value=[]):
-        result = compute_progress_hash(state, 0, 0, _make_storage())
+    assert not (wt / "docs" / "run-0" / "activity.log").exists()
+    result = compute_progress_hash(state, 0, 0, _make_storage())
 
     assert result is None
 

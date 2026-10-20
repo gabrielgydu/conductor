@@ -129,7 +129,7 @@ async def test_prompt_includes_run_description(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_uses_opus_model(tmp_path):
+async def test_uses_sonnet_model(tmp_path):
     conflict_file = tmp_path / "foo.py"
     conflict_file.write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> br\n")
 
@@ -143,7 +143,7 @@ async def test_uses_opus_model(tmp_path):
     with patch("conductor.integration.merge.run_claude", side_effect=fake_claude):
         await resolve_conflicts_with_claude(["foo.py"], "desc", tmp_path)
 
-    assert captured["model"] == "claude-opus-4-6"
+    assert captured["model"] == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
