@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tomllib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
@@ -204,6 +205,8 @@ def _command_list(value: Any, *, where: str) -> list[list[str]]:
 
 
 def _check_unknown(section: dict, allowed: set[str], *, where: str) -> None:
+    if not isinstance(section, dict):
+        raise ValueError(f"{where}: expected a table, got {type(section).__name__}")
     unknown = set(section) - allowed
     if unknown:
         raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
@@ -361,11 +364,12 @@ class ConfigPreset(BasePreset):
         path = Path(path)
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"Invalid preset file {path}: {exc}") from exc
         try:
             return cls(data, name=name, source=path)
-        except ValueError as exc:
+        except (ValueError, TypeError, AttributeError) as exc:
+            # TypeError/AttributeError: a value of the wrong type, e.g. timeout = [1]
             raise ValueError(f"Invalid preset file {path}: {exc}") from exc
 
     def matches(self, project_dir: Path) -> bool:
@@ -464,11 +468,34 @@ def _user_presets() -> list[Path]:
     return sorted(directory.glob("*.toml"))
 
 
+def _detect_paths_match(path: Path, project_dir: Path) -> bool:
+    """True when the raw ``[detect] paths`` of *path* all exist under *project_dir*.
+
+    Used for preset files that fail to load, to tell whether they were meant
+    for this project.
+    """
+    try:
+        paths = tomllib.loads(path.read_text(encoding="utf-8"))["detect"]["paths"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (
+        isinstance(paths, list)
+        and bool(paths)
+        and all(isinstance(p, str) and (project_dir / p).exists() for p in paths)
+    )
+
+
 def detect_preset(project_dir: Path | str) -> str:
     """Return the preset name for *project_dir*.
 
     Order: project-local ``.conductor/preset.toml``, then the first user-level
-    preset whose ``[detect] paths`` all exist, else ``"base"``.
+    preset whose ``[detect] paths`` all exist (named by its file stem, which is
+    what `load_preset` resolves), else ``"base"``.
+
+    Raises ValueError when a broken preset file's detect paths match the
+    project: falling back to ``base`` would silently drop its quality gates
+    and teardown. Broken presets meant for other projects are skipped with a
+    warning on stderr.
     """
     project_dir = Path(project_dir)
     local = _project_preset_file(project_dir)
@@ -477,10 +504,13 @@ def detect_preset(project_dir: Path | str) -> str:
     for path in _user_presets():
         try:
             preset = ConfigPreset.from_file(path, name=path.stem)
-        except ValueError:
+        except ValueError as exc:
+            if _detect_paths_match(path, project_dir):
+                raise ValueError(f"{exc}\n(its [detect] paths match {project_dir}; fix it or pass --preset)") from exc
+            print(f"Warning: skipping preset {path}: {exc}", file=sys.stderr)
             continue
         if preset.matches(project_dir):
-            return preset.name
+            return path.stem
     return "base"
 
 
@@ -506,5 +536,15 @@ def load_preset(name: Optional[str], project_dir: Path | str | None = None) -> P
     candidate = presets_dir() / f"{name}.toml"
     if candidate.is_file():
         return ConfigPreset.from_file(candidate, name=name)
+
+    # User presets are named by file stem; also accept a preset's internal
+    # `name` when it differs (e.g. a copied example that still says "example").
+    for path in _user_presets():
+        try:
+            preset = ConfigPreset.from_file(path, name=path.stem)
+        except ValueError:
+            continue
+        if preset.name == name:
+            return preset
 
     raise ValueError(f"Unknown preset: {name!r} (no {candidate}, no matching {PROJECT_PRESET_FILE})")

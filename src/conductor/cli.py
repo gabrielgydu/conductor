@@ -307,6 +307,25 @@ def _unlock_project(storage: StorageResolver, name: str) -> None:
     release_project_lock(storage.conductor_dir(name))
 
 
+# ─── Presets ─────────────────────────────────────────────────────────────────
+
+
+def _resolve_preset(name: str | None, repo_path: Path) -> str:
+    """The preset to use: *name*, or the detected one when None. Exits if it can't be loaded."""
+    from conductor.core.presets import detect_preset, load_preset
+
+    try:
+        if name is None:
+            name = detect_preset(repo_path)
+            if name != "base":
+                print(f"Auto-detected preset: {name}", file=sys.stderr)
+        load_preset(name, repo_path)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+    return name
+
+
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 
@@ -327,23 +346,9 @@ def _cmd_init(args, *, next_steps: bool = True):
     conductor_dir = storage.conductor_dir(args.name)
     conductor_dir.mkdir(parents=True, exist_ok=True)
 
-    # Detect or validate preset
-    from conductor.core.presets import detect_preset, load_preset
-
+    # Detect or validate preset ("base" is the parser default, so it also means "detect")
     preset_name = getattr(args, "preset", None)
-    if preset_name is None or preset_name == "base":
-        detected = detect_preset(repo_path)
-        if detected != "base":
-            preset_name = detected
-            print(f"Auto-detected preset: {preset_name}", file=sys.stderr)
-        else:
-            preset_name = preset_name or "base"
-
-    try:
-        load_preset(preset_name, repo_path)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        sys.exit(1)
+    preset_name = _resolve_preset(None if preset_name == "base" else preset_name, repo_path)
 
     brief_path = storage.conductor_brief(args.name)
     if not brief_path.exists():
@@ -1182,7 +1187,9 @@ def _cmd_loop(args):
         plan_content = plan_path.read_text(encoding="utf-8")
 
         from conductor.core.loop import LoopState, parse_checklist, decompose_plan
-        from conductor.core.presets import detect_preset
+
+        # Before decomposing, so a broken preset doesn't cost a Claude call
+        preset_name = _resolve_preset(getattr(args, "preset", None), repo_path)
 
         # Try parsing as checklist first; if no tasks found, use Claude to decompose
         tasks = parse_checklist(plan_content)
@@ -1194,10 +1201,6 @@ def _cmd_loop(args):
         if not tasks:
             print("Error: Could not extract tasks from plan.")
             sys.exit(1)
-
-        preset_name = getattr(args, "preset", None)
-        if not preset_name:
-            preset_name = detect_preset(repo_path)
 
         base_branch = getattr(args, "base_branch", None) or _detect_git_branch(args.project_dir)
 
@@ -1339,7 +1342,6 @@ def _cmd_manual_test(args):
         manual_state_path,
         run_manual_test_in_tmux,
     )
-    from conductor.core.presets import detect_preset
 
     state_path = manual_state_path(conductor_dir)
     inside_tmux = getattr(args, "inside_tmux", False)
@@ -1360,7 +1362,7 @@ def _cmd_manual_test(args):
             print(f"Error: Plan file not found: {plan_path}")
             sys.exit(1)
 
-        preset_name = getattr(args, "preset", None) or detect_preset(repo_path)
+        preset_name = _resolve_preset(getattr(args, "preset", None), repo_path)
         try:
             state = initialize_manual_state(
                 name=args.name,
