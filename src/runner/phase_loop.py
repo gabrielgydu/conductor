@@ -47,7 +47,7 @@ from runner.git_ops import (
 from runner.logging import log, success, warn, error, header, dim
 from runner.prompt import build_prompt
 from runner.steerable import SteerableSession
-from runner.steer_inbox import poll_steer_inbox
+from runner.steer_inbox import clear_steer_inbox, poll_steer_inbox
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -573,6 +573,10 @@ async def run_phase_loop(
         error("Preflight check failed — aborting")
         _write_exit_code(feature_dir, 1)
         return 1
+
+    # Steering written for a previous runner process is stale; messages that
+    # arrive from now on wait in the inbox for the next live session.
+    clear_steer_inbox(feature_dir / "steer_inbox")
 
     # ── Resume point ───────────────────────────────────────────────────────
     # Restarts (infra/transient/logic retries, auto-resume) relaunch the

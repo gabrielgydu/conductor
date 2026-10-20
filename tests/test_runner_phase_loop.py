@@ -301,3 +301,15 @@ async def test_failing_per_phase_local_checks_fail_the_phase(project, monkeypatc
 
     assert fake.calls == [1]  # phase 2 never starts
     assert not (feature_dir / "PHASES-DONE.jsonl").exists()
+
+
+async def test_runner_start_clears_stale_steering(project, monkeypatch):
+    repo, feature_dir = project
+    inbox = feature_dir / "steer_inbox"
+    inbox.mkdir()
+    (inbox / "1.msg").write_text("for a runner that died")
+    fake = FakeClaude(repo, [finish_without_changes])
+
+    assert await _run(_config(repo, feature_dir, phases=1), feature_dir, fake, monkeypatch) == 0
+
+    assert not (inbox / "1.msg").exists()
