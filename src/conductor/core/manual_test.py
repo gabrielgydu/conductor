@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,6 +27,8 @@ from conductor.core.models import atomic_save
 from conductor.core.presets import ManualTestPolicy, load_preset
 from conductor.core.storage import StorageResolver
 
+if TYPE_CHECKING:
+    from conductor.core.tmux import TmuxManager
 
 MANUAL_STATE_FILE = "MANUAL-TEST-STATE.json"
 MANUAL_LOG_FILE = "MANUAL-TEST-LOG.md"
@@ -48,6 +52,20 @@ ALLOWED_SEVERITIES = {"high", "medium", "low", "ux"}
 ALLOWED_CATEGORIES = {"app_bug", "ux", "test_gap", "flaky", "env", "data"}
 TERMINAL_SCENARIO_STATUSES = {"passed", "failed", "blocked", "policy_violation"}
 FIXABLE_FINDING_CATEGORIES = {"app_bug", "ux"}
+
+# Claude infrastructure failures (no output, auth/model errors, usage limits)
+# are retried after a pause; this many in a row pause the whole run instead.
+MAX_CONSECUTIVE_INFRA_FAILURES = 3
+INFRA_RETRY_DELAY_SECS = 60
+
+# A scenario is blocked after this many generations without a valid signal, or
+# after this many honest <manual-handoff/>s (long scenarios need several).
+MAX_SCENARIO_INVALID_RESULTS = 3
+MAX_SCENARIO_HANDOFFS = 5
+# How much of the previous handoff file is inlined into the next prompt.
+HANDOFF_EXCERPT_CHARS = 4000
+# A finding is handed to a human after this many failed fixer attempts.
+MAX_FIX_ATTEMPTS = 3
 
 
 class ManualEvidence(BaseModel):
@@ -87,6 +105,30 @@ class DataShortcut(BaseModel):
     approved_by_policy: bool = False
 
 
+class ManualFixAttempt(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    number: int
+    # Why the attempt failed; empty while it runs and when it was verified.
+    outcome: str = ""
+    # Files the fixer changed, relative to the repo root.
+    files: list[str] = Field(default_factory=list)
+    # Stash commit holding a failed attempt's changes, and the ref keeping it
+    # (off the user's stash list; empty if it could not be written).
+    stash: str = ""
+    stash_ref: str = ""
+    # Cut short by a paused run: not the fixer's failure, so it does not count.
+    interrupted: bool = False
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.outcome) and not self.interrupted
+
+    @property
+    def stash_label(self) -> str:
+        return self.stash_ref or f"stash {self.stash[:12]}"
+
+
 class ManualFinding(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -102,6 +144,7 @@ class ManualFinding(BaseModel):
     suspected_files: list[str] = Field(default_factory=list)
     status: str = "open"
     fix_commits: list[str] = Field(default_factory=list)
+    fix_attempts: list[ManualFixAttempt] = Field(default_factory=list)
     verification: list[str] = Field(default_factory=list)
 
 
@@ -114,7 +157,10 @@ class ManualScenario(BaseModel):
     description: str
     status: str = "pending"
     priority: str = "medium"
+    # Generations run for this scenario; `handoffs` of them ended in a valid
+    # <manual-handoff/>, the rest of the unfinished ones had no valid signal.
     attempts: int = 0
+    handoffs: int = 0
     started_at: datetime | None = None
     completed_at: datetime | None = None
     evidence: ManualEvidence | None = None
@@ -142,6 +188,10 @@ class ManualTestState(BaseModel):
     plan_file: str
     preset: str | None = None
     status: str = "pending"
+    # Status to return to when a "paused" run is resumed ("coverage" or "running").
+    paused_from: str = ""
+    last_error: str = ""
+    consecutive_infra_failures: int = 0
     current_scenario_index: int = 0
     session_count: int = 0
     model: str | None = None
@@ -160,6 +210,9 @@ class PolicyFlag(BaseModel):
     value: str
     source: str = "tool"
     fatal_reason: str = ""
+    # The fatal hit clearly made the forbidden change (see _fatal_tool_input),
+    # rather than only naming the protected thing in a call that may just read it.
+    fatal_mutation: bool = False
 
 
 class ManualSignal(BaseModel):
@@ -169,6 +222,8 @@ class ManualSignal(BaseModel):
     result_status: str | None = None
     valid: bool = False
     errors: list[str] = Field(default_factory=list)
+    # Problems recorded for the audit log that do not invalidate the result.
+    warnings: list[str] = Field(default_factory=list)
     evidence: ManualEvidence | None = None
     severity: str | None = None
     category: str | None = None
@@ -184,6 +239,13 @@ class ManualSignal(BaseModel):
     shortcuts: list[DataShortcut] = Field(default_factory=list)
     policy_flags: list[PolicyFlag] = Field(default_factory=list)
     raw_text: str = ""
+    # Set by _run_generation when Claude itself failed (see _claude_failure);
+    # such a generation says nothing about the scenario or finding.
+    infra_error: str = ""
+
+
+class ManualRunPaused(Exception):
+    """Stop the run, resumably: raised when Claude keeps failing to run at all."""
 
 
 def manual_state_path(conductor_dir: Path) -> Path:
@@ -229,13 +291,24 @@ def ensure_manual_test_layout(conductor_dir: Path) -> None:
 
 
 def _split_table_cells(line: str) -> list[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    """Cells of a markdown table row; ``\\|`` inside a cell is a literal pipe."""
+    row = line.strip()
+    row = row.removeprefix("|")
+    row = row[:-1] if row.endswith("|") and not row.endswith("\\|") else row
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", row)]
+
+
+def _table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
 
 
 def _is_table_separator(cells: list[str]) -> bool:
     if not cells:
         return False
-    return all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+    return all(re.fullmatch(r":?-+:?", cell.replace(" ", "")) for cell in cells)
+
+
+_EVIDENCE_TARGET_PREFIX = "Primary evidence target: "
 
 
 def _clean_cell(value: str) -> str:
@@ -319,8 +392,12 @@ def _parse_table_scenarios(markdown_text: str) -> list[ManualScenario]:
                     "[!]": "failed",
                 }.get(status, status)
 
+            # The rendered matrix stores the description (with this prefix)
+            # in its Evidence Target column; do not stack the prefix again.
+            while evidence_target.startswith(_EVIDENCE_TARGET_PREFIX):
+                evidence_target = evidence_target[len(_EVIDENCE_TARGET_PREFIX):].strip()
             description = (
-                f"Primary evidence target: {evidence_target}"
+                f"{_EVIDENCE_TARGET_PREFIX}{evidence_target}"
                 if evidence_target
                 else name
             )
@@ -381,11 +458,11 @@ def render_scenarios_markdown(state: ManualTestState) -> str:
     rows = []
     for scenario in state.scenarios:
         findings = ", ".join(scenario.findings) if scenario.findings else ""
-        description = scenario.description.replace("|", "\\|").replace("\n", " ")
         rows.append(
             "| "
             f"{scenario.index} | {scenario.status} | {scenario.priority} | "
-            f"{scenario.area} | {scenario.name} | {description} | {findings} |"
+            f"{_table_cell(scenario.area)} | {_table_cell(scenario.name)} | "
+            f"{_table_cell(scenario.description)} | {findings} |"
         )
 
     body = "\n".join(rows) if rows else "| | | | | | | |"
@@ -494,6 +571,8 @@ def format_manual_status(state: ManualTestState) -> str:
         f"Findings: {len(state.findings)}",
         "",
     ]
+    if state.last_error:
+        lines.insert(2, f"Last error: {state.last_error}")
     for scenario in state.scenarios:
         marker = {
             "passed": "[x]",
@@ -514,7 +593,7 @@ def _format_evidence_lines(evidence: ManualEvidence) -> list[str]:
     lines.extend(f"url={url}" for url in evidence.urls)
     lines.extend(f"screenshot={path}" for path in evidence.screenshots)
     lines.extend(f"trace={path}" for path in evidence.traces)
-    lines.extend(f"mailhog={msg}" for msg in evidence.mailhog_messages)
+    lines.extend(f"mail={msg}" for msg in evidence.mailhog_messages)
     lines.extend(f"console={err}" for err in evidence.console_errors)
     lines.extend(f"db={readback}" for readback in evidence.db_readbacks)
     lines.extend(evidence.notes)
@@ -548,6 +627,8 @@ def generate_manual_report(state: ManualTestState) -> str:
         "## Scenario Counts",
         "",
     ]
+    if state.last_error:
+        lines.insert(6, f"- Last error: {state.last_error}")
     if scenario_counts:
         for status in sorted(scenario_counts):
             lines.append(f"- {status}: {scenario_counts[status]}")
@@ -593,6 +674,10 @@ def generate_manual_report(state: ManualTestState) -> str:
                 f"- {finding.id}: {finding.severity}/{finding.category}, "
                 f"scenario {finding.scenario_index}, {finding.status}: {finding.title}"
             )
+            for attempt in finding.fix_attempts:
+                if attempt.outcome:
+                    stash = f"; changes in {attempt.stash_label}" if attempt.stash else ""
+                    lines.append(f"  - fix attempt {attempt.number}: {attempt.outcome}{stash}")
     else:
         lines.append("- none")
 
@@ -640,8 +725,9 @@ def write_manual_report(state: ManualTestState, conductor_dir: Path) -> Path:
     return path
 
 
-def _extract_text_from_stream_json(output: str) -> str:
-    text_parts: list[str] = []
+def _stream_events(output: str) -> list[dict]:
+    """The JSON object events of a stream-json transcript; other lines are skipped."""
+    events: list[dict] = []
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -650,16 +736,34 @@ def _extract_text_from_stream_json(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
-            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _assistant_blocks(output: str) -> list[tuple[str, str]]:
+    """Assistant ("text", text) and ("tool_use", tool name) blocks, in session order.
+
+    Output that is not stream-json (or has no assistant text) is one text block.
+    """
+    blocks: list[tuple[str, str]] = []
+    for event in _stream_events(output):
         if event.get("type") != "assistant":
             continue
-        for block in event.get("message", {}).get("content", []):
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-    if text_parts:
-        return "\n".join(text_parts)
-    return output
+        for block in (event.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                blocks.append(("text", str(block.get("text", ""))))
+            elif block.get("type") == "tool_use":
+                blocks.append(("tool_use", str(block.get("name", ""))))
+    if not any(kind == "text" for kind, _ in blocks):
+        return [("text", output)]
+    return blocks
+
+
+def _extract_text_from_stream_json(output: str) -> str:
+    return "\n".join(text for kind, text in _assistant_blocks(output) if kind == "text")
 
 
 def _tag_values(text: str, tag: str) -> list[str]:
@@ -674,44 +778,73 @@ def _tag_value(text: str, tag: str) -> str:
     return values[0] if values else ""
 
 
-def _manual_result_block(text: str) -> tuple[str, str | None]:
-    match = re.search(r"<manual-result\b([^>]*)>(.*?)</manual-result>", text, re.DOTALL | re.I)
-    if not match:
+def _manual_result_block(text: str, kind: str | None = None) -> tuple[str, str | None]:
+    """The first <manual-result> whose status is *kind*, else the first one.
+
+    Sessions sometimes draft a result of another kind before the final one,
+    or report a finding and then summarise with a pass block. Several blocks
+    of the same kind have so far been several findings, of which only the
+    first is recorded.
+    """
+    blocks: list[tuple[str, str | None]] = []
+    for match in re.finditer(r"<manual-result\b([^>]*)>(.*?)</manual-result>", text, re.DOTALL | re.I):
+        status_match = re.search(r"status=[\"']([^\"']+)[\"']", match.group(1), re.I)
+        status = status_match.group(1).strip().lower() if status_match else None
+        blocks.append((match.group(2), status))
+    if not blocks:
         return "", None
-    attrs = match.group(1)
-    status_match = re.search(r"status=[\"']([^\"']+)[\"']", attrs, re.I)
-    status = status_match.group(1).strip().lower() if status_match else None
-    return match.group(2), status
+    return next((block for block in blocks if block[1] == kind), blocks[0])
+
+
+_NESTED_RESULT_TAGS = ("shortcut", "data-shortcut", "evidence")
+
+
+def _top_level(block: str) -> str:
+    """*block* without nested <shortcut>/<evidence> elements, for top-level fields."""
+    for tag in _NESTED_RESULT_TAGS:
+        block = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", block, flags=re.DOTALL | re.I)
+    return block
 
 
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "approved"}
 
 
+# Empty tags and the template's "..." placeholders are not evidence.
+_PLACEHOLDER_VALUE = re.compile(r"[.\s…]*")
+
+
+def _evidence_values(block: str, *tags: str) -> list[str]:
+    return [
+        value
+        for tag in tags
+        for value in _tag_values(block, tag)
+        if not _PLACEHOLDER_VALUE.fullmatch(value)
+    ]
+
+
 def _parse_evidence(block: str) -> ManualEvidence:
-    evidence_block = _tag_value(block, "evidence") or block
+    evidence_block = _tag_value(block, "evidence") or _top_level(block)
     return ManualEvidence(
-        summary=_tag_value(block, "summary"),
-        urls=_tag_values(evidence_block, "url"),
-        screenshots=_tag_values(evidence_block, "screenshot"),
-        traces=_tag_values(evidence_block, "trace"),
-        mailhog_messages=(
-            _tag_values(evidence_block, "mailhog")
-            + _tag_values(evidence_block, "mailhog_message")
-        ),
-        console_errors=(
-            _tag_values(evidence_block, "console")
-            + _tag_values(evidence_block, "console_error")
-        ),
-        db_readbacks=(
-            _tag_values(evidence_block, "db")
-            + _tag_values(evidence_block, "db_readback")
-        ),
-        notes=_tag_values(evidence_block, "note"),
+        summary=_tag_value(_top_level(block), "summary"),
+        urls=_evidence_values(evidence_block, "url"),
+        screenshots=_evidence_values(evidence_block, "screenshot"),
+        traces=_evidence_values(evidence_block, "trace"),
+        # <mail> for any mail catcher; <mailhog> is the older tag.
+        mailhog_messages=_evidence_values(evidence_block, "mail", "mailhog", "mailhog_message"),
+        console_errors=_evidence_values(evidence_block, "console", "console_error"),
+        db_readbacks=_evidence_values(evidence_block, "db", "db_readback"),
+        notes=_evidence_values(evidence_block, "note"),
     )
 
 
-def _has_required_evidence(evidence: ManualEvidence | None) -> bool:
+def _has_required_evidence(evidence: ManualEvidence | None, *, notes_count: bool = True) -> bool:
+    """Whether *evidence* has something to show.
+
+    A pass or finding needs an observation (URL, screenshot, trace, mail,
+    console output or DB readback); a note alone is just a claim. A blocked
+    result may rest on notes (``notes_count``).
+    """
     if evidence is None:
         return False
     return any(
@@ -722,7 +855,7 @@ def _has_required_evidence(evidence: ManualEvidence | None) -> bool:
             evidence.mailhog_messages,
             evidence.console_errors,
             evidence.db_readbacks,
-            evidence.notes,
+            evidence.notes if notes_count else [],
         ]
     )
 
@@ -766,16 +899,32 @@ def _parse_shortcuts(block: str) -> list[DataShortcut]:
 
 
 _POLICY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("database cli", re.compile(r"\b(mysql|psql|sqlite3|mongo|redis-cli)\b", re.I)),
+    (
+        "database cli",
+        re.compile(r"\b(mysql|mariadb|mycli|psql|pgcli|sqlite3|mongo|mongosh|redis-cli)\b", re.I),
+    ),
     (
         "mutating http",
-        re.compile(r"\b(curl|httpie|wget)\b.*\b(POST|PUT|PATCH|DELETE)\b", re.I | re.S),
+        re.compile(
+            r"\b(curl|httpie|wget)\b.*(\b(POST|PUT|PATCH|DELETE)\b"
+            r"|(?-i:\s(-d|--data\S*|--json|-F|--form\S*|-T|--upload-file|--post-data|--post-file))(\s|=|$))",
+            re.I | re.S,
+        ),
     ),
     (
-        "db framework command",
-        re.compile(r"\b(artisan\s+tinker|php\s+artisan\s+db|doctrine|bin/console\s+doctrine)\b", re.I),
+        "framework console",
+        # Running the test suite (`artisan test --filter=<flag>`) is not a shortcut.
+        re.compile(
+            r"\b(artisan|bin/console|doctrine|manage\.py|django-admin|rake"
+            r"|rails\s+(runner|r|console|c|dbconsole|db:\S+))\b(?!\s+(test|spec)\b)",
+            re.I,
+        ),
     ),
-    ("fixture command", re.compile(r"\b(seed|seeder|factory|fixture|dump|reset-db)\b", re.I)),
+    (
+        "fixture command",
+        # A dump command, not json.dump() or PHP's dump()/var_dump().
+        re.compile(r"\b(seed|seeder|factory|fixture|reset-db)\b|(?<![.\w])dump\b(?!\s*\()", re.I),
+    ),
     (
         "browser storage mutation",
         re.compile(r"\b(localStorage|sessionStorage|document\.cookie)\b", re.I),
@@ -814,72 +963,442 @@ def _is_auto_approved(flag: "PolicyFlag", policy: ManualTestPolicy | None = None
     return (policy or ManualTestPolicy()).auto_approve_shortcuts
 
 
-def _iter_tool_inputs(output: str) -> list[str]:
-    values: list[str] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
+# Tool-input keys the built-in _POLICY_PATTERNS are matched against.
+_POLICY_INPUT_KEYS = ("command", "cmd", "url", "query", "script", "code", "function", "sql")
+
+# Tools whose inputs never trip a fatal pattern: they read code, keep todos,
+# delegate (a subagent's own tool calls are scanned), or drive the UI that the
+# policy asks for, so naming a protected flag there is expected.
+_FATAL_EXEMPT_TOOLS = {
+    "Read", "Grep", "Glob", "LS", "NotebookRead", "WebSearch", "Task", "Agent",
+    "ExitPlanMode", "ToolSearch", "Skill", "TodoWrite", "TodoRead",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+}
+_UI_ACTION_TOOL_RE = re.compile(
+    r"browser_(click|type|fill_form|select_option|hover|drag|press_key|snapshot|"
+    r"take_screenshot|wait_for|tabs?|close|resize|console_messages|network_requests|"
+    r"handle_dialog|file_upload|navigate_back|navigate_forward)"
+)
+# Written content is checked when a later tool call runs or reads the file
+# (e.g. Write x.sql, then `mysql app < x.sql`), not when it is written.
+_FILE_EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+_SHELL_OPERATOR_CHARS = frozenset(";&|<>()\n")
+_READ_ONLY_PROGRAMS = {
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "head", "tail", "less", "more",
+    "ls", "tree", "find", "wc", "sort", "uniq", "cut", "tr", "nl", "diff", "file", "stat",
+    "pwd", "cd", "echo", "printf", "true", "jq", "which", "type",
+}
+_READ_ONLY_GIT_COMMANDS = {"grep", "log", "show", "diff", "blame", "status", "ls-files"}
+# A database call is a readback when its SQL is inline and only reads.
+_READ_SQL = re.compile(
+    r"\bSELECT\b[\s\S]*\bFROM\b|\bSHOW\s+(TABLES|COLUMNS|CREATE|VARIABLES|DATABASES|INDEX)\b"
+    r"|\b(DESCRIBE|EXPLAIN)\s+\w",
+    re.I,
+)
+# SQL a shell command does not show: sourced, redirected in from a file (not
+# a heredoc, here-string or process substitution) or piped into a client.
+_SQL_SCRIPT = re.compile(
+    r"\bsource\b|\\i\b|\.read\b|(?<!<)<(?![<(=>])|\|\s*\S*\b(mysql|mariadb|mycli|psql|pgcli|sqlite3)\b", re.I
+)
+# Browser-code tools (browser_evaluate, browser_run_code) act when the script
+# writes storage or sends requests; reading a checkbox's state does not.
+_BROWSER_CODE_TOOL_RE = re.compile(r"browser_(evaluate|run_code)")
+_JS_MUTATION = re.compile(
+    r"\b(localStorage|sessionStorage|document\.cookie|fetch|XMLHttpRequest|ajax|axios|sendBeacon)\b", re.I
+)
+# What makes a call clearly change state (see _fatal_tool_input). SQL writes
+# are statement-shaped, so prose ("update the notes") and str.replace() do
+# not count.
+_SQL_WRITE = re.compile(
+    r"\b(INSERT\s+(IGNORE\s+)?INTO|REPLACE\s+INTO|DELETE\s+FROM|ALTER\s+TABLE|DROP\s+(TABLE|DATABASE|SCHEMA)"
+    r"|TRUNCATE\s+(TABLE\s+)?[\w`\"]+|UPDATE\s+[\w`\".]+(\s+(AS\s+)?\w+)?\s+SET)\b",
+    re.I,
+)
+_JS_WRITE = re.compile(
+    r"\b(localStorage|sessionStorage)\s*(\.\s*(setItem|removeItem|clear)\s*\(|\.\s*\w+\s*=(?!=)|\[[^\]]*\]\s*=(?!=))"
+    r"|\bdocument\.cookie\s*=(?!=)"
+    r"|\bmethod\s*:\s*[\"'`](POST|PUT|PATCH|DELETE)\b"
+    r"|\.open\(\s*[\"'`](POST|PUT|PATCH|DELETE)\b"
+    r"|(\baxios|\bjQuery|\$)\s*\.\s*(post|put|patch|delete)\s*\("
+    r"|\bsendBeacon\s*\(",
+    re.I,
+)
+_MUTATING_HTTP = dict(_POLICY_PATTERNS)["mutating http"]
+_TEST_ROUTE = dict(_POLICY_PATTERNS)["test route"]
+_DB_CLIENTS = {"mysql", "mariadb", "mycli", "psql", "pgcli", "sqlite3", "mongo", "mongosh", "redis-cli"}
+_HTTP_CLIENTS = {"curl", "wget", "http", "httpie", "xh"}
+_SHELLS = {"bash", "sh", "zsh", "dash"}
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\1(?P<rest>[^\n]*)\n"
+    r"(?P<body>.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
+    re.S,
+)
+_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+_COMMAND_PREFIXES = {"sudo", "env", "time", "nice", "nohup", "command", "builtin", "exec"}
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Shell words and operators of *command*, comments dropped; None if unparsable."""
+    # A backslash-newline continues the command; shlex would make it a newline.
+    command = command.replace("\\\n", " ")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="".join(_SHELL_OPERATOR_CHARS))
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _is_read_only_command(command: str) -> bool:
+    """True for a shell command that only searches or reads.
+
+    Covers grep/rg/cat-style programs (also behind xargs) and read-only git
+    subcommands. Anything it cannot parse, any output redirection to a file,
+    backtick substitution and any other program counts as not read-only.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None or any("`" in token for token in tokens):
+        return False
+
+    for index, token in enumerate(tokens):
+        if ">" in token and set(token) <= _SHELL_OPERATOR_CHARS:
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if target != "/dev/null" and not target.isdigit():
+                return False
+    return all(_reads_only(words) for pipeline in _pipelines(tokens) for words in pipeline)
+
+
+def _pipelines(tokens: list[str]) -> list[list[list[str]]]:
+    """The pipelines in *tokens*, each a list of simple commands' words.
+
+    A redirection's target stays with its command; a process substitution
+    (`<(...)`) is a command of its own.
+    """
+    pipelines: list[list[list[str]]] = [[[]]]
+    for token in tokens:
+        if not set(token) <= _SHELL_OPERATOR_CHARS:
+            pipelines[-1][-1].append(token)
+        elif token in ("|", "|&"):
+            pipelines[-1].append([])
+        elif "(" in token or ")" in token or ("<" not in token and ">" not in token):
+            pipelines.append([[]])
+    return [[words for words in pipeline if words] for pipeline in pipelines if any(pipeline)]
+
+
+def _reads_only(words: list[str]) -> bool:
+    """True for a simple command (its shell words) that only searches or reads."""
+    while words and (
+        words[0] in _COMMAND_PREFIXES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])
+    ):
+        words = words[1:]
+    if not words:
+        return True
+    program, args = Path(words[0]).name, words[1:]
+    if program == "git":
+        return next((arg for arg in args if not arg.startswith("-")), "") in _READ_ONLY_GIT_COMMANDS
+    if program == "find":
+        return not _FIND_ACTIONS.intersection(args)
+    if program == "xargs":
+        return next((arg for arg in args if not arg.startswith("-")), "") in _READ_ONLY_PROGRAMS
+    return program in _READ_ONLY_PROGRAMS
+
+
+def _state_changing_calls(command: str, written: dict[str, str], depth: int = 0) -> list[str]:
+    """What the shell command's clearly state-changing DB and HTTP calls send.
+
+    A pipeline counts when it runs a DB client and its SQL (inline, piped in,
+    a heredoc or a file in *written*) writes, or runs an HTTP client that
+    sends a mutating request or calls a test route. A heredoc belongs to the
+    command reading it, so notes or scripts written through one are not
+    calls. A command string handed to a shell (`bash -c '...'`) or starting
+    with a client (`docker exec app "curl ..."`) is looked into too.
+    """
+    bodies: dict[str, str] = {}
+
+    def keep_body(match: re.Match[str]) -> str:
+        key = f"heredoc-{len(bodies)}"
+        bodies[key] = match.group("body")
+        return f"<< {key}{match.group('rest')}"
+
+    stripped = _HEREDOC_RE.sub(keep_body, command)
+    tokens = _shell_tokens(stripped)
+    calls: list[str] = []
+    for pipeline in _pipelines(tokens if tokens is not None else stripped.split()):
+        words = [word for simple in pipeline for word in simple]
+        sent = " ".join(
+            [*words, *(bodies[word] for word in words if word in bodies)]
+            + [
+                content
+                for path, content in written.items()
+                if any(path in word or Path(path).name in word for word in words)
+            ]
+        )
+        acting = [simple for simple in pipeline if not _reads_only(simple)]
+        programs = {Path(word).name for simple in acting for word in simple}
+        if (programs & _DB_CLIENTS and _SQL_WRITE.search(sent)) or (
+            programs & _HTTP_CLIENTS and (_MUTATING_HTTP.search(sent) or _TEST_ROUTE.search(sent))
+        ):
+            calls.append(sent)
+        if depth >= 2:
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+        for simple in acting:
+            for index, word in enumerate(simple):
+                inner = word.split()
+                if len(inner) < 2 or word in bodies:
+                    continue
+                handed_to_shell = (
+                    index >= 2 and re.fullmatch(r"-\w*c", simple[index - 1]) is not None
+                    and Path(simple[index - 2]).name in _SHELLS
+                )
+                if handed_to_shell or Path(inner[0]).name in _DB_CLIENTS | _HTTP_CLIENTS:
+                    calls += _state_changing_calls(word, written, depth + 1)
+    return calls
+
+
+# Tool-input keys that describe a call rather than make it.
+_TOOL_METADATA_KEYS = {"description", "timeout", "run_in_background", "activeForm"}
+
+
+def _is_sql_readback(sql: str) -> bool:
+    return bool(_READ_SQL.search(sql)) and not _MUTATING_SQL.search(sql)
+
+
+def _is_acting_command(command: str, text: str) -> bool:
+    """True when a shell command matches a shortcut detector (other than a DB readback).
+
+    *text* is what runs (the command without comments). A DB call is a
+    readback when all its SQL is in the command, heredocs included, and only
+    reads.
+    """
+    without_heredocs = _HEREDOC_RE.sub(lambda match: "<< heredoc" + match.group("rest"), command)
+    readback = _is_sql_readback(text) and not _SQL_SCRIPT.search(without_heredocs)
+    return any(
+        pattern.search(text) and not (label == "database cli" and readback)
+        for label, pattern in _POLICY_PATTERNS
+    )
+
+
+def _string_leaves(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            leaf
+            for key, item in value.items()
+            if key not in _TOOL_METADATA_KEYS
+            for leaf in _string_leaves(item)
+        ]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return []
+
+
+def _tool_uses(output: str) -> list[tuple[str, object]]:
+    uses: list[tuple[str, object]] = []
+    for event in _stream_events(output):
+        if event.get("type") != "assistant":
             continue
-        if not isinstance(event, dict) or event.get("type") != "assistant":
-            continue
-        for block in event.get("message", {}).get("content", []):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                uses.append((str(block.get("name", "")), block.get("input", {})))
+    return uses
+
+
+def _excerpt(value: str, pattern: str, width: int = 150) -> str:
+    match = re.search(pattern, value, re.I)
+    if match is None or len(value) <= 2 * width:
+        return value
+    start, end = max(match.start() - width, 0), match.end() + width
+    return ("..." if start else "") + value[start:end] + ("..." if end < len(value) else "")
+
+
+def _shorten(text: str, limit: int = 300) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _fatal_tool_input(
+    name: str,
+    tool_input: object,
+    written: dict[str, str],
+    policy: ManualTestPolicy,
+    check_written_files: bool,
+) -> tuple[str, str, bool]:
+    """(reason, offending text, mutation) when a tool call matches a preset fatal pattern.
+
+    Only calls that can change state count. Shell commands must match a
+    shortcut detector (DB CLI other than a readback, mutating HTTP, framework
+    console, fixtures, browser storage, test route); then the command and any
+    file this session wrote that it refers to are checked. Browser-code tools
+    count when the script writes storage or sends requests. Any other tool
+    that does not just read or drive the UI is checked in full, minus SQL
+    readbacks. A bare flag name in a pattern would otherwise reject every
+    screenshot named after the flag and every grep or GET readback of it.
+
+    *mutation* is True when the match is in what a clearly state-changing
+    call sent: SQL that writes through a DB client or SQL tool, a mutating
+    HTTP request or test-route call (see _state_changing_calls), or a
+    browser script that writes storage or sends a mutating request. A
+    console, script or readback that names the flag may only be reading it.
+    """
+    tool = name.rsplit("__", 1)[-1]
+    if tool in _FATAL_EXEMPT_TOOLS or tool in _FILE_EDIT_TOOLS or _UI_ACTION_TOOL_RE.fullmatch(tool):
+        return "", "", False
+    # (text checked, what the call's state-changing parts sent)
+    candidates: list[tuple[str, list[str]]]
+    if tool == "Bash":
+        command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else str(tool_input)
+        # Match what runs: shell comments are not part of it.
+        tokens = _shell_tokens(command)
+        text = " ".join(tokens) if tokens is not None else command
+        if _is_read_only_command(command) or not _is_acting_command(command, text):
+            return "", "", False
+        calls = _state_changing_calls(command, written if check_written_files else {})
+        candidates = [(text, calls)]
+        if check_written_files:
+            candidates += [
+                (content, calls)
+                for path, content in written.items()
+                if path in text or Path(path).name in text
+            ]
+    elif _BROWSER_CODE_TOOL_RE.fullmatch(tool):
+        candidates = [
+            (leaf, [leaf] if _JS_WRITE.search(leaf) else [])
+            for leaf in _string_leaves(tool_input)
+            if _JS_MUTATION.search(leaf)
+        ]
+    else:
+        candidates = [
+            (leaf, [leaf] if _SQL_WRITE.search(leaf) or _TEST_ROUTE.fullmatch(leaf.strip()) else [])
+            for leaf in _string_leaves(tool_input)
+            if not _is_sql_readback(leaf)
+        ]
+    # A clear mutation anywhere in the call outranks an earlier hit that may only read.
+    first_hit = ("", "", False)
+    for value, sent in candidates:
+        for fatal in policy.fatal_patterns:
+            if not re.search(fatal.pattern, value, re.I):
                 continue
-            tool_input = block.get("input", {})
-            if isinstance(tool_input, dict):
-                for key in ["command", "cmd", "url", "query", "script", "code"]:
-                    value = tool_input.get(key)
-                    if isinstance(value, str):
-                        values.append(value)
-            elif isinstance(tool_input, str):
-                values.append(tool_input)
-    return values
+            if any(re.search(fatal.pattern, part, re.I) for part in sent):
+                return fatal.reason, _excerpt(value, fatal.pattern), True
+            if not first_hit[0]:
+                first_hit = (fatal.reason, _excerpt(value, fatal.pattern), False)
+    return first_hit
 
 
 def scan_policy_shortcuts(
-    output: str, policy: ManualTestPolicy | None = None
+    output: str,
+    policy: ManualTestPolicy | None = None,
+    *,
+    fatal_scope: str = "all",
 ) -> list[PolicyFlag]:
+    """Flag shortcut-like tool calls and prose, and fatal policy violations.
+
+    Built-in _POLICY_PATTERNS only flag (for the audit log, or for a strict
+    preset's <shortcut> requirement). The preset's fatal patterns are checked
+    against the inputs of every tool call that acts (see _fatal_tool_input),
+    never against prose: describing a UI flow that names a protected flag is
+    not a violation. *fatal_scope* is "all", "commands" (the fixer: editing
+    code is its job, so content it wrote is not checked when it runs checks
+    on it) or "none" (coverage, which only reads code and edits the matrix).
+    """
+    policy = policy or ManualTestPolicy()
+    check_fatal = bool(policy.fatal_patterns) and fatal_scope != "none"
     flags: list[PolicyFlag] = []
     seen: set[tuple[str, str]] = set()
-    candidates = [("tool", value) for value in _iter_tool_inputs(output)]
-    text = _extract_text_from_stream_json(output)
-    if text.strip():
-        candidates.append(("text", text))
 
-    for source, value in candidates:
-        for label, pattern in _POLICY_PATTERNS:
-            match = pattern.search(value)
-            if match:
-                flagged_value = value if source == "tool" else match.group(0)
-                key = (label, flagged_value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                flags.append(
-                    PolicyFlag(
-                        pattern=label,
-                        value=flagged_value,
-                        source=source,
-                        fatal_reason=_fatal_policy_reason(flagged_value, policy),
-                    )
+    def add(label: str, value: str, source: str, fatal_reason: str = "", fatal_mutation: bool = False) -> None:
+        if (label, value) not in seen:
+            seen.add((label, value))
+            flags.append(
+                PolicyFlag(
+                    pattern=label, value=value, source=source,
+                    fatal_reason=fatal_reason, fatal_mutation=fatal_mutation,
                 )
+            )
+
+    written: dict[str, str] = {}
+    for name, tool_input in _tool_uses(output):
+        fatal_reason, fatal_value, fatal_mutation = "", "", False
+        if check_fatal:
+            fatal_reason, fatal_value, fatal_mutation = _fatal_tool_input(
+                name, tool_input, written, policy, fatal_scope == "all"
+            )
+        if isinstance(tool_input, dict):
+            values = [tool_input[key] for key in _POLICY_INPUT_KEYS if isinstance(tool_input.get(key), str)]
+        else:
+            values = [tool_input] if isinstance(tool_input, str) else []
+        flagged = False
+        for value in values:
+            for label, pattern in _POLICY_PATTERNS:
+                if pattern.search(value):
+                    flagged = True
+                    add(label, value, "tool", fatal_reason, fatal_mutation)
+        if fatal_reason and not flagged:
+            add("fatal pattern", fatal_value, "tool", fatal_reason, fatal_mutation)
+        if name.rsplit("__", 1)[-1] in _FILE_EDIT_TOOLS and isinstance(tool_input, dict):
+            path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+            if path:
+                content = "\n".join(leaf for leaf in _string_leaves(tool_input) if leaf != path)
+                written[path] = written.get(path, "") + "\n" + content
+
+    text = _extract_text_from_stream_json(output)
+    for label, pattern in _POLICY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            add(label, match.group(0), "text")
     return flags
 
 
-def _signal_tags(text: str) -> list[str]:
-    found: list[tuple[int, str]] = []
-    for tag in SIGNAL_TAGS:
-        for match in re.finditer(rf"<{tag}\s*/>", text, re.I):
-            found.append((match.start(), tag))
-    return [tag for _, tag in sorted(found)]
+_SIGNAL_TAG_RE = re.compile(
+    "<(" + "|".join(re.escape(tag) for tag in SIGNAL_TAGS) + r")\s*/>", re.I
+)
+# Mentions like `<manual-pass/>` in prose (often quoting a previous attempt)
+# are not signals.
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+# What may follow the tag in its text block: a closing code fence or a full stop.
+_AFTER_SIGNAL_RE = re.compile(r"[\s`.!]*")
+# Tool calls that may follow the tag: todo bookkeeping, not work.
+_BOOKKEEPING_TOOLS = {"TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
 
 
-def _signal_tag_is_final(text: str, tag: str) -> bool:
-    return re.search(rf"<{tag}\s*/>\s*$", text, re.I) is not None
+def _without_inline_code(text: str) -> str:
+    return _INLINE_CODE_RE.sub(lambda match: " " * len(match.group(0)), text)
+
+
+def _find_signal_tag(output: str) -> tuple[str | None, list[str]]:
+    """The authoritative signal tag of a session, and any errors about it.
+
+    The last bare tag wins. It must end its text block, and no tool call may
+    follow it; later text-only turns (e.g. background-task notices) are fine.
+    Earlier mentions of the same tag are ignored; a different one makes the
+    signal ambiguous (no tag).
+    """
+    blocks = _assistant_blocks(output)
+    hits: list[tuple[int, int, str]] = []
+    for index, (kind, text) in enumerate(blocks):
+        if kind != "text":
+            continue
+        for match in _SIGNAL_TAG_RE.finditer(_without_inline_code(text)):
+            hits.append((index, match.end(), match.group(1).lower()))
+    if not hits:
+        return None, ["missing required manual signal tag"]
+
+    index, end, tag = hits[-1]
+    conflicting = sorted({other for _, _, other in hits[:-1] if other != tag})
+    if conflicting:
+        return None, [
+            f"expected exactly one manual signal tag, found: {', '.join(conflicting + [tag])}"
+        ]
+    trailing = _without_inline_code(blocks[index][1])[end:]
+    later_tool_use = any(
+        kind == "tool_use" and name not in _BOOKKEEPING_TOOLS for kind, name in blocks[index + 1:]
+    )
+    if not _AFTER_SIGNAL_RE.fullmatch(trailing) or later_tool_use:
+        return tag, ["manual signal tag must be the final output"]
+    return tag, []
 
 
 def _shortcut_errors(shortcuts: list[DataShortcut]) -> list[str]:
@@ -930,20 +1449,21 @@ def parse_manual_signal(
     text = _extract_text_from_stream_json(output)
     signal = ManualSignal(raw_text=text, policy_flags=policy_flags or [])
 
-    tags = _signal_tags(text)
-    if not tags:
-        signal.errors.append("missing required manual signal tag")
-        return signal
-    if len(tags) > 1:
-        signal.errors.append(f"expected exactly one manual signal tag, found: {', '.join(tags)}")
+    tag, tag_errors = _find_signal_tag(output)
+    signal.errors.extend(tag_errors)
+    if tag is None:
         return signal
 
-    tag = tags[0]
     signal.kind = SIGNAL_TAGS[tag]
-    if not _signal_tag_is_final(text, tag):
-        signal.errors.append("manual signal tag must be the final output")
-    block, result_status = _manual_result_block(text)
+    block, result_status = _manual_result_block(text, signal.kind)
     signal.result_status = result_status
+
+    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
+    if fatal_flags:
+        signal.errors.append(
+            "policy scanner flagged forbidden shortcut: "
+            + "; ".join(f"{flag.fatal_reason}: {_shorten(flag.value)}" for flag in fatal_flags)
+        )
 
     if signal.kind == "handoff":
         signal.valid = not signal.errors
@@ -959,20 +1479,30 @@ def parse_manual_signal(
 
     signal.evidence = _parse_evidence(block)
     signal.shortcuts = _parse_shortcuts(block)
-    signal.errors.extend(_shortcut_errors(signal.shortcuts))
+    # With auto-approval (the default) declaring a shortcut is optional, so an
+    # incomplete or honest "not approved" declaration must not cost more than
+    # staying silent would.
+    if (policy or ManualTestPolicy()).auto_approve_shortcuts:
+        signal.warnings.extend(_shortcut_errors(signal.shortcuts))
+    else:
+        signal.errors.extend(_shortcut_errors(signal.shortcuts))
 
     if signal.kind == "pass":
-        if not _has_required_evidence(signal.evidence):
-            signal.errors.append("pass result requires at least one evidence item")
+        if not _has_required_evidence(signal.evidence, notes_count=False):
+            signal.errors.append(
+                "pass result requires evidence beyond notes "
+                "(url, screenshot, trace, mail, console or db_readback)"
+            )
 
     elif signal.kind == "finding":
-        signal.severity = _tag_value(block, "severity").lower()
-        signal.category = _tag_value(block, "category").lower()
-        signal.title = _tag_value(block, "title")
-        signal.reproduction = _parse_reproduction(block)
-        signal.expected = _tag_value(block, "expected")
-        signal.actual = _tag_value(block, "actual")
-        signal.suspected_files = _tag_values(block, "suspected_file")
+        top = _top_level(block)
+        signal.severity = _tag_value(top, "severity").lower()
+        signal.category = _tag_value(top, "category").lower()
+        signal.title = _tag_value(top, "title")
+        signal.reproduction = _parse_reproduction(top)
+        signal.expected = _tag_value(top, "expected")
+        signal.actual = _tag_value(top, "actual")
+        signal.suspected_files = _tag_values(top, "suspected_file")
 
         if signal.severity not in ALLOWED_SEVERITIES:
             signal.errors.append("finding severity must be high, medium, low, or ux")
@@ -988,14 +1518,18 @@ def parse_manual_signal(
             signal.errors.append("finding requires expected behavior")
         if not signal.actual.strip():
             signal.errors.append("finding requires actual behavior")
-        if not _has_required_evidence(signal.evidence):
-            signal.errors.append("finding requires evidence")
+        if not _has_required_evidence(signal.evidence, notes_count=False):
+            signal.errors.append(
+                "finding requires evidence beyond notes "
+                "(url, screenshot, trace, mail, console or db_readback)"
+            )
 
     elif signal.kind == "blocked":
-        signal.blocked_reason = _tag_value(block, "reason")
-        signal.code_read = _tag_value(block, "code_read")
-        signal.data_attempts = _tag_value(block, "data_attempts")
-        signal.why_not_fixable_now = _tag_value(block, "why_not_fixable_now")
+        top = _top_level(block)
+        signal.blocked_reason = _tag_value(top, "reason")
+        signal.code_read = _tag_value(top, "code_read")
+        signal.data_attempts = _tag_value(top, "data_attempts")
+        signal.why_not_fixable_now = _tag_value(top, "why_not_fixable_now")
         if not signal.blocked_reason.strip():
             signal.errors.append("blocked result requires a reason")
         if not signal.code_read.strip():
@@ -1009,19 +1543,11 @@ def parse_manual_signal(
         if _is_missing_data_reason(signal.blocked_reason, policy):
             signal.errors.append("blocked reason cannot be only missing data")
 
-    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
-    if fatal_flags:
-        signal.errors.append(
-            "policy scanner flagged forbidden shortcut: "
-            + "; ".join(
-                f"{flag.fatal_reason}: {flag.value}" for flag in fatal_flags
-            )
-        )
-
     missing_shortcuts = [
         flag
         for flag in signal.policy_flags
-        if not _is_auto_approved(flag, policy)
+        if not flag.fatal_reason  # already an error above
+        and not _is_auto_approved(flag, policy)
         and not any(_shortcut_covers_flag(shortcut, flag) for shortcut in signal.shortcuts)
     ]
     if missing_shortcuts:
@@ -1086,6 +1612,16 @@ def build_scenario_prompt(
     handoff_section = _scenario_handoff_section(scenario)
     policy = policy or ManualTestPolicy()
     project_rules = f"\n{policy.policy_text}" if policy.policy_text else ""
+    if policy.auto_approve_shortcuts:
+        shortcut_rule = (
+            "- Declare each SQL/test-route/mutating HTTP shortcut in the result with a <shortcut>\n"
+            "  entry, for the audit report:"
+        )
+    else:
+        shortcut_rule = (
+            "- Every SQL/test-route/mutating HTTP shortcut must include a <shortcut> entry in the\n"
+            "  result, with approved_by_policy=true, or the result is rejected:"
+        )
     return f"""\
 You are a senior manual QA engineer running Conductor manual-test mode.
 
@@ -1116,7 +1652,7 @@ Artifacts directory: {artifacts_dir}
   at least once.
 - SQL/test routes may be used only for non-user-facing preconditions, bulk fixture creation,
   cleanup, or impossible setup.
-- Every SQL/test-route/mutating HTTP shortcut must include a <shortcut> entry in the result:
+{shortcut_rule}
   <shortcut><reason>...</reason><command_or_route>...</command_or_route><user_flow_supported>...</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
 - If a UI setup step fails, record a finding. Do not silently bypass it with SQL.{project_rules}
 
@@ -1140,7 +1676,7 @@ Pass format:
     <url>...</url>
     <screenshot>...</screenshot>
     <trace>...</trace>
-    <mailhog>...</mailhog>
+    <mail>...</mail>
     <db_readback>...</db_readback>
     <note>...</note>
   </evidence>
@@ -1182,8 +1718,29 @@ def build_fixer_prompt(
     plan_content: str,
     finding: ManualFinding,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
+    policy = policy or ManualTestPolicy()
+    # The fixer's commands are checked against the preset's fatal patterns too.
+    project_rules = f"\n## Project Rules\n\n{policy.policy_text}\n" if policy.policy_text else ""
     evidence = _format_evidence_lines(finding.evidence) if finding.evidence else []
+    attempts = [attempt for attempt in finding.fix_attempts if attempt.outcome]
+    previous = ""
+    if attempts:
+        rows = []
+        for attempt in attempts:
+            row = f"- Attempt {attempt.number}: {attempt.outcome}"
+            if attempt.stash:
+                row += (
+                    f"\n  Its changes are stashed: `git stash show -p --include-untracked {attempt.stash}`"
+                )
+            rows.append(row)
+        previous = (
+            "\n## Previous Fix Attempts\n\n"
+            "These attempts failed and were taken out of the worktree. Do not repeat them blindly.\n\n"
+            + "\n".join(rows)
+            + "\n"
+        )
     return f"""\
 You are fixing a manual-test finding with minimal code changes.
 
@@ -1200,8 +1757,11 @@ Artifacts directory: {conductor_dir / 'artifacts'}
 Read code first, make the smallest correct fix, and run the relevant focused checks.
 Do not mark this verified; a verifier generation must rerun the scenario.
 
-End with <manual-handoff/> and summarize changed files and checks run.
+Do not commit; Conductor commits the fix once a verifier generation confirms it.
 
+Summarize the changed files and the checks you ran, then put <manual-handoff/> on
+the last line, with nothing after it.
+{project_rules}{previous}
 ## Original Plan
 
 {plan_content}
@@ -1213,7 +1773,10 @@ def build_verifier_prompt(
     plan_content: str,
     finding: ManualFinding,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
+    policy = policy or ManualTestPolicy()
+    project_rules = f"\n## Project Rules\n{policy.policy_text}\n" if policy.policy_text else ""
     return f"""\
 You are verifying a fixed manual-test finding.
 
@@ -1226,7 +1789,7 @@ Artifacts directory: {conductor_dir / 'artifacts'}
 Rerun the exact reproduction through the UI/browser, then run the relevant focused checks.
 Record fresh evidence. End with a full manual-result block plus <manual-pass/> if verified
 or <manual-finding/> if it still fails.
-
+{project_rules}
 Pass format:
 <manual-result status="pass">
   <summary>...</summary>
@@ -1268,22 +1831,30 @@ def _safe_name(value: str) -> str:
 
 def _output_tail(text: str, limit: int = 120) -> str:
     lines = _extract_text_from_stream_json(text).splitlines()
-    return "\n".join(lines[-limit:])
+    # The next generation reads this file; a quoted signal tag there tends to
+    # come back as a duplicate tag in its own output.
+    return _SIGNAL_TAG_RE.sub(r"[\1]", "\n".join(lines[-limit:]))
 
 
 def _scenario_handoff_section(scenario: ManualScenario) -> str:
     if not scenario.handoff_notes.strip():
         return ""
 
-    content = ""
+    content, handoff_path = "", None
     match = re.search(r"(/\S*generation-\d{3}-handoff\.md)", scenario.handoff_notes)
     if match:
         handoff_path = Path(match.group(1))
         if handoff_path.exists():
-            content = handoff_path.read_text(encoding="utf-8", errors="replace")[:4000]
+            content = handoff_path.read_text(encoding="utf-8", errors="replace")
 
     section = f"## Previous Handoff\n\n{scenario.handoff_notes}\n"
     if content:
+        # The newest output, including any handoff summary, is at the end.
+        if len(content) > HANDOFF_EXCERPT_CHARS:
+            content = (
+                f"...(earlier output omitted; Read {handoff_path} for all of it)\n"
+                + content[-HANDOFF_EXCERPT_CHARS:]
+            )
         section += f"\n```markdown\n{content}\n```\n"
     return section + "\n"
 
@@ -1346,8 +1917,12 @@ def detect_relevant_check_commands(
     return commands
 
 
+# Output browser and test tooling leaves in the target repo while testing:
+# Playwright CLI/MCP page snapshots and Playwright's report directories.
 _TEST_ARTIFACT_PATTERNS = re.compile(
-    r"\.yaml$|\.yml\.snap$|/artifacts/|/screenshots/|/mailhog/|/generations/"
+    r"(^|/)(\.playwright-(cli|mcp)|test-results|playwright-report|blob-report)/"
+    r"|(^|/)page-\d{4}-\d\d-\d\dT[\d-]+Z?\.(ya?ml|png|jpe?g)$"
+    r"|\.yml\.snap$"
 )
 
 
@@ -1355,36 +1930,30 @@ def _is_test_artifact(path: str) -> bool:
     return bool(_TEST_ARTIFACT_PATTERNS.search(path))
 
 
-def _git_changed_files(cwd: Path, exclude_test_artifacts: bool = False) -> list[str]:
-    files: list[str] = []
-    for args in [
-        ["git", "diff", "--name-only", "--diff-filter=ACMRTD"],
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRTD"],
-    ]:
-        result = subprocess.run(
-            args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        files.extend(line.strip() for line in result.stdout.splitlines() if line.strip())
+# Paths are passed to git as literal names, never as globs.
+_GIT = ["git", "--literal-pathspecs"]
 
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
+
+def _git_root(cwd: Path) -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    return Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else cwd
+
+
+def _git_changed_files(cwd: Path) -> list[str]:
+    """Every path with staged, unstaged or untracked changes, relative to the repo root.
+
+    Files inside untracked directories are listed one by one, and names come
+    back unquoted, so paths with spaces or non-ASCII characters work.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
         cwd=cwd,
         capture_output=True,
-        text=True,
         check=False,
     )
-    for line in status.stdout.splitlines():
-        if line.startswith("?? "):
-            files.append(line[3:].strip())
-
-    all_files = sorted(set(files))
-    if exclude_test_artifacts:
-        return [f for f in all_files if not _is_test_artifact(f)]
-    return all_files
+    return sorted({os.fsdecode(entry[3:]) for entry in result.stdout.split(b"\0") if len(entry) > 3})
 
 
 def _format_files_for_log(files: list[str], limit: int = 12) -> str:
@@ -1432,43 +2001,92 @@ def _commit_verified_finding(
     finding: ManualFinding,
     changed_files: list[str],
 ) -> str | None:
-    if not changed_files:
-        return None
+    """Commit exactly *changed_files* (root-relative) and return the short hash.
 
-    subprocess.run(
-        ["git", "add", "--", *changed_files],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-    )
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMRTD"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if not staged.stdout.strip():
+    Anything else the user has staged stays staged and out of the commit.
+    Returns None when none of the files has changes left. If staging or the
+    commit fails (a pre-commit hook, say), the files are unstaged again so a
+    later commit cannot sweep them in, and CalledProcessError propagates.
+    """
+    root = _git_root(cwd)
+    pending = set(_git_changed_files(root))
+    files = [path for path in changed_files if path in pending]
+    if not files:
         return None
-
+    # New and modified files must be added first; deletions commit as they are.
+    present = [path for path in files if os.path.lexists(root / path)]
     message = (
         f"Fix {finding.id}: {finding.title}\n\n"
         f"Verified manual-test scenario {finding.scenario_index}."
     )
-    subprocess.run(
-        ["git", "commit", "-m", message],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-    )
+    try:
+        if present:
+            subprocess.run([*_GIT, "add", "-A", "--", *present], cwd=root, check=True, capture_output=True)
+        subprocess.run(
+            [*_GIT, "commit", "--only", "-m", message, "--", *files],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        subprocess.run([*_GIT, "reset", "-q", "--", *files], cwd=root, check=False, capture_output=True)
+        raise
     result = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
-        cwd=cwd,
+        cwd=root,
         capture_output=True,
         text=True,
         check=False,
     )
     return result.stdout.strip() or None
+
+
+def _stash_files(cwd: Path, files: list[str], message: str, ref: str) -> tuple[str, str]:
+    """Stash the changes to *files* (new files included) and keep the stash as *ref*.
+
+    Returns (stash commit, ref), or ("", "") when there was nothing to stash.
+    The stash then leaves the user's stash list, so their `git stash pop`
+    cannot apply it; if *ref* cannot be written it stays there (ref "").
+    """
+    root = _git_root(cwd)
+
+    def stash_head() -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", "refs/stash"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    before = stash_head()
+    subprocess.run(
+        [*_GIT, "stash", "push", "--include-untracked", "-m", message, "--", *files],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    after = stash_head()
+    if after == before:
+        return "", ""
+    try:
+        subprocess.run(
+            ["git", "update-ref", "--create-reflog", "-m", message, ref, after],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return after, ""
+    subprocess.run(["git", "stash", "drop", "-q"], cwd=root, check=False, capture_output=True)
+    return after, ref
+
+
+def _process_error_text(exc: subprocess.CalledProcessError) -> str:
+    output = exc.stderr or exc.stdout or b""
+    text = output.decode(errors="replace") if isinstance(output, bytes) else str(output)
+    return _clip(text, 300) or str(exc)
 
 
 def _scenario_for_finding(
@@ -1494,10 +2112,16 @@ def _scenario_has_open_findings(state: ManualTestState, scenario: ManualScenario
 
 
 def _should_fix_finding(finding: ManualFinding) -> bool:
+    """Open, fixable and not out of attempts.
+
+    "needs_human" (attempts exhausted) is not retried but still counts as an
+    open finding for its scenario.
+    """
     return (
         finding.status in {"open", "fixing"}
         and finding.category in FIXABLE_FINDING_CATEGORIES
         and finding.severity in {"high", "medium", "low", "ux"}
+        and sum(1 for attempt in finding.fix_attempts if attempt.failed) < MAX_FIX_ATTEMPTS
     )
 
 
@@ -1532,6 +2156,67 @@ def _write_generation_handoff(
     return path
 
 
+# API errors that say nothing about the work: the call was refused or failed.
+# Context exhaustion ("Prompt is too long", reported as invalid_request) and
+# error_max_turns are deliberately absent: those sessions did real work and ran
+# out of budget, which is an attempt like any other.
+_INFRA_API_ERRORS = {"authentication_failed", "billing_error", "rate_limit", "server_error"}
+
+
+def _clip(text: str, limit: int = 500) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def _claude_failure(output: str, exit_code: int, stderr: str) -> str:
+    """Describe a Claude infrastructure failure, or return "" for a real attempt.
+
+    It is an infrastructure failure when the model never produced a turn of its
+    own (empty output, bad model, auth error, usage limit before the first
+    turn), or when the session ended on an API error from _INFRA_API_ERRORS.
+    """
+    worked = False
+    error_kind = ""
+    error_text = ""
+    for event in _stream_events(output):
+        if event.get("type") == "assistant":
+            message = event.get("message") or {}
+            blocks = [b for b in message.get("content") or [] if isinstance(b, dict)]
+            if event.get("error") or message.get("model") == "<synthetic>":
+                error_kind = str(event.get("error") or "")
+                error_text = "\n".join(str(b.get("text", "")) for b in blocks) or error_text
+            elif any(b.get("type") in {"text", "tool_use"} for b in blocks):
+                worked = True
+        elif event.get("type") == "result" and event.get("is_error"):
+            if event.get("subtype") == "success" and isinstance(event.get("result"), str):
+                error_text = event["result"] or error_text
+
+    detail = _clip(error_text or stderr) or "no output"
+    if not worked:
+        return f"exit {exit_code}: {detail}"
+    if error_kind in _INFRA_API_ERRORS:
+        return f"{error_kind}: {detail}"
+    return ""
+
+
+def _read_generation_result(
+    exit_file: Path, output_file: Path, stderr_file: Path
+) -> tuple[int, str, str]:
+    try:
+        exit_code = int(exit_file.read_text().strip())
+    except (OSError, ValueError):
+        exit_code = 1
+    output_text = ""
+    if output_file.exists():
+        output_text = output_file.read_text(encoding="utf-8", errors="replace")
+    stderr_text = ""
+    if stderr_file.exists():
+        stderr_text = stderr_file.read_text(encoding="utf-8", errors="replace")
+        if not stderr_text.strip():
+            stderr_file.unlink()
+    return exit_code, output_text, stderr_text
+
+
 async def _run_generation(
     *,
     state: ManualTestState,
@@ -1546,6 +2231,7 @@ async def _run_generation(
     audit_path: Path,
     write_markdown_on_finish: bool = True,
     policy: ManualTestPolicy | None = None,
+    fatal_scope: str = "all",
 ) -> tuple[ManualSignal, str]:
     from conductor.core.loop import _wait_for_exit
 
@@ -1556,23 +2242,27 @@ async def _run_generation(
         scenario_index=scenario.index if scenario else None,
     )
     state.generations.append(generation)
-    save_manual_state(state, conductor_dir)
+    # A coverage generation edits MANUAL-TEST-SCENARIOS.md itself; re-rendering
+    # it here would wipe a previous coverage attempt's matrix on retry.
+    save_manual_state(state, conductor_dir, write_markdown=write_markdown_on_finish)
 
-    safe = _safe_name(state.name)
     label_safe = _safe_name(label)
     prompt_file = conductor_dir / "logs" / f"manual-prompt-{generation.index:03d}-{label_safe}.md"
     output_file = conductor_dir / "logs" / f"manual-output-{generation.index:03d}-{label_safe}.jsonl"
-    exit_file = Path(f"/tmp/conductor-manual-exit-{safe}-{generation.index:03d}-{label_safe}")
+    stderr_file = conductor_dir / "logs" / f"manual-stderr-{generation.index:03d}-{label_safe}.log"
+    # Per run directory, so two projects using the same --name cannot collide.
+    exit_file = conductor_dir / "logs" / f"manual-exit-{generation.index:03d}-{label_safe}"
     prompt_file.write_text(prompt, encoding="utf-8")
     exit_file.unlink(missing_ok=True)
     output_file.unlink(missing_ok=True)
 
     quoted_prompt = shlex.quote(str(prompt_file))
     quoted_exit = shlex.quote(str(exit_file))
+    quoted_stderr = shlex.quote(str(stderr_file))
     pipeline = (
         f"claude -p - --dangerously-skip-permissions "
         f"--max-turns {state.max_turns} --model {shlex.quote(model)} "
-        f"--output-format stream-json --verbose < {quoted_prompt} 2>/dev/null "
+        f"--output-format stream-json --verbose < {quoted_prompt} 2> {quoted_stderr} "
         f"| {stream_filter_pipe(output_file)}; "
         f"echo ${{PIPESTATUS[0]}} > {quoted_exit}"
     )
@@ -1595,32 +2285,42 @@ async def _run_generation(
         log_file=tmux_log,
     )
     await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
+    exit_code, output_text, stderr_text = _read_generation_result(exit_file, output_file, stderr_file)
+    # The window stays open after exit (remain-on-exit), keeping its pipe-pane
+    # helper alive; everything it showed is in the output, stderr and tmux logs.
+    await tmux.kill_window(window_name)
 
-    try:
-        exit_code = int(exit_file.read_text().strip())
-    except (OSError, ValueError):
-        exit_code = 1
-
-    output_text = ""
-    if output_file.exists():
-        output_text = output_file.read_text(encoding="utf-8", errors="replace")
-
-    policy_flags = scan_policy_shortcuts(output_text, policy)
+    policy_flags = scan_policy_shortcuts(output_text, policy, fatal_scope=fatal_scope)
     signal = parse_manual_signal(output_text, policy_flags=policy_flags, policy=policy)
+    if not signal.valid:
+        signal.infra_error = _claude_failure(output_text, exit_code, stderr_text)
+    if signal.infra_error:
+        state.consecutive_infra_failures += 1
+    else:
+        state.consecutive_infra_failures = 0
     generation.completed_at = datetime.now(timezone.utc)
-    generation.summary = signal.kind or "no-signal"
+    generation.summary = "infra-error" if signal.infra_error else (signal.kind or "no-signal")
 
+    outcome = (
+        f"Claude failed ({signal.infra_error})"
+        if signal.infra_error
+        else f"signal {signal.kind}, valid={signal.valid}"
+    )
+    if signal.warnings:
+        outcome += f"; warnings: {'; '.join(signal.warnings)}"
     _log(
         "MANUAL_GENERATION_END",
-        f"Generation {generation.index}: exit {exit_code}, signal {signal.kind}, valid={signal.valid}",
+        f"Generation {generation.index}: exit {exit_code}, {outcome}",
         log_path,
         audit_path,
         exit_code=exit_code,
         signal=signal.kind,
         valid=signal.valid,
         errors=signal.errors,
+        warnings=signal.warnings,
+        infra_error=signal.infra_error,
         auto_approved=[
-            f"{flag.kind}: {flag.value}"
+            f"{flag.pattern}: {flag.value}"
             for flag in policy_flags
             if _is_auto_approved(flag, policy)
         ],
@@ -1629,6 +2329,35 @@ async def _run_generation(
     exit_file.unlink(missing_ok=True)
     save_manual_state(state, conductor_dir, write_markdown=write_markdown_on_finish)
     return signal, output_text
+
+
+async def _run_generation_retrying(**kwargs) -> tuple[ManualSignal, str]:
+    """Run a generation, retrying it while Claude itself fails to run.
+
+    Raises ManualRunPaused after MAX_CONSECUTIVE_INFRA_FAILURES failures in a
+    row, so a usage limit or auth error stops the run instead of being counted
+    against scenarios and findings.
+    """
+    state: ManualTestState = kwargs["state"]
+    while True:
+        signal, output_text = await _run_generation(**kwargs)
+        if not signal.infra_error:
+            return signal, output_text
+        if state.consecutive_infra_failures >= MAX_CONSECUTIVE_INFRA_FAILURES:
+            raise ManualRunPaused(
+                f"{state.consecutive_infra_failures} Claude failures in a row; "
+                f"last ({kwargs['label']}): {signal.infra_error}"
+            )
+        _log(
+            "MANUAL_INFRA_RETRY",
+            f"{kwargs['label']}: Claude failed ({signal.infra_error}); "
+            f"retrying in {INFRA_RETRY_DELAY_SECS}s",
+            kwargs["log_path"],
+            kwargs["audit_path"],
+            error=signal.infra_error,
+            consecutive=state.consecutive_infra_failures,
+        )
+        await asyncio.sleep(INFRA_RETRY_DELAY_SECS)
 
 
 def _apply_signal_to_scenario(
@@ -1644,6 +2373,21 @@ def _apply_signal_to_scenario(
     for shortcut in signal.shortcuts:
         shortcut.scenario_index = scenario.index
     scenario.shortcuts.extend(signal.shortcuts)
+
+    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
+    if any(flag.fatal_mutation for flag in fatal_flags):
+        # The forbidden change has already happened, so a retry would only
+        # test against polluted state (and could then "pass"). Any other
+        # fatal hit (e.g. a console script that may only read the flag) just
+        # invalidates the result, which is retried below like any other.
+        scenario.status = "policy_violation"
+        scenario.evidence = ManualEvidence(
+            summary="Generation used a shortcut the preset forbids",
+            notes=[f"{flag.fatal_reason}: {_shorten(flag.value)}" for flag in fatal_flags],
+        )
+        scenario.completed_at = now
+        state.current_scenario_index = scenario.index + 1
+        return
 
     if signal.kind == "pass" and signal.valid:
         scenario.status = "passed"
@@ -1679,7 +2423,7 @@ def _apply_signal_to_scenario(
         state.current_scenario_index = scenario.index + 1
         return
 
-    reason = "handoff" if signal.kind == "handoff" else "; ".join(signal.errors)
+    reason = "handoff" if signal.kind == "handoff" and signal.valid else "; ".join(signal.errors)
     handoff = _write_generation_handoff(
         state=state,
         conductor_dir=conductor_dir,
@@ -1689,16 +2433,22 @@ def _apply_signal_to_scenario(
         output_text=output_text,
     )
     scenario.handoff_notes = f"See {handoff}"
-    if scenario.attempts >= 3:
-        scenario.status = "blocked"
-        scenario.evidence = ManualEvidence(
-            summary="Scenario did not produce a valid result after 3 attempts",
-            notes=signal.errors or ["No valid manual signal"],
-        )
-        scenario.completed_at = now
-        state.current_scenario_index = scenario.index + 1
+    if signal.kind == "handoff" and signal.valid:
+        scenario.handoffs += 1
+    invalid_results = scenario.attempts - scenario.handoffs
+    if scenario.handoffs >= MAX_SCENARIO_HANDOFFS:
+        summary = f"Scenario handed off {scenario.handoffs} times without reaching a result"
+        notes = [f"Last handoff: {handoff}"]
+    elif invalid_results >= MAX_SCENARIO_INVALID_RESULTS:
+        summary = f"Scenario did not produce a valid result after {invalid_results} attempts"
+        notes = signal.errors or ["No valid manual signal"]
     else:
         scenario.status = "pending"
+        return
+    scenario.status = "blocked"
+    scenario.evidence = ManualEvidence(summary=summary, notes=notes)
+    scenario.completed_at = now
+    state.current_scenario_index = scenario.index + 1
 
 
 async def _fix_and_verify_finding(
@@ -1738,22 +2488,45 @@ async def _fix_and_verify_finding(
         save_manual_state(state, conductor_dir)
         return
 
+    attempt = ManualFixAttempt(number=len(finding.fix_attempts) + 1)
+    finding.fix_attempts.append(attempt)
     finding.status = "fixing"
     save_manual_state(state, conductor_dir)
 
-    signal, output_text = await _run_generation(
-        state=state,
-        project_dir=project_dir,
-        conductor_dir=conductor_dir,
-        tmux=tmux,
-        prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir),
-        label=f"fix-{finding.id}",
-        model=model,
-        scenario=_scenario_for_finding(state, finding),
-        log_path=log_path,
-        audit_path=audit_path,
-        policy=policy,
-    )
+    def fail(outcome: str, interrupted: bool = False) -> None:
+        attempt.interrupted = interrupted
+        _shelve_failed_fix(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            finding=finding,
+            attempt=attempt,
+            outcome=outcome,
+            files=_fixer_changed_files(project_dir, preexisting_files),
+            log_path=log_path,
+            audit_path=audit_path,
+        )
+
+    try:
+        signal, output_text = await _run_generation_retrying(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            tmux=tmux,
+            prompt=build_fixer_prompt(state, plan_content, finding, conductor_dir, policy=policy),
+            label=f"fix-{finding.id}",
+            model=model,
+            scenario=_scenario_for_finding(state, finding),
+            log_path=log_path,
+            audit_path=audit_path,
+            policy=policy,
+            fatal_scope="commands",
+        )
+    except ManualRunPaused as exc:
+        # Claude could not run, which is not the fixer's failure. Clear the
+        # tree so the next attempt starts clean on resume.
+        fail(f"Interrupted, the run paused: {exc}", interrupted=True)
+        raise
     generation = state.generations[-1]
     if not signal.valid:
         _write_generation_handoff(
@@ -1764,35 +2537,129 @@ async def _fix_and_verify_finding(
             reason="fixer generation did not produce valid handoff signal",
             output_text=output_text,
         )
-        finding.status = "open"
-        finding.verification.append("Fixer did not produce a valid handoff signal")
-        save_manual_state(state, conductor_dir)
+        detail = f": {'; '.join(signal.errors)}" if signal.errors else ""
+        fail(f"Fixer did not produce a valid handoff signal{detail}")
         return
 
-    all_changed = _git_changed_files(project_dir)
-    fixer_files = [f for f in all_changed if f not in preexisting_files]
+    fixer_files = _fixer_changed_files(project_dir, preexisting_files)
+    attempt.files = fixer_files
     if not fixer_files:
-        finding.status = "open"
-        finding.verification.append("Fixer produced no new file changes")
-        save_manual_state(state, conductor_dir)
+        fail("Fixer produced no new file changes")
         return
 
     checks_passed, check_summaries = _run_relevant_checks(project_dir, fixer_files, policy=policy)
     finding.verification.extend(check_summaries)
     if not checks_passed:
-        finding.status = "open"
-        save_manual_state(state, conductor_dir)
+        failed_checks = [line for line in check_summaries if ": exit 0;" not in line]
+        fail(_clip("Focused checks failed: " + " / ".join(failed_checks), 600))
         return
 
+    # Persisted with attempt.files, so a run that stops before the verifier
+    # finishes verifies this fix on resume (_resume_verification).
     finding.status = "fixed"
     save_manual_state(state, conductor_dir)
-
-    verifier_signal, verifier_output = await _run_generation(
+    await _verify_and_commit(
         state=state,
         project_dir=project_dir,
         conductor_dir=conductor_dir,
         tmux=tmux,
-        prompt=build_verifier_prompt(state, plan_content, finding, conductor_dir),
+        plan_content=plan_content,
+        finding=finding,
+        fix_files=fixer_files,
+        fail=fail,
+        log_path=log_path,
+        audit_path=audit_path,
+        model=model,
+        policy=policy,
+    )
+
+
+async def _resume_verification(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    finding: ManualFinding,
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy | None = None,
+) -> None:
+    """Verify a "fixed" finding whose verification never finished (killed or paused run)."""
+    attempt = finding.fix_attempts[-1] if finding.fix_attempts else None
+    if attempt is None or not attempt.files:
+        # Fixed before fix files were recorded: there is nothing safe to commit.
+        finding.status = "open"
+        finding.verification.append(
+            "Verification was interrupted and the fix's files are unknown; "
+            "check the worktree for its changes"
+        )
+        save_manual_state(state, conductor_dir)
+        return
+
+    def fail(outcome: str) -> None:
+        pending = set(_git_changed_files(project_dir))
+        _shelve_failed_fix(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            finding=finding,
+            attempt=attempt,
+            outcome=outcome,
+            files=[path for path in attempt.files if path in pending],
+            log_path=log_path,
+            audit_path=audit_path,
+        )
+
+    _log(
+        "FINDING_FIX_RETRY",
+        f"Verifying {finding.id} after an interrupted verification: {finding.title}",
+        log_path,
+        audit_path,
+        finding_id=finding.id,
+        files=attempt.files,
+    )
+    await _verify_and_commit(
+        state=state,
+        project_dir=project_dir,
+        conductor_dir=conductor_dir,
+        tmux=tmux,
+        plan_content=plan_content,
+        finding=finding,
+        fix_files=attempt.files,
+        fail=fail,
+        log_path=log_path,
+        audit_path=audit_path,
+        model=model,
+        policy=policy,
+    )
+
+
+async def _verify_and_commit(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    finding: ManualFinding,
+    fix_files: list[str],
+    fail: Callable[[str], None],
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy | None = None,
+) -> None:
+    """Rerun the finding's scenario on the fix; commit it if it passes, else *fail*."""
+    # A pause here leaves the finding "fixed"; resume verifies it again.
+    verifier_signal, verifier_output = await _run_generation_retrying(
+        state=state,
+        project_dir=project_dir,
+        conductor_dir=conductor_dir,
+        tmux=tmux,
+        prompt=build_verifier_prompt(state, plan_content, finding, conductor_dir, policy=policy),
         label=f"verify-{finding.id}",
         model=model,
         scenario=_scenario_for_finding(state, finding),
@@ -1814,21 +2681,31 @@ async def _fix_and_verify_finding(
             scenario.completed_at = datetime.now(timezone.utc)
 
         try:
-            commit_hash = _commit_verified_finding(project_dir, finding, fixer_files)
+            commit_hash = _commit_verified_finding(project_dir, finding, fix_files)
         except subprocess.CalledProcessError as exc:
             commit_hash = None
-            finding.verification.append(f"Commit failed: {exc}")
+            error = _process_error_text(exc)
+            # Verification did pass, so the status stays; the fix is left
+            # unstaged in the worktree for the user to commit.
+            finding.verification.append(
+                f"Commit failed, fix left uncommitted ({_format_files_for_log(fix_files)}): {error}"
+            )
+            _log(
+                "MANUAL_COMMIT_FAILED",
+                f"{finding.id}: commit failed, fix left uncommitted: {error}",
+                log_path,
+                audit_path,
+                finding_id=finding.id,
+                files=fix_files,
+                error=error,
+            )
         if commit_hash:
             finding.fix_commits.append(commit_hash)
         save_manual_state(state, conductor_dir)
         return
 
     if verifier_signal.kind == "finding" and verifier_signal.valid:
-        finding.status = "open"
-        finding.verification.append(
-            f"Verifier still failing: {verifier_signal.title or verifier_signal.actual}"
-        )
-        save_manual_state(state, conductor_dir)
+        fail(f"Verifier still failing: {verifier_signal.title or verifier_signal.actual}")
         return
 
     _write_generation_handoff(
@@ -1839,8 +2716,77 @@ async def _fix_and_verify_finding(
         reason="verifier generation did not produce valid pass/finding signal",
         output_text=verifier_output,
     )
-    finding.status = "open"
-    finding.verification.append("Verifier did not produce a valid pass/finding signal")
+    fail("Verifier did not produce a valid pass/finding signal: " + "; ".join(verifier_signal.errors))
+
+
+def _fixer_changed_files(project_dir: Path, preexisting_files: set[str]) -> list[str]:
+    return [
+        path
+        for path in _git_changed_files(project_dir)
+        if path not in preexisting_files and not _is_test_artifact(path)
+    ]
+
+
+def _shelve_failed_fix(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    finding: ManualFinding,
+    attempt: ManualFixAttempt,
+    outcome: str,
+    files: list[str],
+    log_path: Path,
+    audit_path: Path,
+) -> None:
+    """End a failed fix attempt: stash its *files* and reopen (or give up on) the finding.
+
+    The fixer only runs on a tree without other changes, so its changes are
+    exactly the non-artifact files that changed since. Stashing them gives
+    the next attempt a clean tree (and later scenarios working code), keeps
+    the attempt recoverable under refs/conductor/manual-test/ (not on the
+    user's stash list), and lets the next fixer prompt point at it.
+    An interrupted attempt is reopened without counting against the limit.
+    """
+    if files:
+        attempt.files = files
+        try:
+            attempt.stash, attempt.stash_ref = _stash_files(
+                project_dir,
+                files,
+                f"conductor manual-test: failed fix {finding.id} attempt {attempt.number}",
+                f"refs/conductor/manual-test/{_safe_name(state.name)}/"
+                f"{_safe_name(finding.id)}-attempt-{attempt.number}",
+            )
+        except subprocess.CalledProcessError as exc:
+            finding.verification.append(
+                f"Could not stash the failed fix ({_format_files_for_log(files)}): "
+                f"{_process_error_text(exc)}"
+            )
+        if attempt.stash:
+            finding.verification.append(
+                f"Fix attempt {attempt.number} changes stashed in {attempt.stash_label} "
+                f"({_format_files_for_log(files)})"
+            )
+            _log(
+                "MANUAL_FIX_STASHED",
+                f"{finding.id}: attempt {attempt.number} changes stashed in {attempt.stash_label}",
+                log_path,
+                audit_path,
+                finding_id=finding.id,
+                attempt=attempt.number,
+                stash=attempt.stash,
+                ref=attempt.stash_ref,
+                files=files,
+            )
+    attempt.outcome = outcome
+    finding.verification.append(f"Fix attempt {attempt.number}: {outcome}")
+    failed = sum(1 for item in finding.fix_attempts if item.failed)
+    if failed >= MAX_FIX_ATTEMPTS:
+        finding.status = "needs_human"
+        finding.verification.append(f"Gave up after {failed} failed fix attempts")
+    else:
+        finding.status = "open"
     save_manual_state(state, conductor_dir)
 
 
@@ -1875,17 +2821,107 @@ async def _manual_main(
     tmux = TmuxManager(session_name=f"conductor-manual-test-{state.name}")
     await tmux.ensure_session()
 
+    resumed = ""
+    if state.status == "paused":
+        resumed = f" (resuming after: {state.last_error})"
+        state.status = state.paused_from or "running"
+        state.paused_from = ""
+        state.last_error = ""
+        state.consecutive_infra_failures = 0
+
     _log(
         "MANUAL_TEST_START",
-        f"Starting manual-test {state.name} with {len(state.scenarios)} scenarios",
+        f"Starting manual-test {state.name} with {len(state.scenarios)} scenarios{resumed}",
         log_path,
         audit_path,
     )
 
+    try:
+        await _run_manual_phases(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            tmux=tmux,
+            plan_content=plan_content,
+            log_path=log_path,
+            audit_path=audit_path,
+            model=model,
+            policy=policy,
+        )
+    except ManualRunPaused as exc:
+        state.paused_from = state.status
+        state.status = "paused"
+        state.last_error = str(exc)
+        # A pause during coverage must not re-render the matrix coverage edited.
+        save_manual_state(state, conductor_dir, write_markdown=state.paused_from != "coverage")
+        report = write_manual_report(state, conductor_dir)
+        _log(
+            "MANUAL_TEST_PAUSED",
+            f"Manual-test paused: {exc}",
+            log_path,
+            audit_path,
+            error=str(exc),
+            report=str(report),
+        )
+        _print_banner(
+            f"MANUAL TEST PAUSED: {state.name}",
+            [
+                f"Reason: {exc}",
+                "Re-run the same `conductor manual-test` command to resume.",
+                f"Report: {report}",
+            ],
+        )
+        return
+
+    failed = sum(1 for s in state.scenarios if s.status == "failed")
+    blocked = sum(1 for s in state.scenarios if s.status == "blocked")
+    violations = sum(1 for s in state.scenarios if s.status == "policy_violation")
+    state.status = "completed" if failed == 0 and blocked == 0 and violations == 0 else "failed"
+    save_manual_state(state, conductor_dir)
+    report = write_manual_report(state, conductor_dir)
+
+    _log(
+        "MANUAL_TEST_DONE",
+        f"Manual-test finished: {state.status}; report {report}",
+        log_path,
+        audit_path,
+        report=str(report),
+    )
+    _print_banner(
+        f"MANUAL TEST COMPLETE: {state.name}",
+        [f"Status: {state.status}", f"Report: {report}"],
+    )
+
+
+def _print_banner(title: str, lines: list[str]) -> None:
+    sep = "=" * 50
+    print(f"\n{sep}", file=sys.stderr)
+    print(f"  {title}", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    print(f"{sep}\n", file=sys.stderr)
+
+
+async def _run_manual_phases(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    tmux: "TmuxManager",
+    plan_content: str,
+    log_path: Path,
+    audit_path: Path,
+    model: str,
+    policy: ManualTestPolicy,
+) -> None:
+    """Coverage, then retries of open findings, then every open scenario.
+
+    Raises ManualRunPaused to stop early; state is resumable at that point.
+    """
     if state.status in {"pending", "coverage"}:
         state.status = "coverage"
         save_manual_state(state, conductor_dir, write_markdown=False)
-        signal, output_text = await _run_generation(
+        signal, output_text = await _run_generation_retrying(
             state=state,
             project_dir=project_dir,
             conductor_dir=conductor_dir,
@@ -1898,6 +2934,7 @@ async def _manual_main(
             audit_path=audit_path,
             write_markdown_on_finish=False,
             policy=policy,
+            fatal_scope="none",
         )
         generation = state.generations[-1]
         if not signal.valid:
@@ -1909,9 +2946,10 @@ async def _manual_main(
                 reason="coverage generation did not produce valid handoff signal",
                 output_text=output_text,
             )
-            state.status = "coverage"
-            save_manual_state(state, conductor_dir, write_markdown=False)
-            return
+            raise ManualRunPaused(
+                "coverage generation did not produce a valid handoff signal: "
+                + "; ".join(signal.errors)
+            )
         scenarios_text = manual_scenarios_path(conductor_dir).read_text(encoding="utf-8")
         discovered = parse_scenarios_from_markdown(scenarios_text)
         if discovered:
@@ -1919,7 +2957,22 @@ async def _manual_main(
         state.status = "running"
         save_manual_state(state, conductor_dir)
 
-    # Fix existing open findings from prior runs before processing new scenarios.
+    # Finish verifications a stopped run left behind, then retry open findings
+    # from prior runs, before processing new scenarios.
+    for finding in list(state.findings):
+        if finding.status == "fixed":
+            await _resume_verification(
+                state=state,
+                project_dir=project_dir,
+                conductor_dir=conductor_dir,
+                tmux=tmux,
+                plan_content=plan_content,
+                finding=finding,
+                log_path=log_path,
+                audit_path=audit_path,
+                model=model,
+                policy=policy,
+            )
     for finding in list(state.findings):
         if _should_fix_finding(finding):
             _log(
@@ -1952,19 +3005,25 @@ async def _manual_main(
         scenario.started_at = scenario.started_at or datetime.now(timezone.utc)
         save_manual_state(state, conductor_dir)
 
-        signal, output_text = await _run_generation(
-            state=state,
-            project_dir=project_dir,
-            conductor_dir=conductor_dir,
-            tmux=tmux,
-            prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir, policy=policy),
-            label=f"scenario-{scenario.index}",
-            model=model,
-            scenario=scenario,
-            log_path=log_path,
-            audit_path=audit_path,
-            policy=policy,
-        )
+        try:
+            signal, output_text = await _run_generation_retrying(
+                state=state,
+                project_dir=project_dir,
+                conductor_dir=conductor_dir,
+                tmux=tmux,
+                prompt=build_scenario_prompt(state, plan_content, scenario, conductor_dir, policy=policy),
+                label=f"scenario-{scenario.index}",
+                model=model,
+                scenario=scenario,
+                log_path=log_path,
+                audit_path=audit_path,
+                policy=policy,
+            )
+        except ManualRunPaused:
+            # Claude never ran the scenario; this was not an attempt.
+            scenario.attempts -= 1
+            scenario.status = "pending"
+            raise
         generation = state.generations[-1]
         _apply_signal_to_scenario(
             state=state,
@@ -1992,25 +3051,3 @@ async def _manual_main(
                 model=model,
                 policy=policy,
             )
-
-    failed = sum(1 for s in state.scenarios if s.status == "failed")
-    blocked = sum(1 for s in state.scenarios if s.status == "blocked")
-    policy = sum(1 for s in state.scenarios if s.status == "policy_violation")
-    state.status = "completed" if failed == 0 and blocked == 0 and policy == 0 else "failed"
-    save_manual_state(state, conductor_dir)
-    report = write_manual_report(state, conductor_dir)
-
-    _log(
-        "MANUAL_TEST_DONE",
-        f"Manual-test finished: {state.status}; report {report}",
-        log_path,
-        audit_path,
-        report=str(report),
-    )
-
-    sep = "=" * 50
-    print(f"\n{sep}", file=sys.stderr)
-    print(f"  MANUAL TEST COMPLETE: {state.name}", file=sys.stderr)
-    print(f"  Status: {state.status}", file=sys.stderr)
-    print(f"  Report: {report}", file=sys.stderr)
-    print(f"{sep}\n", file=sys.stderr)
