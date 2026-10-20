@@ -1890,14 +1890,35 @@ async def advance_run(
         # Post-run validation on last stage's worktree
         last_wt = run.stages[-1].worktree if run.stages else None
         if last_wt:
-            from conductor.core.validation import ValidationContext, validate_and_fix  # noqa: PLC0415
+            from conductor.core.validation import (  # noqa: PLC0415
+                ValidationContext,
+                commit_validation_fixes,
+                validate_and_fix,
+            )
 
             vctx = ValidationContext(
                 project_dir=Path(last_wt),
                 stage="post-run",
                 feature_name=run.name,
+                state=state,
+                preset=preset,
             )
             vresult = await validate_and_fix(vctx, max_attempts=2)
+            # Integration and the single-run PR use the stage branch, not the
+            # worktree: commit what the fix sessions changed.
+            if vresult.fix_attempts and not await commit_validation_fixes(
+                Path(last_wt),
+                f"Apply post-run validation fixes for {run.name}\n\n{vresult.summary}",
+                keep_untracked=vresult.untracked_before_fix,
+            ):
+                _log(
+                    "VALIDATION_WARNING",
+                    f"Post-run fix sessions for {run.name} left nothing committed",
+                    log_path,
+                    audit_path,
+                    run=run_idx,
+                    name=run.name,
+                )
             if not vresult.passed:
                 _log(
                     "VALIDATION_WARNING",

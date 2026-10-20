@@ -10,15 +10,16 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from conductor.core.claude import run_claude
-from conductor.core.presets import CommandSpec, ValidationSettings, load_preset
+from conductor.core.presets import CommandSpec, Preset, ValidationSettings, load_preset
 
 if TYPE_CHECKING:
-    from conductor.core.models import ConductorState
+    from conductor.core.models import ConductorState, E2ETestState
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ class ValidationContext:
     stage: str  # "post-runner" | "post-run" | "integration"
     feature_name: str
     state: ConductorState | None = None
+    # The project's preset, loaded by the caller from the repo root. Without it
+    # the preset is loaded by state.preset from project_dir, a worktree that may
+    # lack an uncommitted .conductor/preset.toml.
+    preset: Preset | None = None
 
 
 @dataclass
@@ -41,6 +46,7 @@ class CheckResult:
     passed: bool
     output: str  # last 2000 chars
     duration_s: float
+    e2e: E2ETestState | None = None  # integration-tests only: the Playwright counts
 
 
 @dataclass
@@ -48,6 +54,10 @@ class ValidationResult:
     passed: bool
     checks: list[CheckResult] = field(default_factory=list)
     summary: str = ""
+    # Set by validate_and_fix: Claude fix sessions run, and the untracked files
+    # that existed before the first one (commit_validation_fixes leaves them out).
+    fix_attempts: int = 0
+    untracked_before_fix: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +66,20 @@ class ValidationResult:
 
 
 async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
-    """Run command, return (exit_code, combined_output_last_2000_chars)."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd),
-    )
+    """Run command, return (exit_code, combined_output_last_2000_chars).
+
+    A command that cannot be started (missing binary or cwd) is reported as
+    exit 127 instead of raising.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+        )
+    except OSError as exc:
+        return 127, f"cannot run {cmd[0]}: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -74,6 +91,84 @@ async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]
     return proc.returncode or 0, combined[-2000:]
 
 
+async def _git(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run git, return (exit_code, stdout + stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd),
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, (stdout + stderr).decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Committing fixes
+# ---------------------------------------------------------------------------
+
+# Untracked paths that are output of the checks themselves (reports, builds,
+# caches) or may hold secrets. commit_validation_fixes never stages them.
+_CHECK_OUTPUT_DIRS = frozenset({
+    "node_modules", "test-results", "playwright-report", "blob-report", "coverage",
+    "dist", "build", "__pycache__", ".pytest_cache", ".phpunit.cache", ".cache",
+})
+
+
+def _is_check_output(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    name = parts[-1]
+    return (
+        any(part in _CHECK_OUTPUT_DIRS for part in parts[:-1])
+        or name.startswith(".env")
+        or name.endswith((".log", ".result.cache"))
+    )
+
+
+async def untracked_files(project_dir: Path) -> set[str]:
+    """Untracked, non-ignored files in *project_dir*, relative to it."""
+    rc, out = await _git(["ls-files", "--others", "--exclude-standard", "-z"], project_dir)
+    if rc != 0:
+        return set()
+    return {p for p in out.split("\0") if p}
+
+
+async def commit_validation_fixes(
+    project_dir: Path,
+    message: str,
+    *,
+    keep_untracked: Collection[str] = (),
+) -> bool:
+    """Commit what validate_and_fix's Claude sessions changed in *project_dir*.
+
+    Stages tracked modifications plus the untracked files that are new, i.e.
+    not in *keep_untracked* (pass ValidationResult.untracked_before_fix) and
+    not check output (_is_check_output). Hooks are bypassed (--no-verify), as
+    for every commit conductor makes outside the runner: validation has just
+    run the project's checks on this tree, and a hook that needs tooling the
+    worktree lacks (husky without node_modules) must not strand the fix.
+
+    Returns True when a commit was made.
+    """
+    await _git(["add", "-u"], project_dir)
+    new_files = sorted(
+        p
+        for p in await untracked_files(project_dir)
+        if p not in keep_untracked and not _is_check_output(p)
+    )
+    if new_files:
+        await _git(["add", "--", *new_files], project_dir)
+    rc, _ = await _git(["diff", "--cached", "--quiet"], project_dir)
+    if rc == 0:
+        return False  # the fix sessions changed nothing committable
+    rc, out = await _git(["commit", "--no-verify", "-m", message], project_dir)
+    if rc != 0:
+        logger.error("Committing validation fixes in %s failed: %s", project_dir, out.strip())
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Individual check implementations
 # ---------------------------------------------------------------------------
@@ -81,6 +176,8 @@ async def _run_cmd(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]
 
 def _preset_validation(ctx: ValidationContext) -> ValidationSettings:
     """Validation hooks from the project's preset (base defaults when unavailable)."""
+    if ctx.preset is not None:
+        return ctx.preset.validation
     name = ctx.state.preset if ctx.state else None
     try:
         return load_preset(name, ctx.project_dir).validation
@@ -176,8 +273,22 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
             duration_s=time.monotonic() - start,
         )
 
-    # Generic fallback: generate and run Playwright smoke test
-    from conductor.core.smoke_test import generate_smoke_test  # noqa: PLC0415
+    # Generic fallback, opt-in: a generated Playwright smoke test, run only when
+    # the project has a Playwright setup (see playwright_unavailable).
+    from conductor.core.smoke_test import (  # noqa: PLC0415
+        generate_smoke_test,
+        playwright_unavailable,
+    )
+
+    reason = playwright_unavailable(ctx.project_dir)
+    if reason:
+        logger.warning("Smoke check skipped: %s", reason)
+        return CheckResult(
+            name="smoke",
+            passed=True,
+            output=f"skipped: {reason}",
+            duration_s=time.monotonic() - start,
+        )
 
     smoke_src = generate_smoke_test(ctx.project_dir)
     spec_path = (
@@ -186,8 +297,9 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
     spec_path.parent.mkdir(parents=True, exist_ok=True)
     spec_path.write_text(smoke_src, encoding="utf-8")
 
+    # --no: never let npx download Playwright
     exit_code, output = await _run_cmd(
-        ["npx", "playwright", "test", str(spec_path)],
+        ["npx", "--no", "playwright", "test", str(spec_path)],
         cwd=ctx.project_dir,
         timeout=300,
     )
@@ -200,41 +312,20 @@ async def _check_smoke(ctx: ValidationContext) -> CheckResult:
 
 
 async def _check_integration_tests(ctx: ValidationContext) -> CheckResult:
+    """Run the conductor integration specs already in the project (the
+    integration merge generates them); skipped when there are none."""
     start = time.monotonic()
 
     # Lazy import to avoid circular imports
-    from conductor.integration.e2e import run_integration_testing  # noqa: PLC0415
+    from conductor.integration.e2e import run_integration_specs  # noqa: PLC0415
 
-    if ctx.state is None:
-        return CheckResult(
-            name="integration-tests",
-            passed=False,
-            output="ValidationContext.state is required for integration-tests check",
-            duration_s=time.monotonic() - start,
-        )
-
-    # run_integration_testing expects a storage object with a .repo_root attribute.
-    # Adapt ctx.project_dir into that interface.
-    class _StorageAdapter:
-        def __init__(self, path: Path) -> None:
-            self.repo_root = str(path)
-
-    e2e_state = await run_integration_testing(
-        ctx.state, _StorageAdapter(ctx.project_dir), ctx.project_dir
-    )
-
-    passed = e2e_state.failed == 0
-    summary_parts = [
-        f"passed={e2e_state.passed}",
-        f"failed={e2e_state.failed}",
-        f"skipped={e2e_state.skipped}",
-    ]
-    output = ", ".join(summary_parts)
+    e2e_state, output = await run_integration_specs(ctx.project_dir)
     return CheckResult(
         name="integration-tests",
-        passed=passed,
+        passed=e2e_state.failed == 0,
         output=output,
         duration_s=time.monotonic() - start,
+        e2e=e2e_state,
     )
 
 
@@ -368,12 +459,20 @@ async def run_validation(
 async def validate_and_fix(
     ctx: ValidationContext,
     max_attempts: int = 3,
+    checks: list[str] | None = None,
 ) -> ValidationResult:
     """Run validation, and if it fails, ask Claude to fix the code, then retry.
 
-    Loops up to *max_attempts* times. Returns the final ValidationResult.
+    Loops up to *max_attempts* times; every attempt runs *checks* (default:
+    detect_checks). Returns the final ValidationResult. The fixes are left
+    uncommitted; callers commit them with commit_validation_fixes when
+    result.fix_attempts > 0. Once a fix session has started, an exception
+    ends the loop with a failed result instead of propagating; only the
+    first validation run can raise.
     """
-    result = await run_validation(ctx)
+    result = await run_validation(ctx, checks)
+    fix_attempts = 0
+    untracked_before: frozenset[str] = frozenset()
 
     for attempt in range(1, max_attempts + 1):
         if result.passed:
@@ -383,7 +482,7 @@ async def validate_and_fix(
                 max_attempts,
                 result.summary,
             )
-            return result
+            break
 
         logger.warning(
             "Validation failed on attempt %d/%d: %s",
@@ -410,16 +509,32 @@ async def validate_and_fix(
             f"Attempt: {attempt}/{max_attempts}\n"
         )
 
+        if fix_attempts == 0:
+            untracked_before = frozenset(await untracked_files(ctx.project_dir))
         logger.info(
             "Asking Claude to fix failures (attempt %d/%d)…", attempt, max_attempts
         )
-        await run_claude(
-            prompt,
-            model="claude-opus-4-8[1m]",
-            max_turns=30,
-            cwd=str(ctx.project_dir),
-        )
+        # Counted before it runs: a session that crashes may have edited files.
+        fix_attempts += 1
+        try:
+            await run_claude(
+                prompt,
+                model="claude-opus-4-8[1m]",
+                max_turns=30,
+                cwd=str(ctx.project_dir),
+            )
+            result = await run_validation(ctx, checks)
+        except Exception as exc:
+            # Raising would lose fix_attempts, and with it the caller's commit
+            # of the edits made so far (the integration worktree is removed).
+            logger.exception("Fix attempt %d/%d crashed", attempt, max_attempts)
+            result = ValidationResult(
+                passed=False,
+                checks=result.checks,
+                summary=f"{result.summary}; fix attempt {attempt} crashed: {exc}",
+            )
+            break
 
-        result = await run_validation(ctx)
-
+    result.fix_attempts = fix_attempts
+    result.untracked_before_fix = untracked_before
     return result

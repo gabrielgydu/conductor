@@ -1,43 +1,44 @@
-"""Integration E2E testing — generates and runs cross-feature tests."""
+"""Integration E2E testing — generates and runs cross-feature tests.
+
+The integration merge has Claude generate the specs once
+(generate_integration_tests); the "integration-tests" validation check
+runs them (run_integration_specs), so validate_and_fix retries execute the
+same specs instead of regenerating them.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-import subprocess
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 from conductor.core.claude import run_claude
-from conductor.core.enums import IntegrationStatus
-from conductor.core.models import ConductorState, E2ETestState
+from conductor.core.models import ConductorState, ConflictRecord, E2ETestState, RunState
+from conductor.core.smoke_test import playwright_unavailable
 
 logger = logging.getLogger(__name__)
 
-# Test framework config files that indicate E2E test capability
-_FRAMEWORK_CONFIGS = [
-    "playwright.config.ts",
-    "playwright.config.js",
-    "playwright.config.mjs",
-    "cypress.config.ts",
-    "cypress.config.js",
-    "cypress.config.mjs",
-]
+INTEGRATION_SPECS = (
+    "tests/Playwright/tests/conductor-integration.spec.ts",
+    "tests/Playwright/tests/conductor-api-integration.spec.ts",
+)
+_SPEC_TIMEOUT_S = 1800
 
 
-def _has_test_framework(repo_root: Path, branch: str) -> bool:
-    """Check if the integration branch has an E2E test framework config."""
-    result = subprocess.run(
-        ["git", "ls-tree", "--name-only", branch],
-        capture_output=True,
-        text=True,
-        cwd=str(repo_root),
+async def _git(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run git, return (exit_code, stdout)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        cwd=str(cwd),
     )
-    if result.returncode != 0:
-        return False
-    files = set(result.stdout.splitlines())
-    return any(cfg in files for cfg in _FRAMEWORK_CONFIGS)
+    stdout, _ = await proc.communicate()
+    return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
 
 
 def _parse_test_results(stdout: str) -> tuple[int, int, int]:
@@ -55,40 +56,28 @@ def _parse_test_results(stdout: str) -> tuple[int, int, int]:
     return passed, failed, skipped
 
 
-async def run_integration_testing(
+async def generate_integration_tests(
     state: ConductorState,
-    storage,  # StorageResolver or FakeStorage
     worktree_path: Path,
-) -> E2ETestState:
-    """Generate and run E2E tests on the integration worktree.
+    runs: Sequence[RunState],
+    conflicts_resolved: Sequence[ConflictRecord],
+) -> bool:
+    """Have Claude write cross-feature specs into the worktree, and commit them.
 
-    Returns E2ETestState — never raises on test failures.
+    *runs* and *conflicts_resolved* come from the merge in progress: only the
+    runs actually on the branch, so no spec targets a feature that is not
+    there. Skipped (False) when the worktree has no Playwright setup to run
+    them. Returns True when at least one spec exists afterwards. Never raises
+    on Claude failures.
     """
-    # Must have a completed integration merge
-    if state.integration is None or state.integration.status != IntegrationStatus.DONE:
-        return E2ETestState(skipped=1)
-
-    # Check if playwright is available
-    try:
-        check = await asyncio.create_subprocess_exec(
-            "npx",
-            "playwright",
-            "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(worktree_path),
-        )
-        await check.communicate()
-        if check.returncode != 0:
-            logger.info("Playwright not available — skipping integration tests")
-            return E2ETestState(skipped=1)
-    except FileNotFoundError:
-        logger.info("npx not found — skipping integration tests")
-        return E2ETestState(skipped=1)
+    reason = playwright_unavailable(worktree_path)
+    if reason:
+        logger.warning("Integration E2E generation skipped: %s", reason)
+        return False
 
     # Build run context
     run_context_parts = []
-    for run in state.runs:
+    for run in runs:
         part = f"## Run {run.index}: {run.name}\n{run.description}"
         if run.constitution:
             part += "\nConstitution rules:\n" + "\n".join(
@@ -98,23 +87,15 @@ async def run_integration_testing(
     run_context = "\n\n".join(run_context_parts)
 
     # Build conflict context
-    conflict_context = ""
-    if state.integration and state.integration.conflicts_resolved:
-        conflict_lines = []
-        for cr in state.integration.conflicts_resolved:
-            conflict_lines.append(
-                f"- {cr.file}: conflict between {cr.feature_a} and {cr.feature_b} ({cr.description})"
-            )
-        conflict_context = "\n".join(conflict_lines)
+    conflict_context = "\n".join(
+        f"- {cr.file}: conflict between {cr.feature_a} and {cr.feature_b} ({cr.description})"
+        for cr in conflicts_resolved
+    )
 
     # Git diff --stat against base branch
-    diff_result = subprocess.run(
-        ["git", "diff", "--stat", f"{state.base_branch}...HEAD"],
-        capture_output=True,
-        text=True,
-        cwd=str(worktree_path),
-    )
-    diff_stat = diff_result.stdout if diff_result.returncode == 0 else ""
+    rc, diff_stat = await _git(["diff", "--stat", f"{state.base_branch}...HEAD"], worktree_path)
+    if rc != 0:
+        diff_stat = ""
 
     prompt = f"""You are in the integration worktree of a project where multiple features were developed in parallel and merged together. Your job is to write integration tests that verify the features work correctly TOGETHER — not individually.
 
@@ -136,8 +117,8 @@ async def run_integration_testing(
    - Event/notification chains crossing feature boundaries
 3. Write Playwright tests for cross-feature UI flows
 4. Write API tests (using fetch/HTTP requests) for cross-feature backend interactions
-5. Put Playwright tests in: tests/Playwright/tests/conductor-integration.spec.ts
-6. Put API tests in: tests/Playwright/tests/conductor-api-integration.spec.ts
+5. Put Playwright tests in: {INTEGRATION_SPECS[0]}
+6. Put API tests in: {INTEGRATION_SPECS[1]}
 7. Do NOT test features in isolation — only test interactions
 8. Do NOT duplicate tests that exist in individual feature branches
 9. Each test should have a clear name describing which features interact
@@ -154,59 +135,93 @@ async def run_integration_testing(
         )
     except Exception:
         logger.exception("Claude test generation failed")
-        return E2ETestState(skipped=1)
+        return False
+
+    specs = _existing_specs(worktree_path)
+    if not specs:
+        logger.warning("Integration E2E generation wrote no spec file")
+        return False
 
     # Commit generated tests
-    subprocess.run(
-        [
-            "git",
-            "add",
-            "tests/Playwright/tests/conductor-integration.spec.ts",
-            "tests/Playwright/tests/conductor-api-integration.spec.ts",
-        ],
-        cwd=str(worktree_path),
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "Add conductor integration tests", "--no-verify"],
-        cwd=str(worktree_path),
-        capture_output=True,
-    )
+    await _git(["add", "--", *specs], worktree_path)
+    await _git(["commit", "-m", "Add conductor integration tests", "--no-verify"], worktree_path)
+    return True
 
-    # Run the tests
-    test_files = [
-        "tests/Playwright/tests/conductor-integration.spec.ts",
-        "tests/Playwright/tests/conductor-api-integration.spec.ts",
-    ]
+
+def _existing_specs(worktree_path: Path) -> list[str]:
+    return [spec for spec in INTEGRATION_SPECS if (worktree_path / spec).is_file()]
+
+
+async def run_integration_specs(worktree_path: Path) -> tuple[E2ETestState, str]:
+    """Run the integration specs present in the worktree; never generates any.
+
+    Returns the counts and a summary plus the tail of the runner's output. A
+    spec run that exits non-zero without reporting a failed test (no tests
+    found, webServer timeout, syntax error) counts as one failure.
+    """
+    specs = _existing_specs(worktree_path)
+    if not specs:
+        return E2ETestState(skipped=1), "skipped: no conductor integration specs"
+    reason = playwright_unavailable(worktree_path)
+    if reason:
+        return E2ETestState(skipped=1), f"skipped: {reason}"
+
     total_passed = total_failed = total_skipped = 0
-
-    try:
-        for tf in test_files:
-            test_path = worktree_path / tf
-            if not test_path.exists():
-                continue
+    outputs = []
+    for spec in specs:
+        try:
+            # --no: never let npx download Playwright
             proc = await asyncio.create_subprocess_exec(
                 "npx",
+                "--no",
                 "playwright",
                 "test",
-                tf,
+                spec,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
                 cwd=str(worktree_path),
             )
-            stdout_bytes, stderr_bytes = await proc.communicate()
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-            p, f, s = _parse_test_results(stdout_text)
-            total_passed += p
-            total_failed += f
-            total_skipped += s
-    except Exception:
-        logger.exception("E2E test execution failed")
-        return E2ETestState(skipped=1)
+        except OSError as exc:
+            total_failed += 1
+            outputs.append(f"{spec}: cannot run npx: {exc}")
+            continue
+        try:
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), _SPEC_TIMEOUT_S)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            total_failed += 1
+            outputs.append(f"{spec}: timed out after {_SPEC_TIMEOUT_S}s")
+            continue
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        p, f, s = _parse_test_results(stdout_text)
+        if proc.returncode != 0 and f == 0:
+            f = 1
+        total_passed += p
+        total_failed += f
+        total_skipped += s
+        outputs.append(f"{spec} (exit {proc.returncode}):\n{stdout_text[-1500:]}")
 
-    return E2ETestState(
+    e2e = E2ETestState(
         passed=total_passed,
         failed=total_failed,
         skipped=total_skipped,
         last_run_at=datetime.now(timezone.utc),
     )
+    summary = f"passed={e2e.passed}, failed={e2e.failed}, skipped={e2e.skipped}"
+    return e2e, "\n".join([summary, *outputs])[-2000:]
+
+
+async def run_integration_testing(
+    state: ConductorState,
+    storage,  # StorageResolver or FakeStorage
+    worktree_path: Path,
+) -> E2ETestState:
+    """Generate the integration specs, then run them (both steps in one call).
+
+    Returns E2ETestState — never raises on test failures.
+    """
+    conflicts = state.integration.conflicts_resolved if state.integration else []
+    await generate_integration_tests(state, worktree_path, state.runs, conflicts)
+    e2e, _ = await run_integration_specs(worktree_path)
+    return e2e

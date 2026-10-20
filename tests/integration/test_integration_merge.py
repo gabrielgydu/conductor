@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "tests"))
 
 from conductor.core.enums import IntegrationStatus, RunStatus
 from conductor.core.models import ConductorState, RunState, StageState
+from conductor.integration.e2e import generate_integration_tests as _real_generate
 from conductor.integration.merge import run_integration_merge
 
 # No real Claude / npx / gh-retry sleeps; see tests/integration/conftest.py.
@@ -44,6 +45,26 @@ def _done_run_with_branch(index: int, name: str, branch: str) -> RunState:
 def _project_name(tmp_path: Path) -> str:
     """Unique short project name safe for git branch names."""
     return f"it{abs(hash(str(tmp_path))) % 999999:06d}"
+
+
+def _worktree_list(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def _install_failing_hooks(repo: Path, hooks: Path) -> None:
+    """Point the repo (and its worktrees) at hooks that all exit 1."""
+    hooks.mkdir()
+    for hook in ("pre-commit", "pre-merge-commit", "commit-msg"):
+        (hooks / hook).write_text("#!/bin/sh\nexit 1\n")
+        (hooks / hook).chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", str(hooks)], check=True
+    )
 
 
 def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
@@ -105,61 +126,103 @@ async def test_full_merge_real_git(real_merge_repo, tmp_path, hermetic_merge):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Conflict resolved with -X theirs
+# Test 2: Content conflicts go to Claude; -X theirs is a recorded last resort
 # ---------------------------------------------------------------------------
 
 
+def _same_line_conflict(repo) -> None:
+    """main has app.txt; conflict-a and conflict-b both rewrite line 2."""
+    (repo.path / "app.txt").write_text("l1\nl2\nl3\nl4\nl5\n")
+    subprocess.run(["git", "-C", str(repo.path), "add", "app.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo.path), "commit", "-q", "-m", "add app"], check=True
+    )
+    repo.create_branch("conflict-a", {"app.txt": "l1\nA-feature\nl3\nl4\nl5\n"})
+    repo.create_branch("conflict-b", {"app.txt": "l1\nB-feature\nl3\nl4\nB-l5\n"})
+
+
+def _show(repo, ref: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo.path), "show", ref],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
 @pytest.mark.asyncio
-async def test_conflict_theirs_real_git(real_merge_repo, tmp_path):
-    """Both branches modify same line → -X theirs resolves conflict."""
-    # Add shared.txt to main
-    shared = real_merge_repo.path / "shared.txt"
-    shared.write_text("original content\n")
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True,
-        capture_output=True,
-    )
+async def test_content_conflict_goes_to_claude(real_merge_repo, tmp_path):
+    """A same-line conflict reaches Claude with the markers still in the tree."""
+    from conductor.integration import merge as merge_module
 
-    real_merge_repo.create_branch(
-        "conflict-a", {"shared.txt": "version from branch-a\n"}
-    )
-    real_merge_repo.create_branch(
-        "conflict-b", {"shared.txt": "version from branch-b\n"}
-    )
-
+    _same_line_conflict(real_merge_repo)
     project_name = _project_name(tmp_path)
     state = _make_state(
         tmp_path,
         _done_run_with_branch(0, "feat-a", "conflict-a"),
         _done_run_with_branch(1, "feat-b", "conflict-b"),
     )
-    storage = FakeStorage(real_merge_repo.path)
+    seen: list[tuple[list[str], str]] = []
 
-    with patch(
-        "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+    async def claude_merges_both(conflicting_files, run_description, cwd):
+        seen.append((conflicting_files, (cwd / "app.txt").read_text()))
+        (cwd / "app.txt").write_text("l1\nA-feature\nB-feature\nl3\nl4\nB-l5\n")
+        return True
+
+    with patch.object(
+        merge_module, "resolve_conflicts_with_claude", side_effect=claude_merges_both
     ):
-        result = await run_integration_merge(state, storage)
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
+    [(files, content)] = seen
+    assert files == ["app.txt"]
+    assert "<<<<<<<" in content and ">>>>>>>" in content
     assert result.status == IntegrationStatus.DONE
-    assert 0 in result.merged_runs
-    assert 1 in result.merged_runs
-
-    # "Theirs" (conflict-b) content should win
-    branch_name = f"integration/{project_name}"
-    show = subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "show", f"{branch_name}:shared.txt"],
-        capture_output=True,
-        text=True,
+    assert result.merged_runs == [0, 1]
+    [record] = result.conflicts_resolved
+    assert (record.file, record.feature_a, record.feature_b) == ("app.txt", "feat-a", "feat-b")
+    assert result.conflicts_unresolved == []
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == (
+        "l1\nA-feature\nB-feature\nl3\nl4\nB-l5\n"
     )
-    assert "version from branch-b" in show.stdout
+
+
+@pytest.mark.asyncio
+async def test_theirs_fallback_is_recorded_as_unresolved(real_merge_repo, tmp_path):
+    """When Claude fails, -X theirs drops feat-a's hunk: that must not look clean."""
+    from conductor.integration import merge as merge_module
+
+    _same_line_conflict(real_merge_repo)
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "conflict-a"),
+        _done_run_with_branch(1, "feat-b", "conflict-b"),
+    )
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch.object(
+        merge_module, "resolve_conflicts_with_claude", AsyncMock(return_value=False)
+    ):
+        with patch("conductor.integration.merge._run_git_gh", gh):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0, 1]
+    assert result.conflicts_resolved == []
+    [record] = result.conflicts_unresolved
+    assert (record.file, record.feature_a, record.feature_b) == ("app.txt", "feat-a", "feat-b")
+    assert record.description.startswith("theirs overwrote feat-a")
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == (
+        "l1\nB-feature\nl3\nl4\nB-l5\n"
+    )
+    pr_create = [c.args[0] for c in gh.await_args_list if c.args[0][:3] == ["gh", "pr", "create"]]
+    assert pr_create and all("--draft" in args for args in pr_create)
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +449,678 @@ async def test_validation_failure_marks_needs_fix(
 
     assert result.status == IntegrationStatus.NEEDS_FIX
     assert result.merged_runs == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Fixes made by post-merge validation reach the integration branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermetic_merge):
+    """Claude's fix sessions edit the worktree; the branch must carry the fix."""
+    from conductor.core.validation import ValidationResult
+
+    real_merge_repo.create_branch("fx-a", {"app.txt": "broken\n"})
+    real_merge_repo.create_branch("fx-b", {"other.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "fx-a"),
+        _done_run_with_branch(1, "feat-b", "fx-b"),
+    )
+
+    smoke_spec = "tests/Playwright/tests/conductor-smoke.spec.ts"
+
+    async def validate_with_fix(vctx, max_attempts):
+        (vctx.project_dir / "app.txt").write_text("fixed\n")
+        (vctx.project_dir / "helper.txt").write_text("added by the fix\n")
+        # The smoke check writes its spec; merge.py commits it after the fixes.
+        (vctx.project_dir / smoke_spec).parent.mkdir(parents=True)
+        (vctx.project_dir / smoke_spec).write_text("// smoke\n")
+        return ValidationResult(passed=True, summary="1/1 checks passed", fix_attempts=1)
+
+    hermetic_merge.validate.side_effect = validate_with_fix
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    branch_name = f"integration/{project_name}"
+
+    def show(path: str, repo: Path = real_merge_repo.path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "show", f"{branch_name}:{path}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    assert show("app.txt") == "fixed\n"
+    assert show("helper.txt") == "added by the fix\n"
+    # One push, after every commit: origin has the fix and the spec commit.
+    assert show("app.txt", real_merge_repo.origin) == "fixed\n"
+    assert show(smoke_spec, real_merge_repo.origin) == "// smoke\n"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Default worktree location; leftovers do not keep the worktree alive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_worktree_next_to_repo_is_removed_when_dirty(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    """Without worktrees_base the worktree goes beside the repo (not /tmp) and is
+    force-removed even though validation left check output behind."""
+    from conductor.core.validation import ValidationResult
+
+    real_merge_repo.create_branch("dw-a", {"dw_a.txt": "a\n"})
+    real_merge_repo.create_branch("dw-b", {"dw_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = ConductorState(
+        project_name=project_name,
+        base_branch="main",
+        runs=[
+            _done_run_with_branch(0, "feat-a", "dw-a"),
+            _done_run_with_branch(1, "feat-b", "dw-b"),
+        ],
+    )
+    expected = real_merge_repo.path.parent / "worktrees" / f"integration-{project_name}"
+    validated_in: list[Path] = []
+
+    async def validate_leaving_output(vctx, max_attempts):
+        validated_in.append(vctx.project_dir)
+        (vctx.project_dir / "test-results").mkdir()
+        (vctx.project_dir / "test-results" / "trace.zip").write_text("x")
+        return ValidationResult(passed=True, summary="1/1 checks passed")
+
+    hermetic_merge.validate.side_effect = validate_leaving_output
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert validated_in == [expected]
+    assert not expected.exists()
+    assert str(expected) not in _worktree_list(real_merge_repo.path)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Runs whose branch cannot be merged are not reported as merged
+# ---------------------------------------------------------------------------
+
+
+def _unrelated_branch(repo: Path, name: str) -> None:
+    """A branch with its own root commit: git refuses to merge it."""
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "checkout", "-q", "--orphan", name], check=True)
+    subprocess.run([*git, "rm", "-rq", "--cached", "."], check=True)
+    (repo / "README.md").unlink()
+    (repo / "orphan.txt").write_text("orphan\n")
+    subprocess.run([*git, "add", "orphan.txt"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "orphan root"], check=True)
+    subprocess.run([*git, "checkout", "-q", "-f", "main"], check=True)
+
+
+@pytest.mark.asyncio
+async def test_unmergeable_runs_are_not_reported_as_merged(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    real_merge_repo.create_branch("nm-a", {"nm_a.txt": "a\n"})
+    real_merge_repo.create_branch("nm-d", {"nm_d.txt": "d\n"})
+    _unrelated_branch(real_merge_repo.path, "nm-orphan")
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "nm-a"),
+        _done_run_with_branch(1, "feat-b", "feat/does-not-exist"),
+        _done_run_with_branch(2, "feat-c", "nm-orphan"),
+        _done_run_with_branch(3, "feat-d", "nm-d"),
+    )
+    async def gh_without_remote(args, cwd):
+        return (0, "[]", "") if "list" in args else (1, "", "no remote")
+
+    gh = AsyncMock(side_effect=gh_without_remote)
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.merged_runs == [0, 3]
+    assert result.status == IntegrationStatus.PARTIAL
+    files = _show(real_merge_repo, f"integration/{project_name}:").split()
+    assert "nm_a.txt" in files and "nm_d.txt" in files and "orphan.txt" not in files
+
+    [create] = {tuple(c.args[0]) for c in gh.await_args_list if "create" in c.args[0]}
+    body = create[create.index("--body") + 1]
+    assert "- Run 1: feat-b (branch feat/does-not-exist does not exist)" in body
+    assert (
+        "- Run 2: feat-c (git merge failed: fatal: refusing to merge unrelated histories)"
+        in body
+    )
+    assert "--draft" in create
+
+
+@pytest.mark.asyncio
+async def test_no_mergeable_run_fails_without_publishing(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "gone-a"),
+        _done_run_with_branch(1, "feat-b", "gone-b"),
+    )
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.FAILED
+    assert result.merged_runs == []
+    hermetic_merge.validate.assert_not_awaited()
+    gh.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Conflict markers never reach the branch
+# ---------------------------------------------------------------------------
+
+
+def _modify_delete_conflict(repo) -> None:
+    """md-a edits other.txt and app.txt line 2; md-d deletes other.txt and edits
+    the same line, so -X theirs cannot settle it (modify/delete)."""
+    git = ["git", "-C", str(repo.path)]
+    (repo.path / "app.txt").write_text("l1\nl2\nl3\n")
+    (repo.path / "other.txt").write_text("other\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "base files"], check=True)
+    repo.create_branch("md-a", {"app.txt": "l1\nA\nl3\n", "other.txt": "other, edited\n"})
+    subprocess.run([*git, "checkout", "-q", "-b", "md-d", "main"], check=True)
+    subprocess.run([*git, "rm", "-q", "other.txt"], check=True)
+    (repo.path / "app.txt").write_text("l1\nD\nl3\n")
+    subprocess.run([*git, "commit", "-q", "-am", "md-d"], check=True)
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+
+
+@pytest.mark.parametrize(
+    "claude_leaves",
+    [
+        pytest.param(None, id="claude-fails"),
+        # Claude drops only the opening markers; ======= and >>>>>>> remain.
+        pytest.param("l1\nA\n=======\nD\n>>>>>>> md-d\nl3\n", id="partial-markers"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unresolved_conflicts_are_left_out_not_committed(
+    real_merge_repo, tmp_path, claude_leaves
+):
+    from conductor.core.claude import ClaudeResult
+
+    _modify_delete_conflict(real_merge_repo)
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "md-a"),
+        _done_run_with_branch(1, "feat-d", "md-d"),
+    )
+
+    async def fake_claude(prompt, **kwargs):
+        if claude_leaves is None:
+            return ClaudeResult(exit_code=1, output="", tokens_used=None, cost=None, duration=0)
+        (Path(kwargs["cwd"]) / "app.txt").write_text(claude_leaves)
+        (Path(kwargs["cwd"]) / "other.txt").unlink()
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    with patch("conductor.integration.merge.run_claude", side_effect=fake_claude):
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0]
+    assert sorted(c.file for c in result.conflicts_unresolved) == ["app.txt", "other.txt"]
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:app.txt") == "l1\nA\nl3\n"
+    assert _show(real_merge_repo, f"{branch}:other.txt") == "other, edited\n"
+    log = _show(real_merge_repo, branch)
+    assert "Partial merge" not in log
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Failing git hooks cannot leave a merge open or drop a run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failing_hooks_do_not_drop_a_resolved_run(real_merge_repo, tmp_path):
+    """Hooks that fail in the fresh worktree (husky without node_modules) must not
+    leave run d's resolved merge open for run e's merge to abort."""
+    from conductor.core.claude import ClaudeResult
+
+    _modify_delete_conflict(real_merge_repo)
+    real_merge_repo.create_branch("md-e", {"e.txt": "e\n"})
+    _install_failing_hooks(real_merge_repo.path, tmp_path / "hooks")
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "md-a"),
+        _done_run_with_branch(1, "feat-d", "md-d"),
+        _done_run_with_branch(2, "feat-e", "md-e"),
+    )
+    state.runs[2].depends_on = [1]  # merge order a, d, e
+
+    async def claude_resolves(prompt, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        (cwd / "app.txt").write_text("l1\nA+D\nl3\n")
+        (cwd / "other.txt").unlink()
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    with patch("conductor.integration.merge.run_claude", side_effect=claude_resolves):
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert result.merged_runs == [0, 1, 2]
+    assert sorted(c.file for c in result.conflicts_resolved) == ["app.txt", "other.txt"]
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:app.txt") == "l1\nA+D\nl3\n"
+    assert _show(real_merge_repo, f"{branch}:e.txt") == "e\n"
+    files = _show(real_merge_repo, f"{branch}:").split()
+    assert "other.txt" not in files
+
+
+# ---------------------------------------------------------------------------
+# Test 12: A crash in validation does not cost the push, the PR or cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_crash_still_publishes(real_merge_repo, tmp_path, hermetic_merge):
+    real_merge_repo.create_branch("vc-a", {"vc_a.txt": "a\n"})
+    real_merge_repo.create_branch("vc-b", {"vc_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "vc-a"),
+        _done_run_with_branch(1, "feat-b", "vc-b"),
+    )
+    hermetic_merge.validate.side_effect = FileNotFoundError("npx")
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch("conductor.integration.merge._run_git_gh", gh):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX
+    assert result.merged_runs == [0, 1]
+    assert any(c.args[0][:3] == ["gh", "pr", "create"] for c in gh.await_args_list)
+    assert not (tmp_path / "worktrees" / f"integration-{project_name}").exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Integration specs are generated once, run by validation, recorded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_integration_specs_generated_once_and_results_recorded(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    from conductor.core.models import E2ETestState
+    from conductor.core.validation import CheckResult, ValidationResult
+
+    real_merge_repo.create_branch("e2e-a", {"e2e_a.txt": "a\n"})
+    real_merge_repo.create_branch("e2e-b", {"e2e_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "e2e-a"),
+        _done_run_with_branch(1, "feat-b", "e2e-b"),
+        _done_run_with_branch(2, "feat-gone", "no-such-branch"),
+    )
+    counts = E2ETestState(passed=4, failed=1)
+    order = []
+
+    async def validate(ctx, max_attempts):
+        order.append("validate")
+        return ValidationResult(
+            passed=False,
+            checks=[CheckResult("integration-tests", False, "1 failed", 0.0, e2e=counts)],
+            summary="0/1 checks passed. Failed: integration-tests",
+        )
+
+    hermetic_merge.e2e.side_effect = lambda *a, **k: order.append("generate")
+    hermetic_merge.validate.side_effect = validate
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert order == ["generate", "validate"]
+    hermetic_merge.e2e.assert_awaited_once()
+    _, _, runs, conflicts = hermetic_merge.e2e.await_args.args
+    assert [r.name for r in runs] == ["feat-a", "feat-b"]  # not the unmerged run
+    assert conflicts == []
+    assert result.e2e == counts
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Post-merge validation uses the preset from the repo root
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_gets_the_uncommitted_project_preset(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    """An uncommitted .conductor/preset.toml is not in the integration worktree, so
+    loading the preset there fell back to base validation."""
+    preset_file = real_merge_repo.path / ".conductor" / "preset.toml"
+    preset_file.parent.mkdir()
+    preset_file.write_text(
+        '[[validation.checks]]\nname = "api-tests"\ncommand = "make test-api"\n'
+    )
+    real_merge_repo.create_branch("pr-a", {"pr_a.txt": "a\n"})
+    real_merge_repo.create_branch("pr-b", {"pr_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "pr-a"),
+        _done_run_with_branch(1, "feat-b", "pr-b"),
+    )
+    state.preset = "project"
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    files = _show(real_merge_repo, f"integration/{_project_name(tmp_path)}:").split()
+    assert ".conductor/" not in files  # the worktree never had the preset
+    ctx = hermetic_merge.validate.await_args.args[0]
+    assert [c.name for c in ctx.preset.validation.checks] == ["api-tests"]
+
+
+# ---------------------------------------------------------------------------
+# Test 15: The integration worktree gets the main checkout's node packages
+# ---------------------------------------------------------------------------
+
+
+def _playwright_ready_main(repo: Path, gitignore: str | None) -> Path:
+    """Commit a playwright.config.ts (and *gitignore*) on main and install a stand-in
+    @playwright/test in the main checkout; returns its node_modules."""
+    git = ["git", "-C", str(repo)]
+    (repo / "playwright.config.ts").write_text("export default {};\n")
+    if gitignore is not None:
+        (repo / ".gitignore").write_text(gitignore)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "playwright setup"], check=True)
+    modules = repo / "node_modules"
+    (modules / "@playwright" / "test").mkdir(parents=True)
+    (modules / "@playwright" / "test" / "package.json").write_text("{}\n")
+    (modules / ".bin").mkdir()
+    (modules / ".bin" / "playwright").write_text("#!/bin/sh\n")
+    (modules / "vite").mkdir()
+    (modules / ".cache").mkdir()
+    return modules
+
+
+@pytest.mark.asyncio
+async def test_integration_specs_are_generated_with_the_main_checkout_packages(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """A fresh worktree has no node_modules, so the Playwright gate skipped spec
+    generation (and the specs) in every real integration."""
+    import conductor.integration.e2e as e2e_module
+    from conductor.core.claude import ClaudeResult
+    from conductor.core.smoke_test import playwright_unavailable
+    from conductor.core.validation import ValidationResult
+
+    modules = _playwright_ready_main(real_merge_repo.path, "node_modules/\n")
+    real_merge_repo.create_branch("pw-a", {"pw_a.txt": "a\n"})
+    real_merge_repo.create_branch("pw-b", {"pw_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "pw-a"),
+        _done_run_with_branch(1, "feat-b", "pw-b"),
+    )
+    wt = tmp_path / "worktrees" / f"integration-{project_name}"
+    generated_in: list[str] = []
+
+    async def claude_writes_spec(prompt, **kwargs):
+        generated_in.append(kwargs["cwd"])
+        spec = Path(kwargs["cwd"]) / e2e_module.INTEGRATION_SPECS[0]
+        spec.parent.mkdir(parents=True)
+        spec.write_text("// cross-feature spec\n")
+        return ClaudeResult(exit_code=0, output="", tokens_used=None, cost=None, duration=0)
+
+    seen_by_validation = {}
+
+    async def validate(vctx, max_attempts):
+        node_modules = vctx.project_dir / "node_modules"
+        seen_by_validation["gate"] = playwright_unavailable(vctx.project_dir)
+        seen_by_validation["entries"] = sorted(p.name for p in node_modules.iterdir())
+        seen_by_validation["real dirs"] = sorted(
+            p.name for p in node_modules.iterdir() if not p.is_symlink()
+        )
+        return ValidationResult(passed=True, summary="1/1 checks passed")
+
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", _real_generate)
+    monkeypatch.setattr(e2e_module, "run_claude", claude_writes_spec)
+    hermetic_merge.validate.side_effect = validate
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert generated_in == [str(wt)]
+    assert seen_by_validation == {
+        "gate": None,
+        "entries": [".bin", "@playwright", "vite"],  # no tool caches
+        "real dirs": [".bin", "@playwright"],
+    }
+    branch = f"integration/{project_name}"
+    assert _show(real_merge_repo, f"{branch}:{e2e_module.INTEGRATION_SPECS[0]}")
+    files = _show(real_merge_repo, f"{branch}:").split()
+    assert not any(f.startswith("node_modules") for f in files)
+    # Removing the worktree removed the links, not the packages they point to.
+    assert not wt.exists()
+    assert (modules / "@playwright" / "test" / "package.json").is_file()
+    assert (modules / ".bin" / "playwright").is_file()
+
+
+def _commit_everything(cwd: Path) -> None:
+    subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(cwd), "commit", "-qm", "fix"], check=True)
+
+
+@pytest.mark.asyncio
+async def test_node_modules_is_not_linked_where_git_would_commit_it(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """Without a node_modules ignore rule a Claude session's `git add -A` would put
+    the links on the branch."""
+    import conductor.integration.e2e as e2e_module
+    from conductor.core.validation import ValidationResult
+
+    _playwright_ready_main(real_merge_repo.path, gitignore=None)
+    real_merge_repo.create_branch("ni-a", {"ni_a.txt": "a\n"})
+    real_merge_repo.create_branch("ni-b", {"ni_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "ni-a"),
+        _done_run_with_branch(1, "feat-b", "ni-b"),
+    )
+    claude = AsyncMock()
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", _real_generate)
+    monkeypatch.setattr(e2e_module, "run_claude", claude)
+
+    async def fix_session_commits_everything(vctx, max_attempts):
+        (vctx.project_dir / "fix.txt").write_text("fix\n")
+        _commit_everything(vctx.project_dir)
+        return ValidationResult(passed=True, summary="1/1 checks passed", fix_attempts=1)
+
+    hermetic_merge.validate.side_effect = fix_session_commits_everything
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.merged_runs == [0, 1]
+    files = _show(real_merge_repo, f"integration/{project_name}:").split()
+    assert "fix.txt" in files
+    assert not any(f.startswith("node_modules") for f in files)
+    claude.assert_not_awaited()  # still no @playwright/test: generation skipped
+
+
+# ---------------------------------------------------------------------------
+# Test 16: A worktree at the pre-upgrade default location does not block
+# ---------------------------------------------------------------------------
+
+
+def _add_worktree(repo: Path, path: Path, new_branch: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(path), "-b", new_branch],
+        check=True,
+    )
+
+
+@pytest.mark.parametrize("vanished", [False, True], ids=["present", "dir-vanished"])
+@pytest.mark.asyncio
+async def test_worktree_at_the_old_default_location_is_removed(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch, vanished
+):
+    """Older versions put the worktree in /tmp/conductor-integration-<name>; one
+    left there kept integration/<name> checked out, so the re-run FAILED."""
+    import shutil
+
+    import conductor.integration.merge as merge_module
+
+    monkeypatch.setattr(merge_module, "_LEGACY_WORKTREE_BASE", tmp_path / "old-tmp")
+    real_merge_repo.create_branch("lg-a", {"lg_a.txt": "a\n"})
+    real_merge_repo.create_branch("lg-b", {"lg_b.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    legacy = tmp_path / "old-tmp" / f"conductor-integration-{project_name}"
+    _add_worktree(real_merge_repo.path, legacy, f"integration/{project_name}")
+    (legacy / "leftover.txt").write_text("check output\n")
+    if vanished:
+        shutil.rmtree(legacy)
+    state = ConductorState(
+        project_name=project_name,
+        base_branch="main",
+        runs=[
+            _done_run_with_branch(0, "feat-a", "lg-a"),
+            _done_run_with_branch(1, "feat-b", "lg-b"),
+        ],
+    )
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.DONE
+    assert result.merged_runs == [0, 1]
+    assert str(legacy) not in _worktree_list(real_merge_repo.path)
+
+
+# ---------------------------------------------------------------------------
+# Test 17: An integration branch that could not be pushed is not DONE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_push_is_not_reported_done(real_merge_repo, tmp_path, hermetic_merge):
+    real_merge_repo.create_branch("np-a", {"np_a.txt": "a\n"})
+    real_merge_repo.create_branch("np-b", {"np_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "np-a"),
+        _done_run_with_branch(1, "feat-b", "np-b"),
+    )
+    real_merge_repo.origin.rename(tmp_path / "origin-gone.git")
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX  # validation itself passed
+    assert result.merged_runs == [0, 1]
+    assert result.pr_url is None
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Edits from a fix session that crashed reach the branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_edits_of_a_crashed_fix_session_are_committed(
+    real_merge_repo, tmp_path, hermetic_merge, monkeypatch
+):
+    """The worktree is force-removed at the end, so edits that are not committed
+    are lost; a crash used to drop fix_attempts and with it the commit."""
+    import conductor.core.validation as validation_module
+    import conductor.integration.merge as merge_module
+    from conductor.core.validation import CheckResult, ValidationResult, validate_and_fix
+
+    real_merge_repo.create_branch("cf-a", {"app.txt": "broken\n"})
+    real_merge_repo.create_branch("cf-b", {"other.txt": "b\n"})
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "cf-a"),
+        _done_run_with_branch(1, "feat-b", "cf-b"),
+    )
+    failing = ValidationResult(
+        passed=False, checks=[CheckResult("lint", False, "app broken", 0.0)], summary="0/1"
+    )
+
+    async def claude_edits_then_crashes(prompt, **kwargs):
+        (Path(kwargs["cwd"]) / "app.txt").write_text("fixed\n")
+        raise RuntimeError("stream closed")
+
+    monkeypatch.setattr(merge_module, "validate_and_fix", validate_and_fix)
+    monkeypatch.setattr(validation_module, "run_validation", AsyncMock(return_value=failing))
+    monkeypatch.setattr(validation_module, "run_claude", claude_edits_then_crashes)
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == "fixed\n"

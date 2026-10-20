@@ -653,8 +653,9 @@ def tmp_git_repo(tmp_path) -> Path:
 class RealMergeRepo:
     """A real git repo with helpers for creating feature branches."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, origin: Path) -> None:
         self.path = path
+        self.origin = origin  # bare repo registered as the `origin` remote
 
     def create_branch(self, name: str, files: dict[str, str]) -> None:
         """Create a branch from main with the given file contents."""
@@ -716,7 +717,18 @@ def real_merge_repo(tmp_path) -> RealMergeRepo:
         check=True,
         capture_output=True,
     )
-    return RealMergeRepo(repo)
+    # The integration branch is pushed here. Nothing else is: without an
+    # origin/main the integration worktree starts from the local main.
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    return RealMergeRepo(repo, origin)
 
 
 @pytest.fixture
@@ -734,7 +746,6 @@ def hermetic_merge(monkeypatch):
     import conductor.core.validation as validation_module
     import conductor.integration.e2e as e2e_module
     import conductor.integration.merge as merge_module
-    from conductor.core.models import E2ETestState
     from conductor.core.validation import ValidationResult
 
     async def _no_real_claude(*args, **kwargs):
@@ -746,9 +757,9 @@ def hermetic_merge(monkeypatch):
         monkeypatch.setattr(module, "run_claude", _no_real_claude)
 
     validate = AsyncMock(return_value=ValidationResult(passed=True, summary="stubbed"))
-    e2e = AsyncMock(return_value=E2ETestState(skipped=1))
+    e2e = AsyncMock(return_value=False)
     monkeypatch.setattr(merge_module, "validate_and_fix", validate)
-    monkeypatch.setattr(e2e_module, "run_integration_testing", e2e)
+    monkeypatch.setattr(e2e_module, "generate_integration_tests", e2e)
     monkeypatch.setattr(merge_module, "_GH_RETRY_DELAY_S", 0)
     return SimpleNamespace(validate=validate, e2e=e2e)
 

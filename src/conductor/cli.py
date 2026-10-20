@@ -1294,36 +1294,50 @@ def _cmd_validate(args):
 
     state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
 
+    from conductor.core.presets import load_preset
     from conductor.core.validation import (
         ValidationContext,
-        validate_and_fix,
+        detect_checks,
         run_validation,
+        validate_and_fix,
     )
+    from conductor.integration.merge import integration_worktree_path
 
-    # Determine project directory: integration worktree or repo root
+    # Load the preset from the repo root, as a run does; a typo must not turn
+    # into a green "0/0 checks passed".
+    try:
+        preset = load_preset(state.preset, storage.repo_root)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+    # Determine project directory: the integration worktree while it exists
+    # (a merge in progress or interrupted), otherwise the given checkout
     project_dir = repo_path
     if state.integration and state.integration.branch:
-        if state.worktrees_base:
-            wt_path = Path(state.worktrees_base) / f"integration-{state.project_name}"
-        else:
-            wt_path = Path("/tmp") / f"conductor-integration-{state.project_name}"
+        wt_path = integration_worktree_path(state, storage.repo_root)
         if wt_path.exists():
             project_dir = wt_path
 
-    stage = "integration" if (args.smoke or args.integration) else "post-run"
-
     vctx = ValidationContext(
         project_dir=project_dir,
-        stage=stage,
+        stage="integration" if (args.smoke or args.integration) else "post-run",
         feature_name=state.project_name,
-        state=state if args.integration else None,
+        state=state,
+        preset=preset,
     )
+    # Tool and preset checks always; smoke and the integration specs only on
+    # request (detect_checks adds both for the integration stage).
+    on_request = {"smoke": args.smoke, "integration-tests": args.integration}
+    checks = [c for c in asyncio.run(detect_checks(vctx)) if c not in on_request]
+    checks += [name for name, wanted in on_request.items() if wanted]
 
     if args.fix:
-        max_att = args.max_attempts if hasattr(args, "max_attempts") else 3
-        result = asyncio.run(validate_and_fix(vctx, max_attempts=max_att))
+        result = asyncio.run(
+            validate_and_fix(vctx, max_attempts=args.max_attempts, checks=checks)
+        )
     else:
-        result = asyncio.run(run_validation(vctx))
+        result = asyncio.run(run_validation(vctx, checks=checks))
 
     # Print results
     isatty = sys.stdout.isatty()
@@ -1331,9 +1345,18 @@ def _cmd_validate(args):
     red = "\033[31m" if isatty else ""
     reset = "\033[0m" if isatty else ""
 
+    if not result.checks:
+        print(
+            "No validation checks found: no frontend/package.json, vendor/bin/phpstan,"
+            " vendor/bin/phpunit or [[validation.checks]] in the preset"
+        )
+        return
+
     for check in result.checks:
         icon = f"{green}✓{reset}" if check.passed else f"{red}✗{reset}"
-        print(f"  {icon} {check.name} ({check.duration_s:.1f}s)")
+        skipped = check.passed and check.output.startswith("skipped:")
+        note = f" — {check.output.strip()}" if skipped else ""
+        print(f"  {icon} {check.name} ({check.duration_s:.1f}s){note}")
         if not check.passed:
             # Indent error output
             for line in check.output.strip().splitlines()[-10:]:
