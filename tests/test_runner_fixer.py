@@ -193,3 +193,21 @@ async def test_async_fix_without_fix_pr_leaves_threads_open(pr_checkout, fake_gh
     assert "Fix PR creation failed" in err
     assert "Leaving 15 review thread(s) open" in err
     assert mutations == []
+
+
+def test_dirty_fix_worktree_is_removed_with_its_branch(pr_checkout, tmp_path):
+    work, _ = pr_checkout
+    wt = tmp_path / "fix-wt"
+    assert fixer._worktree_add(work, wt, "fix/feat-phase-1", "feat")
+    (wt / "app.py").write_text("half-edited\n")
+    (wt / "new.py").write_text("untracked\n")
+
+    fixer._worktree_remove(work, wt, "fix/feat-phase-1")
+
+    assert not wt.exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "fix/*"], cwd=work, capture_output=True, text=True, check=True
+    ).stdout
+    assert branches.strip() == ""
+    # The next run can create the same branch again.
+    assert fixer._worktree_add(work, wt, "fix/feat-phase-1", "feat")

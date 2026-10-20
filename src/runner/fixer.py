@@ -496,8 +496,7 @@ def _git_run(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
 def _worktree_add(project_dir: Path, worktree_dir: Path, fix_branch: str, base_branch: str) -> bool:
     """Create a worktree with a new fix branch based on base_branch. Returns True on success."""
     # Clean up stale worktree/branch if they exist
-    _git_run(["worktree", "remove", str(worktree_dir)], project_dir, check=False)
-    _git_run(["branch", "-D", fix_branch], project_dir, check=False)
+    _worktree_remove(project_dir, worktree_dir, fix_branch)
     result = _git_run(
         ["worktree", "add", str(worktree_dir), "-b", fix_branch, base_branch],
         project_dir,
@@ -507,8 +506,14 @@ def _worktree_add(project_dir: Path, worktree_dir: Path, fix_branch: str, base_b
 
 
 def _worktree_remove(project_dir: Path, worktree_dir: Path, fix_branch: str) -> None:
-    """Remove worktree and delete local fix branch."""
-    _git_run(["worktree", "remove", str(worktree_dir)], project_dir, check=False)
+    """Remove worktree and delete local fix branch.
+
+    --force: the worktree is often dirty here (Claude failed mid-edit, or a
+    commit was rejected). Without it the removal failed, the branch stayed
+    checked out there, and every later fixer run for the phase failed on
+    `worktree add -b` because the branch already existed.
+    """
+    _git_run(["worktree", "remove", "--force", str(worktree_dir)], project_dir, check=False)
     _git_run(["branch", "-D", fix_branch], project_dir, check=False)
 
 
