@@ -1621,7 +1621,7 @@ async def _run_generation(
         valid=signal.valid,
         errors=signal.errors,
         auto_approved=[
-            f"{flag.kind}: {flag.value}"
+            f"{flag.pattern}: {flag.value}"
             for flag in policy_flags
             if _is_auto_approved(flag, policy)
         ],

@@ -87,6 +87,115 @@ def _patch_storage(tmp_path: Path, repo_path: Path):
     return patch.object(StorageResolver, "__init__", patched_init)
 
 
+def _assistant_text(text: str) -> str:
+    return json.dumps(
+        {"type": "assistant", "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": text}]}}
+    )
+
+
+def _tool_use(name: str, tool_input) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-5-5",
+                "content": [{"type": "tool_use", "name": name, "input": tool_input}],
+            },
+        }
+    )
+
+
+def _result_event(text: str = "", *, is_error: bool = False, subtype: str = "success") -> str:
+    return json.dumps({"type": "result", "subtype": subtype, "is_error": is_error, "result": text})
+
+
+PASS_RESULT = """<manual-result status="pass">
+  <summary>Works</summary>
+  <evidence><screenshot>artifacts/screenshots/pass.png</screenshot></evidence>
+</manual-result>
+<manual-pass/>"""
+
+
+class _FakeTmux:
+    def __init__(self):
+        self.windows: list[str] = []
+
+    async def spawn_in_window(self, name, _cmd, **_kwargs):
+        self.windows.append(name)
+
+    async def kill_window(self, _name):
+        return None
+
+
+def _fake_claude(monkeypatch, outputs):
+    """Make every generation "run" by writing the next canned (stdout, exit, stderr).
+
+    Replaces loop._wait_for_exit, which _run_generation imports at call time,
+    so the real prompt/output/exit-file handling in _run_generation still runs.
+    """
+    queue = list(outputs)
+
+    async def fake_wait_for_exit(exit_file, output_file, _tmux, _window, _log, _audit):
+        stdout, exit_code, stderr = queue.pop(0)
+        output_file.write_text(stdout, encoding="utf-8")
+        stderr_file = output_file.with_name(
+            output_file.name.replace("manual-output-", "manual-stderr-")
+        ).with_suffix(".log")
+        if stderr_file.exists() or stderr:
+            stderr_file.write_text(stderr, encoding="utf-8")
+        exit_file.write_text(f"{exit_code}\n", encoding="utf-8")
+
+    monkeypatch.setattr("conductor.core.loop._wait_for_exit", fake_wait_for_exit)
+    return queue
+
+
+def _new_state(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    plan = tmp_path / "plan.md"
+    plan.write_text(PLAN_TABLE, encoding="utf-8")
+    conductor_dir = tmp_path / "conductor" / "checkout-manual"
+    state = initialize_manual_state(
+        name="checkout-manual",
+        project_dir=repo,
+        plan_file=plan,
+        conductor_dir=conductor_dir,
+    )
+    return repo, conductor_dir, state
+
+
+def _audit_events(conductor_dir: Path, event: str) -> list[dict]:
+    lines = (conductor_dir / "MANUAL-TEST-AUDIT.jsonl").read_text(encoding="utf-8").splitlines()
+    return [record for record in map(json.loads, lines) if record["event"] == event]
+
+
+@pytest.mark.asyncio
+async def test_run_generation_lists_auto_approved_flags(tmp_path, monkeypatch):
+    repo, conductor_dir, state = _new_state(tmp_path)
+    output = "\n".join(
+        [_tool_use("Bash", {"command": "mysql -e 'select 1'"}), _assistant_text(PASS_RESULT)]
+    )
+    _fake_claude(monkeypatch, [(output, 0, "")])
+
+    signal, _ = await manual_test._run_generation(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=_FakeTmux(),
+        prompt="prompt",
+        label="scenario-0",
+        model="sonnet",
+        scenario=state.scenarios[0],
+        log_path=conductor_dir / "MANUAL-TEST-LOG.md",
+        audit_path=conductor_dir / "MANUAL-TEST-AUDIT.jsonl",
+        policy=ManualTestPolicy(),
+    )
+
+    assert signal.valid is True
+    [end] = _audit_events(conductor_dir, "MANUAL_GENERATION_END")
+    assert end["auto_approved"] == ["database cli: mysql -e 'select 1'"]
+
+
 def test_parse_scenarios_from_table():
     scenarios = parse_scenarios_from_markdown(PLAN_TABLE)
 
