@@ -2106,6 +2106,9 @@ async def _run_generation(
     )
     await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
     exit_code, output_text, stderr_text = _read_generation_result(exit_file, output_file, stderr_file)
+    # The window stays open after exit (remain-on-exit), keeping its pipe-pane
+    # helper alive; everything it showed is in the output, stderr and tmux logs.
+    await tmux.kill_window(window_name)
 
     policy_flags = scan_policy_shortcuts(output_text, policy, fatal_scope=fatal_scope)
     signal = parse_manual_signal(output_text, policy_flags=policy_flags, policy=policy)

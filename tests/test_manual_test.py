@@ -120,6 +120,7 @@ PASS_RESULT = """<manual-result status="pass">
 class _FakeTmux:
     def __init__(self, **_kwargs):
         self.windows: list[str] = []
+        self.killed: list[str] = []
 
     async def ensure_session(self):
         return None
@@ -127,8 +128,8 @@ class _FakeTmux:
     async def spawn_in_window(self, name, _cmd, **_kwargs):
         self.windows.append(name)
 
-    async def kill_window(self, _name):
-        return None
+    async def kill_window(self, name):
+        self.killed.append(name)
 
 
 def _fake_claude(monkeypatch, outputs):
@@ -243,6 +244,28 @@ async def test_run_generation_writes_markdown_log(tmp_path, monkeypatch):
     log = (conductor_dir / "MANUAL-TEST-LOG.md").read_text(encoding="utf-8")
     assert "MANUAL_GENERATION_START" in log
     assert "MANUAL_GENERATION_END" in log
+
+
+@pytest.mark.asyncio
+async def test_run_generation_closes_its_window(tmp_path, monkeypatch):
+    repo, conductor_dir, state = _new_state(tmp_path)
+    _fake_claude(monkeypatch, [(_assistant_text(PASS_RESULT), 0, "")])
+    tmux = _FakeTmux()
+
+    await manual_test._run_generation(
+        state=state,
+        project_dir=repo,
+        conductor_dir=conductor_dir,
+        tmux=tmux,
+        prompt="prompt",
+        label="scenario-0",
+        model="sonnet",
+        scenario=state.scenarios[0],
+        log_path=conductor_dir / "MANUAL-TEST-LOG.md",
+        audit_path=conductor_dir / "MANUAL-TEST-AUDIT.jsonl",
+    )
+
+    assert tmux.windows and tmux.killed == tmux.windows
 
 
 USAGE_LIMIT = "\n".join(
