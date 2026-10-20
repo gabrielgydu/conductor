@@ -269,6 +269,22 @@ def _launch_in_tmux(
     sys.exit(0)
 
 
+# Project names end up in tmux targets, branch names and storage paths.
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def _validate_name(name: str) -> None:
+    """Exit with an error unless *name* is safe as a project/loop/manual-test name."""
+    if not _NAME_RE.fullmatch(name):
+        print(
+            f"Error: invalid --name {name!r}: use letters, digits, '-' and '_', "
+            "starting with a letter or digit.\n"
+            "  Characters such as '.', ':', '/' or spaces break tmux targets, "
+            "branch names and storage paths."
+        )
+        sys.exit(1)
+
+
 # ─── Project lock ────────────────────────────────────────────────────────────
 
 
@@ -296,6 +312,7 @@ def _unlock_project(storage: StorageResolver, name: str) -> None:
 
 def _cmd_init(args):
     """Initialize a new conductor project."""
+    _validate_name(args.name)
     if args.base_branch is None:
         args.base_branch = _detect_git_branch(args.project_dir)
     repo_path = Path(args.project_dir or ".").resolve()
@@ -695,6 +712,7 @@ def _cmd_plan(args):
 
 def _cmd_go(args):
     """One-shot resumable command: init → copy brief → plan → run."""
+    _validate_name(args.name)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
     _lock_project(storage, args.name, "go")
@@ -1020,6 +1038,7 @@ def _cmd_learnings(args):
 
 def _cmd_loop(args):
     """Start or resume a conductor loop."""
+    _validate_name(args.name)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
     _lock_project(storage, args.name, "loop")
@@ -1191,6 +1210,7 @@ def _cmd_loop_status(args):
 
 def _cmd_manual_test(args):
     """Start, resume, or initialize a manual-test run."""
+    _validate_name(args.name)
     repo_path = Path(args.project_dir or ".").resolve()
     storage = StorageResolver(repo_path)
     _lock_project(storage, args.name, "manual-test")
