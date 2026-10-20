@@ -140,13 +140,17 @@ async def test_auto_resume_reactivates_run_blocked_after_its_last_stage(loop_env
 
 
 @pytest.mark.asyncio
-async def test_resumed_runs_respect_max_parallel(loop_env, tmp_path):
+@pytest.mark.parametrize("blocked_in", ["post-run step", "stage"])
+async def test_resumed_runs_respect_max_parallel(loop_env, tmp_path, blocked_in):
     """Two runs blocked at different times must not both resume at once."""
     runs = []
     for i, name in enumerate(("feat-a", "feat-b")):
         run = make_run_state(i, name, status=RunStatus.BLOCKED)
-        run.stages[0].status = StageStatus.DONE
-        run.current_stage = 1
+        if blocked_in == "stage":  # restarted by auto-resume
+            run.stages[0].status = StageStatus.BLOCKED
+        else:
+            run.stages[0].status = StageStatus.DONE
+            run.current_stage = 1
         runs.append(run)
     state = _state(*runs)
 

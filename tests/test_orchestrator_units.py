@@ -407,6 +407,31 @@ def test_starting_runner_is_not_judged_by_its_process_tree(tmp_path, monkeypatch
     assert not exit_file.exists()
 
 
+@pytest.mark.asyncio
+async def test_starting_a_runner_clears_the_previous_runners_shallow_streak(
+    tmp_path, monkeypatch
+):
+    """A new runner in the same window starts its own streak, not a dead one's."""
+    state, wt = _make_state_with_worktree(tmp_path)
+    docs = wt / "docs" / "run-0"
+    (docs / "prompts").mkdir(parents=True)
+    (docs / "prompts" / "01-backend.md").write_text("do it\n")
+    (docs / "run.sh").write_text(
+        'PHASES[1]="01-backend.md"\nPHASE_TOKENS[1]="DONE"\nPHASE_NAMES[1]="Backend"\n'
+    )
+    monkeypatch.setattr(orch, "_shallow_since", {ZOMBIE_KEY: 0.0})
+    storage = _ipc_storage(tmp_path)
+    storage.repo_root = tmp_path
+    storage.tmux_log = lambda name, label: tmp_path / f"{label}.log"
+    tmux = MagicMock()
+    tmux.spawn_runner_in_window = AsyncMock()
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    tmux.spawn_runner_in_window.assert_awaited_once()
+    assert ZOMBIE_KEY not in orch._shallow_since
+
+
 # ---------------------------------------------------------------------------
 # Single-run push and PR
 # ---------------------------------------------------------------------------
