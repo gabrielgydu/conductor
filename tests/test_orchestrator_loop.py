@@ -38,6 +38,8 @@ def loop_env(tmp_path, monkeypatch):
     tmux.spawn_runner_in_window = AsyncMock()
     monkeypatch.setattr(orch._tmux_module, "TmuxManager", MagicMock(return_value=tmux))
     monkeypatch.setattr(orch, "conductor_post_run", AsyncMock())
+    # The between-checks exit-file poll shells out to tmux directly.
+    monkeypatch.setattr(orch, "_any_runner_exit_file_ready", lambda *a, **k: False)
     return tmux
 
 
@@ -118,3 +120,106 @@ async def test_auto_resume_reactivates_run_blocked_after_its_last_stage(loop_env
     await orch._auto_resume_blocked_runs(state, storage, None, None)
 
     assert state.runs[0].status == RunStatus.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# Loop pacing: sleep when nothing can act, never burn max_iterations spinning
+# ---------------------------------------------------------------------------
+
+
+class _FakeSleep:
+    """Records asyncio.sleep calls; runs *on_call(n)* after each one."""
+
+    def __init__(self, on_call=None) -> None:
+        self.calls: list[float] = []
+        self._on_call = on_call
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        if self._on_call is not None:
+            self._on_call(len(self.calls))
+
+
+def _block_run(state: ConductorState, run_idx: int = 0):
+    def on_call(n: int) -> None:
+        state.runs[run_idx].status = RunStatus.BLOCKED
+
+    return on_call
+
+
+@pytest.mark.asyncio
+async def test_loop_sleeps_until_backoff_expires_instead_of_spinning(loop_env, monkeypatch):
+    """A stage in transient backoff makes the loop wait ~until expiry, not spin."""
+    from datetime import datetime, timedelta, timezone
+
+    run = _active(0, "feat-a", StageStatus.GENERATED)
+    run.stages[0].backoff_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+    state = _state(run)
+    sleep = _FakeSleep(_block_run(state))
+    monkeypatch.setattr(orch.asyncio, "sleep", sleep)
+    config = ConductorConfig(check_interval_s=120.0, max_iterations=5)
+
+    with patch.object(orch, "start_runner", new_callable=AsyncMock) as start:
+        await conductor_run_loop(state, config)
+
+    start.assert_not_awaited()
+    assert 28 <= sum(sleep.calls) <= 31, sleep.calls
+    assert orch.conductor_post_run.await_args.args[2] == "all_done"
+
+
+@pytest.mark.asyncio
+async def test_waiting_iterations_do_not_count_against_max_iterations(loop_env, monkeypatch):
+    """Monitoring an executing runner for longer than max_iterations checks is fine."""
+    state = _state(_active(0, "feat-a", StageStatus.EXECUTING))
+
+    def on_call(n: int) -> None:
+        if n == 50:
+            state.runs[0].status = RunStatus.BLOCKED
+
+    monkeypatch.setattr(orch.asyncio, "sleep", _FakeSleep(on_call))
+    config = ConductorConfig(check_interval_s=10.0, max_iterations=2)
+
+    with patch.object(orch, "monitor_runner", new_callable=AsyncMock) as monitor:
+        await conductor_run_loop(state, config)
+
+    assert monitor.await_count == 50
+    assert orch.conductor_post_run.await_args.args[2] != "max_iterations"
+
+
+@pytest.mark.asyncio
+async def test_questions_for_a_human_end_the_loop_with_needs_input(loop_env, monkeypatch, tmp_path):
+    """Without overnight, a lone stage waiting on QUESTIONS.md exits instead of spinning."""
+    state = _state(_active(0, "feat-a", StageStatus.SPEC_NEEDS_INPUT))
+    state.overnight = False
+    state.runs[0].stages[0].worktree = str(tmp_path / "wt")
+    sleep = _FakeSleep()
+    monkeypatch.setattr(orch.asyncio, "sleep", sleep)
+    config = ConductorConfig(check_interval_s=120.0)  # overnight comes from state
+
+    with patch.object(orch, "answer_questions", new_callable=AsyncMock) as answer:
+        result = await conductor_run_loop(state, config)
+
+    answer.assert_not_awaited()
+    assert sleep.calls == []
+    orch.conductor_post_run.assert_not_awaited()
+    assert result.runs[0].stages[0].status == StageStatus.SPEC_NEEDS_INPUT
+    log = (tmp_path / "storage" / "conductor" / "test-proj" / "CONDUCTOR-LOG.md").read_text()
+    assert str(tmp_path / "wt" / "docs" / "feat-a" / "spec" / "QUESTIONS.md") in log
+
+
+@pytest.mark.asyncio
+async def test_human_wait_does_not_stop_an_executing_run(loop_env, monkeypatch):
+    """One run waits for answers, another executes: keep monitoring, don't exit."""
+    state = _state(
+        _active(0, "feat-a", StageStatus.SPEC_NEEDS_INPUT),
+        _active(1, "feat-b", StageStatus.EXECUTING),
+    )
+    state.overnight = False
+    monkeypatch.setattr(orch.asyncio, "sleep", _FakeSleep(_block_run(state, 1)))
+    config = ConductorConfig(check_interval_s=30.0, max_parallel=2)
+
+    with patch.object(orch, "monitor_runner", new_callable=AsyncMock) as monitor:
+        await conductor_run_loop(state, config)
+
+    assert monitor.await_count == 1
+    assert state.runs[0].stages[0].status == StageStatus.SPEC_NEEDS_INPUT

@@ -48,7 +48,13 @@ class ConductorConfig:
     max_retries: int = 2
     max_parallel: int = 1
     project_root: Path | None = None
-    overnight: bool = True
+    # None: use state.overnight (set from --no-overnight); a bool overrides it.
+    overnight: bool | None = None
+
+
+def _overnight(config: ConductorConfig, state: ConductorState) -> bool:
+    """Whether speccer questions are auto-answered (state.overnight unless overridden)."""
+    return state.overnight if config.overnight is None else config.overnight
 
 
 # ---------------------------------------------------------------------------
@@ -1966,26 +1972,43 @@ def activate_ready_runs(state: ConductorState, max_parallel: int = 1) -> list[in
     return activated
 
 
-def _has_foreground_runs(state: ConductorState, active_run_indices: list[int]) -> bool:
-    """Return True if any active run has a non-executing foreground stage status."""
-    foreground = {
-        StageStatus.PENDING,
-        StageStatus.SPEC_INIT,
-        StageStatus.SPEC_RUNNING,
-        StageStatus.SPEC_NEEDS_INPUT,
-        StageStatus.SPEC_COMPLETE,
-        StageStatus.GENERATED,
-    }
-    run_by_index = {r.index: r for r in state.runs}
-    for ri in active_run_indices:
-        run = run_by_index.get(ri)
-        if run is None:
-            continue
-        if run.current_stage < len(run.stages):
-            stage = run.stages[run.current_stage]
-            if stage.status in foreground:
-                return True
-    return False
+def _waiting_reason(
+    state: ConductorState,
+    run: RunState,
+    overnight: bool,
+    now: datetime,
+) -> str | None:
+    """Why *run* has nothing to do right now, or None if advancing it would act.
+
+    "executing": a runner is working in its tmux window; only monitoring is due.
+    "backoff":   the stage waits out a transient-failure backoff.
+    "human":     speccer asked questions and nobody auto-answers them.
+    """
+    if run.current_stage >= len(run.stages):
+        return None
+    stage = run.stages[run.current_stage]
+    if stage.backoff_until is not None and now < stage.backoff_until:
+        return "backoff"
+    if stage.status == StageStatus.EXECUTING:
+        return "executing"
+    if stage.status == StageStatus.SPEC_NEEDS_INPUT and not overnight:
+        return "human"
+    return None
+
+
+def _questions_waiting_message(state: ConductorState, run: RunState) -> str:
+    """How a human answers a stage's speccer questions and lets conductor go on."""
+    stage = run.stages[run.current_stage]
+    fname = run.name + stage.feature_suffix
+    wt = stage.worktree or "<worktree>"
+    questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
+    return (
+        f"Run {run.name} stage {stage.name}: answer the questions in {questions} "
+        "(lines starting with '> '), then either run "
+        f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue` "
+        "and re-run conductor, or re-run conductor without --no-overnight to "
+        "have them answered automatically."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2125,8 +2148,7 @@ async def advance_run(
 
     # ----- spec_needs_input -----
     if status == StageStatus.SPEC_NEEDS_INPUT:
-        overnight = config.overnight or state.overnight
-        if overnight:
+        if _overnight(config, state):
             await answer_questions(
                 state,
                 run_idx,
@@ -2638,9 +2660,12 @@ async def conductor_run_loop(
 
     - Sets up signal handler (INT/TERM -> log exit cost, exit 130)
     - Activates ready runs, blocks runs with blocked deps
-    - Round-robin advance_run for all active runs
-    - Sleeps check_interval ONLY when all active runs are executing AND no foreground runs
-    - After loop: calls conductor_post_run
+    - Round-robin advance_run for all active runs (an exception fails that
+      run's stage, see _record_advance_error)
+    - Sleeps when no active run can act now: runners executing, stages in
+      backoff (wakes at the earliest expiry), questions waiting for a human
+    - Exits with reason "needs_input" when every active run waits for a human
+    - After loop: calls conductor_post_run (not for "needs_input")
     """
     project_root = config.project_root or Path.cwd()
     storage = StorageResolver(project_root)
@@ -2670,7 +2695,7 @@ async def conductor_run_loop(
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    overnight = config.overnight or state.overnight
+    overnight = _overnight(config, state)
     _log(
         "CONDUCTOR_START",
         f"{state.project_name}{' (overnight)' if overnight else ''}",
@@ -2683,8 +2708,14 @@ async def conductor_run_loop(
 
     exit_reason = "unknown"
     advance_errors: dict[int, int] = {}  # run index -> consecutive exceptions
+    # Only iterations that did work count against max_iterations: waiting for
+    # runners or backoffs is paced by sleeps and must not end an overnight run.
+    busy_iterations = 0
 
-    for _iteration in range(config.max_iterations):
+    while True:
+        if busy_iterations >= config.max_iterations:
+            exit_reason = "max_iterations"
+            break
         active_run_indices = activate_ready_runs(state, max_parallel=config.max_parallel)
 
         all_terminal = all(
@@ -2788,12 +2819,7 @@ async def conductor_run_loop(
             break
 
         # Round-robin advance all active runs
-        any_executing = False
         for run_idx in active_run_indices:
-            run = state.runs[run_idx]
-            si = run.current_stage
-            if si < len(run.stages) and run.stages[si].status == StageStatus.EXECUTING:
-                any_executing = True
             try:
                 await advance_run(
                     state, run_idx, tmux, storage, config, preset, log_path, audit_path
@@ -2807,23 +2833,64 @@ async def conductor_run_loop(
             else:
                 advance_errors.pop(run_idx, None)
 
-        # Sleep only when all active are monitoring (executing) and no foreground work
-        has_foreground = _has_foreground_runs(state, active_run_indices)
-        if any_executing and not has_foreground and config.check_interval_s > 0:
-            # Fast-poll exit files every 10s so we detect runner completion quickly,
-            # but only run the full advance_run cycle at check_interval_s.
-            poll_interval = 10.0
-            elapsed = 0.0
-            while elapsed < config.check_interval_s:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-                if _any_runner_exit_file_ready(
-                    state, storage, session_name=f"conductor-{state.project_name}"
-                ):
-                    break
+        # Pace the loop. Advance again right away only if some run can act now;
+        # otherwise sleep until the next monitoring check or the earliest
+        # backoff expiry, waking early when a runner writes its exit file.
+        now = datetime.now(timezone.utc)
+        waiting = {
+            run_idx: _waiting_reason(state, state.runs[run_idx], overnight, now)
+            if state.runs[run_idx].status == RunStatus.ACTIVE
+            else None
+            for run_idx in active_run_indices
+        }
+        if any(reason is None for reason in waiting.values()):
+            busy_iterations += 1
+            continue
 
-    else:
-        exit_reason = "max_iterations"
+        if all(reason == "human" for reason in waiting.values()):
+            # Nothing runs and nothing will change until someone answers.
+            for run_idx in waiting:
+                _log(
+                    "CONDUCTOR_EXIT",
+                    _questions_waiting_message(state, state.runs[run_idx]),
+                    log_path,
+                    audit_path,
+                    reason="needs_input",
+                    run=run_idx,
+                )
+            atomic_save(state, storage.conductor_state(state.project_name))
+            exit_reason = "needs_input"
+            break
+
+        if config.check_interval_s <= 0:
+            busy_iterations += 1  # no pacing configured (tests): keep the bound
+            continue
+
+        wait_s = config.check_interval_s
+        backoffs = [
+            state.runs[i].stages[state.runs[i].current_stage].backoff_until
+            for i, reason in waiting.items()
+            if reason == "backoff"
+        ]
+        if backoffs:
+            until_backoff = (min(backoffs) - now).total_seconds()
+            wait_s = min(wait_s, max(1.0, until_backoff))
+        executing = "executing" in waiting.values()
+        elapsed = 0.0
+        while elapsed < wait_s:
+            # Fast-poll exit files every 10s so runner completion is noticed
+            # quickly; the full advance_run cycle only runs once per wait.
+            step = min(10.0, wait_s - elapsed)
+            await asyncio.sleep(step)
+            elapsed += step
+            if executing and _any_runner_exit_file_ready(
+                state, storage, session_name=f"conductor-{state.project_name}"
+            ):
+                break
+
+    if exit_reason == "needs_input":
+        # Runs are paused, not finished: no learnings review or audit yet.
+        return state
 
     # Post-run processing
     await conductor_post_run(state, storage, exit_reason, log_path, audit_path)
