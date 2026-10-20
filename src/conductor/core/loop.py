@@ -213,9 +213,10 @@ def build_prompt(state: LoopState, plan_content: str) -> str:
         f"{current_section}\n"
         f"## Instructions\n\n"
         f"1. Work on the current task (marked with <-- YOU ARE HERE)\n"
-        f"2. When you have FULLY completed the current task, output exactly: {_TASK_COMPLETED_TAG}\n"
+        f"2. When you have FULLY completed the current task, output exactly this, on a line by itself: "
+        f"{_TASK_COMPLETED_TAG}\n"
         f"3. After outputting the tag, stop and wait. The orchestrator will handle committing and advancing.\n"
-        f"4. If you cannot complete the task, explain why and output: <task-failed/>\n\n"
+        f"4. If you cannot complete the task, explain why and then output, on a line by itself: <task-failed/>\n\n"
         f"## Original Plan (full context)\n\n{plan_content}\n"
     )
 
@@ -247,15 +248,18 @@ def session_error(output: str) -> str:
     return ""
 
 
+# A signal tag counts only on a line of its own, so prose that mentions it
+# ("I will not output <task-completed/> yet") is not mistaken for it.
+_SIGNAL_RE = re.compile(r"^[ \t]*<task-(completed|failed)\s*/>[ \t]*$", re.MULTILINE)
+
+
 def check_output_for_signal(output: str) -> str | None:
     """Check Claude's output for task-completed or task-failed signal.
-    Returns 'completed', 'failed', or None."""
-    text = _extract_text_from_result(output)
-    if "<task-completed/>" in text or "<task-completed />" in text:
-        return "completed"
-    if "<task-failed/>" in text or "<task-failed />" in text:
-        return "failed"
-    return None
+
+    Returns 'completed', 'failed', or None. If both appear, the last wins.
+    """
+    signals = _SIGNAL_RE.findall(_extract_text_from_result(output))
+    return signals[-1] if signals else None
 
 
 # ---------------------------------------------------------------------------

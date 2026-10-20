@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from conductor.core.loop import LoopState, _loop_main, parse_checklist, run_loop_in_tmux
+from conductor.core.loop import (
+    LoopState, _loop_main, check_output_for_signal, parse_checklist, run_loop_in_tmux,
+)
 from conductor.core.storage import StorageResolver
 
 _FAKE_CLAUDE_PY = r'''
@@ -353,3 +355,25 @@ def test_crashed_loop_is_not_left_running(repo, claude, tmux, monkeypatch):
         (storage.conductor_dir("fix") / "LOOP-STATE.json").read_text()
     )
     assert saved.status == "failed"
+
+
+# -- signal detection ----------------------------------------------------------
+
+
+def _output(*texts: str) -> str:
+    return "\n".join(json.dumps(say(t)) for t in texts)
+
+
+@pytest.mark.parametrize(("texts", "expected"), [
+    (["All done.\n<task-completed/>"], "completed"),
+    (["<task-completed />"], "completed"),
+    (["  <task-failed/>  "], "failed"),
+    (["Tests still fail, so I will not output <task-completed/> for this task.\n\n<task-failed/>"], "failed"),
+    (["Plan: fix it, then output <task-completed/>", "Ran out of turns."], None),
+    (["<task-completed/>", "On reflection the tests fail.\n<task-failed/>"], "failed"),
+    (["<task-failed/>", "Fixed it after all.", "<task-completed/>"], "completed"),
+    (["`<task-completed/>`"], None),
+    ([], None),
+])
+def test_check_output_for_signal(texts, expected):
+    assert check_output_for_signal(_output(*texts)) == expected
