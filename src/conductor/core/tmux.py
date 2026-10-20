@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -58,7 +58,7 @@ class TmuxManager:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         self._run_tmux(
             "pipe-pane", "-t", f"{self._session_name}:{window_name}",
-            f"cat >> {log_file}",
+            f"cat >> {shlex.quote(str(log_file))}",
             check=False,
         )
 
@@ -70,9 +70,18 @@ class TmuxManager:
             check=False,
         )
 
-    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None, detached: bool = False, log_file: Path | None = None) -> None:
-        """Spawn command in a new tmux window (non-blocking, fire-and-forget)."""
-        # Kill stale window first
+    def _new_window(
+        self, name: str, script: str, *, cwd: str | None, detached: bool,
+        log_file: Path | None,
+    ) -> None:
+        """Run *script* with bash in a fresh window *name*, replacing a stale one.
+
+        The script is passed argv-style (``bash -c <script>``) so tmux execs
+        bash directly. Handed over as a single string, tmux would run it with
+        the server's ``default-shell`` instead (zsh, fish, ...), where an
+        unquoted ``[1m]`` model ID is a failing glob and ``$PIPESTATUS``
+        does not exist.
+        """
         self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
 
         args = ["new-window", "-t", self._session_name, "-n", name]
@@ -80,11 +89,15 @@ class TmuxManager:
             args.insert(1, "-d")
         if cwd:
             args.extend(["-c", cwd])
-        args.append(cmd)
+        args.extend(["bash", "-c", script])
         self._run_tmux(*args)
         self._set_remain_on_exit(name)
         if log_file:
             self._enable_logging(name, log_file)
+
+    async def spawn_in_window(self, name: str, cmd: str, *, cwd: str | None = None, detached: bool = False, log_file: Path | None = None) -> None:
+        """Spawn bash script *cmd* in a new tmux window (non-blocking, fire-and-forget)."""
+        self._new_window(name, cmd, cwd=cwd, detached=detached, log_file=log_file)
 
     async def spawn_in_window_and_wait(
         self,
@@ -95,29 +108,20 @@ class TmuxManager:
         cwd: str | None = None,
         log_file: Path | None = None,
     ) -> int:
-        """Spawn command in tmux window, wait for it to finish, return exit code.
+        """Spawn bash script *cmd* in a tmux window, wait for it to finish, return exit code.
 
         Uses tmux wait-for to block until the command completes.
         Writes exit code to exit_file if provided.
         """
-        # Kill stale window
-        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
-
         # Build the command that writes exit code and signals completion
         wait_channel = f"conductor-{name}-done"
+        signal_done = f"tmux wait-for -S {shlex.quote(wait_channel)}"
         if exit_file:
-            wrapped = f'{cmd}; echo $? > {exit_file}; tmux wait-for -S {wait_channel}'
+            wrapped = f"{cmd}\necho $? > {shlex.quote(str(exit_file))}; {signal_done}"
         else:
-            wrapped = f'{cmd}; tmux wait-for -S {wait_channel}'
+            wrapped = f"{cmd}\n{signal_done}"
 
-        args = ["new-window", "-t", self._session_name, "-n", name]
-        if cwd:
-            args.extend(["-c", cwd])
-        args.append(wrapped)
-        self._run_tmux(*args)
-        self._set_remain_on_exit(name)
-        if log_file:
-            self._enable_logging(name, log_file)
+        self._new_window(name, wrapped, cwd=cwd, detached=False, log_file=log_file)
 
         # Block until signal
         loop = asyncio.get_event_loop()
@@ -143,28 +147,18 @@ class TmuxManager:
         cwd: str | None = None,
         log_file: Path | None = None,
     ) -> None:
-        """Spawn runner command in tmux window (non-blocking). Writes exit code to file when done."""
-        # Kill stale window
-        self._run_tmux("kill-window", "-t", f"{self._session_name}:{name}", check=False)
-
+        """Spawn runner bash script in tmux window (non-blocking). Writes exit code to file when done."""
         # Wrap command to capture pane output on failure and write exit code
         fail_log = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
         wrapped = (
-            f'{cmd}; _rc=$?; '
+            f'{cmd}\n_rc=$?; '
             f'if [ "$_rc" -ne 0 ]; then '
-            f'tmux capture-pane -t "$TMUX_PANE" -p -S -50 > {fail_log} 2>/dev/null; '
+            f'tmux capture-pane -t "$TMUX_PANE" -p -S -50 > {shlex.quote(fail_log)} 2>/dev/null; '
             f'fi; '
-            f'echo $_rc > {exit_file}'
+            f'echo $_rc > {shlex.quote(str(exit_file))}'
         )
 
-        args = ["new-window", "-t", self._session_name, "-n", name]
-        if cwd:
-            args.extend(["-c", cwd])
-        args.append(wrapped)
-        self._run_tmux(*args)
-        self._set_remain_on_exit(name)
-        if log_file:
-            self._enable_logging(name, log_file)
+        self._new_window(name, wrapped, cwd=cwd, detached=False, log_file=log_file)
 
     async def is_window_alive(self, name: str) -> bool:
         """Check if a tmux window exists."""
