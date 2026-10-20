@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -260,3 +261,24 @@ async def test_human_wait_does_not_stop_an_executing_run(loop_env, monkeypatch, 
 
     assert monitor.await_count == 1
     assert state.runs[0].stages[0].status == StageStatus.SPEC_NEEDS_INPUT
+
+
+@pytest.mark.asyncio
+async def test_second_conductor_on_the_same_project_is_refused(loop_env, tmp_path):
+    """A second loop must not start while one runs: it would kill the first
+    one's tmux windows and overwrite its state file."""
+    state = _state(_active(0, "feat-a", StageStatus.EXECUTING))
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=1, project_root=tmp_path)
+    storage = StorageResolver(tmp_path)
+    holder = orch._lock_project(storage, state.project_name)
+    try:
+        with patch.object(orch, "_conductor_run_loop", AsyncMock()) as loop:
+            with pytest.raises(orch.ProjectLocked, match=f"pid {os.getpid()}"):
+                await conductor_run_loop(state, config)
+        loop.assert_not_awaited()
+    finally:
+        holder.close()
+
+    # Released: the next start runs.
+    with patch.object(orch, "_conductor_run_loop", AsyncMock(return_value=state)) as loop:
+        assert await conductor_run_loop(state, config) is state

@@ -3508,7 +3508,57 @@ async def _auto_resume_blocked_runs(
 # ---------------------------------------------------------------------------
 
 
+class ProjectLocked(RuntimeError):
+    """Another conductor process is already running this project."""
+
+
+def _lock_project(storage: StorageResolver, project_name: str):
+    """Hold conductor.lock in the project's conductor dir, or raise ProjectLocked.
+
+    Two loops on one project would kill each other's tmux windows by name
+    and overwrite each other's CONDUCTOR-STATE.json. The lock is released
+    when the returned file is closed or the process exits.
+    """
+    import fcntl  # noqa: PLC0415
+
+    conductor_dir = storage.conductor_dir(project_name)
+    conductor_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(conductor_dir / "conductor.lock", "a+")  # noqa: SIM115
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        holder = lock.read().strip() or "unknown"
+        lock.close()
+        raise ProjectLocked(
+            f"conductor is already running project {project_name} (pid {holder}); "
+            "stop it or let it finish before starting another"
+        ) from None
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    return lock
+
+
 async def conductor_run_loop(
+    state: ConductorState,
+    config: ConductorConfig,
+) -> ConductorState:
+    """Run the orchestration loop while holding the project's lock.
+
+    Raises ProjectLocked, before touching any state, tmux window or
+    worktree, when another conductor process runs the same project.
+    """
+    storage = StorageResolver(config.project_root or Path.cwd())
+    lock = _lock_project(storage, state.project_name)
+    try:
+        return await _conductor_run_loop(state, config)
+    finally:
+        lock.close()
+
+
+async def _conductor_run_loop(
     state: ConductorState,
     config: ConductorConfig,
 ) -> ConductorState:
