@@ -35,12 +35,24 @@ def test_conductor_help():
     )
 
 
-def test_conductor_init():
+def test_conductor_init(tmp_path, monkeypatch):
+    import subprocess
+
     from conductor.cli import main
 
-    stdout, stderr, code = _run_main(main, ["conductor", "init", "--name", "test"])
+    # Keep state out of the real ~/.conductor and off the developer's checkout.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CONDUCTOR_HOME", raising=False)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+
+    stdout, stderr, code = _run_main(
+        main, ["conductor", "init", "--name", "test", "--project-dir", str(repo)]
+    )
     assert code == 0
     assert "Initialized" in stdout
+    assert str(home / ".conductor" / "projects") in stdout
 
 
 def test_conductor_unknown_subcommand():

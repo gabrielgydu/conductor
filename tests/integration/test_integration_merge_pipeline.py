@@ -16,6 +16,9 @@ from conductor.core.enums import IntegrationStatus, RunStatus
 from conductor.core.models import ConductorState, RunState, StageState
 from conductor.integration.merge import run_integration_merge
 
+# No real Claude / npx / gh-retry sleeps; see tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("hermetic_merge")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,11 +45,13 @@ def _project_name(tmp_path: Path) -> str:
     return f"it{abs(hash(str(tmp_path))) % 999999:06d}"
 
 
-def _make_state(project_name: str, *runs: RunState) -> ConductorState:
+def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
+    """State whose integration worktree lives under tmp_path, not /tmp."""
     return ConductorState(
-        project_name=project_name,
+        project_name=_project_name(tmp_path),
         base_branch="main",
         runs=list(runs),
+        worktrees_base=str(tmp_path / "worktrees"),
     )
 
 
@@ -68,7 +73,7 @@ async def test_full_merge_pipeline(real_merge_repo, tmp_path):
     run2 = _done_run_with_branch(2, "feat-c", "branch-c")
     run2.depends_on = [0]
 
-    state = _make_state(project_name, run0, run1, run2)
+    state = _make_state(tmp_path, run0, run1, run2)
     storage = FakeStorage(real_merge_repo.path)
 
     with patch(
@@ -134,9 +139,8 @@ async def test_merge_with_conflicts(real_merge_repo, tmp_path):
         "conflict-b", {"shared.txt": "version from branch-b\n"}
     )
 
-    project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "conflict-a"),
         _done_run_with_branch(1, "feat-b", "conflict-b"),
     )
@@ -209,7 +213,7 @@ async def test_partial_merge(real_merge_repo, tmp_path):
 
     project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "partial-a"),
         _done_run_with_branch(1, "feat-b", "partial-b"),
     )
@@ -278,7 +282,7 @@ async def test_merge_skips_failed_runs(real_merge_repo, tmp_path):
         status=RunStatus.BLOCKED,
     )
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "branch-a"),
         _done_run_with_branch(1, "feat-b", "branch-b"),
         run_blocked,
@@ -318,9 +322,8 @@ async def test_merge_skipped_single_run(real_merge_repo, tmp_path):
     """When only 1 DONE run exists, merge is skipped and merged_runs is empty."""
     real_merge_repo.create_branch("branch-a", {"file_a.txt": "content a\n"})
 
-    project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "branch-a"),
     )
     storage = FakeStorage(real_merge_repo.path)

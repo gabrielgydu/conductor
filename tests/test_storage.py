@@ -69,7 +69,12 @@ def test_not_a_git_repo():
 
 KNOWN_ROOT = Path("/home/user/dev/repo")
 KNOWN_KEY = "-home-user-dev-repo"
-CONDUCTOR_BASE = Path.home() / ".conductor" / "projects" / KNOWN_KEY
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """StorageResolver mkdirs under Path.home(); never let that be the real one."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 def make_resolver(tmp_path=None):
@@ -78,10 +83,10 @@ def make_resolver(tmp_path=None):
         return StorageResolver(KNOWN_ROOT)
 
 
-def test_base_dir_location(monkeypatch):
+def test_base_dir_location(tmp_path, monkeypatch):
     monkeypatch.delenv("CONDUCTOR_HOME", raising=False)
     resolver = make_resolver()
-    assert resolver.base_dir == CONDUCTOR_BASE
+    assert resolver.base_dir == tmp_path / "home" / ".conductor" / "projects" / KNOWN_KEY
 
 
 def test_conductor_home_env_overrides_base_dir(tmp_path, monkeypatch):

@@ -16,6 +16,9 @@ from conductor.core.enums import IntegrationStatus, RunStatus
 from conductor.core.models import ConductorState, RunState, StageState
 from conductor.integration.merge import run_integration_merge
 
+# No real Claude / npx / gh-retry sleeps; see tests/integration/conftest.py.
+pytestmark = pytest.mark.usefixtures("hermetic_merge")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,11 +46,13 @@ def _project_name(tmp_path: Path) -> str:
     return f"it{abs(hash(str(tmp_path))) % 999999:06d}"
 
 
-def _make_state(project_name: str, *runs: RunState) -> ConductorState:
+def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
+    """State whose integration worktree lives under tmp_path, not /tmp."""
     return ConductorState(
-        project_name=project_name,
+        project_name=_project_name(tmp_path),
         base_branch="main",
         runs=list(runs),
+        worktrees_base=str(tmp_path / "worktrees"),
     )
 
 
@@ -57,14 +62,14 @@ def _make_state(project_name: str, *runs: RunState) -> ConductorState:
 
 
 @pytest.mark.asyncio
-async def test_full_merge_real_git(real_merge_repo, tmp_path):
+async def test_full_merge_real_git(real_merge_repo, tmp_path, hermetic_merge):
     """Two non-conflicting branches → both merged into integration branch."""
     real_merge_repo.create_branch("branch-a", {"file_a.txt": "content from a\n"})
     real_merge_repo.create_branch("branch-b", {"file_b.txt": "content from b\n"})
 
     project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "branch-a"),
         _done_run_with_branch(1, "feat-b", "branch-b"),
     )
@@ -91,6 +96,12 @@ async def test_full_merge_real_git(real_merge_repo, tmp_path):
     files = ls.stdout.splitlines()
     assert "file_a.txt" in files
     assert "file_b.txt" in files
+
+    # Post-merge validation ran once, against the integration worktree
+    hermetic_merge.validate.assert_awaited_once()
+    vctx = hermetic_merge.validate.await_args.args[0]
+    assert vctx.stage == "integration"
+    assert vctx.project_dir == tmp_path / "worktrees" / f"integration-{project_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +135,7 @@ async def test_conflict_theirs_real_git(real_merge_repo, tmp_path):
 
     project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "conflict-a"),
         _done_run_with_branch(1, "feat-b", "conflict-b"),
     )
@@ -176,9 +187,8 @@ async def test_conflict_markers_real_git(real_merge_repo, tmp_path):
     real_merge_repo.create_branch("claude-a", {"shared.txt": "version from a\n"})
     real_merge_repo.create_branch("claude-b", {"shared.txt": "version from b\n"})
 
-    project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "claude-a"),
         _done_run_with_branch(1, "feat-b", "claude-b"),
     )
@@ -231,7 +241,7 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
 
     project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "wt-a"),
         _done_run_with_branch(1, "feat-b", "wt-b"),
     )
@@ -278,6 +288,17 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
     )
     assert result.status == IntegrationStatus.DONE
 
+    # Worktree lives under worktrees_base and is removed after a clean run
+    worktree = tmp_path / "worktrees" / f"integration-{project_name}"
+    assert not worktree.exists()
+    wt_list = subprocess.run(
+        ["git", "-C", str(real_merge_repo.path), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert str(worktree) not in wt_list
+
 
 # ---------------------------------------------------------------------------
 # Test 5: Rerun cleans previous branch and worktree
@@ -292,7 +313,7 @@ async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
 
     project_name = _project_name(tmp_path)
     state = _make_state(
-        project_name,
+        tmp_path,
         _done_run_with_branch(0, "feat-a", "rerun-a"),
         _done_run_with_branch(1, "feat-b", "rerun-b"),
     )
@@ -330,3 +351,38 @@ async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
         text=True,
     ).stdout
     assert branch_name in branches_after
+    assert not (tmp_path / "worktrees" / f"integration-{project_name}").exists()
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Failed post-merge validation -> NEEDS_FIX
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_marks_needs_fix(
+    real_merge_repo, tmp_path, hermetic_merge
+):
+    """A clean merge whose post-merge validation fails ends as NEEDS_FIX."""
+    from conductor.core.validation import ValidationResult
+
+    real_merge_repo.create_branch("vf-a", {"vf_a.txt": "a\n"})
+    real_merge_repo.create_branch("vf-b", {"vf_b.txt": "b\n"})
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "vf-a"),
+        _done_run_with_branch(1, "feat-b", "vf-b"),
+    )
+    hermetic_merge.validate.return_value = ValidationResult(
+        passed=False, summary="1/2 checks passed. Failed: smoke"
+    )
+
+    with patch(
+        "conductor.integration.merge._run_git_gh",
+        new_callable=AsyncMock,
+        return_value=(1, "", "no remote"),
+    ):
+        result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.NEEDS_FIX
+    assert result.merged_runs == [0, 1]

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import stat
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Callable
+from types import SimpleNamespace
+from typing import Callable, Iterator
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
 from conductor.core.storage import StorageResolver
+from conductor.core.tmux import MIN_HEALTHY_TREE_DEPTH, TmuxManager
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +145,23 @@ def mock_claude_cli(tmp_path, monkeypatch) -> MockClaudeCLI:
 
 
 class MockTmux:
+    """In-memory fake of ``conductor.core.tmux.TmuxManager``.
+
+    Production code never receives this object directly: the ``mock_tmux``
+    fixture patches ``TmuxManager`` with a factory returning
+    :func:`tmux_proxy`, a ``create_autospec(TmuxManager)`` that checks every
+    call against the *real* signature and then delegates here. Keyword-only
+    options the fake does not model (``log_file``, ``detached``, ...) land in
+    ``**_opts``, so a new optional parameter on ``TmuxManager`` does not break
+    the fake, while a call the real class would reject still raises TypeError.
+    """
+
     def __init__(self) -> None:
         self._windows: dict[str, dict] = {}
         self._session_name: str | None = None
         self._spawned_commands: list[dict] = []
         self._spawn_callback: Callable | None = None
+        self._files_written: set[Path] = set()
 
     @property
     def windows(self) -> dict:
@@ -155,20 +171,34 @@ class MockTmux:
     def session_name(self) -> str | None:
         return self._session_name
 
+    # -- test controls -------------------------------------------------------
+
+    def _window(self, name: str) -> dict:
+        return self._windows.setdefault(name, {})
+
     def set_window_alive(self, name: str, alive: bool) -> None:
-        if name not in self._windows:
-            self._windows[name] = {}
-        self._windows[name]["alive"] = alive
+        self._window(name)["alive"] = alive
 
     def set_window_pid(self, name: str, pid: int) -> None:
-        if name not in self._windows:
-            self._windows[name] = {}
-        self._windows[name]["pid"] = pid
+        self._window(name)["pid"] = pid
 
     def set_window_exit_code(self, name: str, code: int) -> None:
-        if name not in self._windows:
-            self._windows[name] = {}
-        self._windows[name]["exit_code"] = code
+        self._window(name)["exit_code"] = code
+
+    def set_window_children(self, name: str, healthy: bool) -> None:
+        """Answer for ``has_active_children`` (real: pstree depth of the pane)."""
+        self._window(name)["children"] = healthy
+
+    def finish_window(self, name: str, exit_code: int = 0) -> None:
+        """Simulate the command running in *name* exiting with *exit_code*.
+
+        Mirrors the real wrappers: the shell has no children any more and the
+        exit code lands in the exit file given to ``spawn_runner_in_window``.
+        """
+        window = self._window(name)
+        window.update(alive=False, children=False, exit_code=exit_code)
+        if window.get("exit_file") is not None:
+            self._write(window["exit_file"], str(exit_code))
 
     def get_spawned_commands(self) -> list[dict]:
         return self._spawned_commands
@@ -176,84 +206,134 @@ class MockTmux:
     def set_spawn_callback(self, callback: Callable) -> None:
         self._spawn_callback = callback
 
-    async def ensure_session(self, name: str | None = None) -> None:
-        if name is not None:
-            self._session_name = name
+    def cleanup(self) -> None:
+        """Delete the exit files this fake wrote (production puts them in /tmp)."""
+        for path in self._files_written:
+            path.unlink(missing_ok=True)
+        self._files_written.clear()
 
-    async def spawn_in_window(self, name: str, cmd: str, *, cwd=None) -> None:
-        self._spawned_commands.append({"window": name, "cmd": cmd})
-        if name not in self._windows:
-            self._windows[name] = {"alive": True}
-        else:
-            self._windows[name]["alive"] = True
-        if self._spawn_callback is not None:
-            result = self._spawn_callback(name, cmd)
-            if asyncio.iscoroutine(result):
-                await result
+    def _write(self, path: Path, text: str) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        self._files_written.add(path)
 
-    async def spawn_runner_in_window(
-        self, name: str, cmd: str, *, exit_file=None, cwd=None
+    async def _spawned(
+        self, name: str, cmd: str, exit_file: Path | None = None, **record
     ) -> None:
-        """Non-blocking spawn (runner). Optionally writes exit file."""
-        self._spawned_commands.append({"window": name, "cmd": cmd, "runner": True})
-        if name not in self._windows:
-            self._windows[name] = {"alive": True}
-        else:
-            self._windows[name]["alive"] = True
+        self._spawned_commands.append({"window": name, "cmd": cmd, **record})
+        window = self._window(name)
+        window.pop("exit_code", None)  # each command starts without a result
+        window.update(alive=True, children=True, exit_file=exit_file)
         if self._spawn_callback is not None:
             result = self._spawn_callback(name, cmd)
             if asyncio.iscoroutine(result):
                 await result
+
+    # -- TmuxManager interface ----------------------------------------------
+
+    def session_exists(self) -> bool:
+        return self._session_name is not None
+
+    async def ensure_session(self) -> None:
+        pass
+
+    async def spawn_in_window(self, name: str, cmd: str, **_opts) -> None:
+        await self._spawned(name, cmd)
 
     async def spawn_in_window_and_wait(
-        self, name: str, cmd: str, *, exit_file=None, cwd=None
+        self, name: str, cmd: str, *, exit_file: Path | None = None, **_opts
     ) -> int:
-        self._spawned_commands.append({"window": name, "cmd": cmd, "waited": True})
-        if name not in self._windows:
-            self._windows[name] = {"alive": False, "exit_code": 0}
-        if self._spawn_callback is not None:
-            result = self._spawn_callback(name, cmd)
-            if asyncio.iscoroutine(result):
-                await result
-        return self._windows.get(name, {}).get("exit_code", 0)
+        """Blocking spawn: the command has finished by the time this returns."""
+        await self._spawned(name, cmd, exit_file=exit_file, waited=True)
+        exit_code = self._window(name).get("exit_code", 0)
+        self.finish_window(name, exit_code)
+        return exit_code
+
+    async def spawn_runner_in_window(
+        self, name: str, cmd: str, *, exit_file: Path, **_opts
+    ) -> None:
+        """Non-blocking spawn: tests call ``finish_window`` to end the runner."""
+        await self._spawned(name, cmd, exit_file=Path(exit_file), runner=True)
 
     async def is_window_alive(self, name: str) -> bool:
         return self._windows.get(name, {}).get("alive", False)
 
+    async def is_runner_idle(self, name: str) -> bool:
+        return not self._windows.get(name, {}).get("alive", False)
+
     async def get_pane_pid(self, name: str) -> int | None:
         return self._windows.get(name, {}).get("pid", None)
+
+    async def has_active_children(
+        self, name: str, depth: int = MIN_HEALTHY_TREE_DEPTH
+    ) -> bool:
+        window = self._windows.get(name, {})
+        return window.get("children", window.get("alive", False))
+
+    async def send_keys(self, name: str, keys: str) -> None:
+        pass
 
     async def kill_window(self, name: str) -> None:
         if name in self._windows:
             self._windows[name]["alive"] = False
 
-    async def send_keys(self, name: str, keys: str) -> None:
-        pass
+    async def kill_session(self) -> None:
+        self._session_name = None
+        for window in self._windows.values():
+            window["alive"] = False
 
     async def capture_pane(self, name: str, lines: int = 20) -> str:
         return ""
 
-    async def is_runner_idle(self, name: str) -> bool:
-        return not self._windows.get(name, {}).get("alive", False)
 
-    def session_exists(self) -> bool:
-        return self._session_name is not None
+def _refuse_real_tmux(name: str) -> Callable:
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"TmuxManager.{name} would run the real tmux binary in a test")
 
-    async def kill_session(self, name: str | None = None) -> None:
-        self._session_name = None
-        for key in self._windows:
-            self._windows[key]["alive"] = False
+    return refuse
+
+
+def tmux_proxy(fake: MockTmux) -> TmuxManager:
+    """Wrap *fake* in an autospec of ``TmuxManager`` (real signatures enforced).
+
+    Every public ``TmuxManager`` method needs a fake - this fails loudly when
+    the real class grows one - and private helpers that shell out to ``tmux``
+    raise instead of returning a silent MagicMock.
+    """
+    proxy = create_autospec(TmuxManager, instance=True)
+    for name, member in inspect.getmembers(TmuxManager, inspect.isfunction):
+        if name.startswith("__"):
+            continue
+        if name.startswith("_"):
+            behaviour = _refuse_real_tmux(name)
+        else:
+            behaviour = getattr(fake, name, None)
+            if behaviour is None:
+                raise AssertionError(
+                    f"MockTmux has no fake for TmuxManager.{name}"
+                    f"{inspect.signature(member)} - add one in tests/integration/conftest.py"
+                )
+        getattr(proxy, name).side_effect = behaviour
+    proxy._session_name = fake.session_name
+    return proxy
 
 
 @pytest.fixture
-def mock_tmux(monkeypatch) -> MockTmux:
+def mock_tmux(monkeypatch) -> Iterator[MockTmux]:
+    """Fake tmux; code under test gets a signature-checked proxy of it."""
     tmux = MockTmux()
-    # Patch TmuxManager wherever it might be imported
-    try:
-        monkeypatch.setattr("conductor.core.tmux.TmuxManager", lambda *a, **kw: tmux)
-    except (AttributeError, ModuleNotFoundError):
-        pass
-    return tmux
+    real_init = inspect.signature(TmuxManager)
+
+    def factory(*args, **kwargs):
+        bound = real_init.bind(*args, **kwargs)  # TypeError on drift, like the real class
+        bound.apply_defaults()
+        tmux._session_name = bound.arguments["session_name"]
+        return tmux_proxy(tmux)
+
+    monkeypatch.setattr("conductor.core.tmux.TmuxManager", factory)
+    yield tmux
+    tmux.cleanup()
 
 
 @pytest.fixture(autouse=True)
@@ -265,6 +345,37 @@ def mock_conductor_post_run(monkeypatch):
         "conductor.core.orchestrator.conductor_post_run",
         AsyncMock(return_value=None),
     )
+
+
+@pytest.fixture
+def isolated_run_loop(monkeypatch) -> SimpleNamespace:
+    """Isolate ``conductor_run_loop`` from the network, real tools and other tests.
+
+    Otherwise a single DONE run does ``git push`` + ``gh pr create`` (three
+    attempts, 5 s sleeps), two or more DONE runs start a real integration
+    merge (a worktree under /tmp, ``gh``, ``npx playwright``, ``claude``), and
+    the module-level zombie counter leaks between tests that reuse window names.
+    """
+    import conductor.core.orchestrator as orch
+    import conductor.integration.merge as merge
+    from conductor.core.enums import IntegrationStatus, RunStatus
+    from conductor.core.models import IntegrationState
+
+    async def fake_merge(state, storage):
+        return IntegrationState(
+            status=IntegrationStatus.DONE,
+            branch=f"integration/{state.project_name}",
+            merged_runs=[r.index for r in state.runs if r.status == RunStatus.DONE],
+        )
+
+    mocks = SimpleNamespace(
+        push_and_pr=AsyncMock(return_value=None),
+        integration_merge=AsyncMock(side_effect=fake_merge),
+    )
+    monkeypatch.setattr(orch, "_push_and_pr_for_branch", mocks.push_and_pr)
+    monkeypatch.setattr(merge, "run_integration_merge", mocks.integration_merge)
+    monkeypatch.setattr(orch, "_shallow_tree_counts", {})
+    return mocks
 
 
 @pytest.fixture(autouse=True)
@@ -356,36 +467,39 @@ class MockSpeccer:
     def _handle_spawn(
         self, window_name: str, cmd: str, storage_path: Path | None = None
     ) -> None:
-        # Detect if this is a speccer init call — init calls don't count toward
-        # fail_count since they just set up the spec, not drive the spec cycle.
-        is_init_call = " init " in cmd and "--feature" not in cmd
-
+        subcommand, options = _parse_speccer_cmd(cmd)
         self._invocations.append(
             {"window": window_name, "cmd": cmd, "count": self._invoke_count}
         )
+        progress_path = self._find_progress_path(options, storage_path)
 
-        if not is_init_call:
-            self._invoke_count += 1
+        if subcommand == "init":
+            # Init only sets the spec dir up: INIT status, not counted as a run.
+            if progress_path:
+                write_speccer_progress(progress_path, "INIT")
+            return
+        if subcommand == "generate":
+            # Real `speccer generate` leaves docs/<feature>/run.sh with PHASES arrays.
+            if progress_path:
+                write_generated_run_sh(progress_path.parent.parent)
+            return
+
+        self._invoke_count += 1
         invoke = self._invoke_count
 
-        # Determine status to write:
-        # - First fail_count RUN invocations: FAILED (explicit failure, triggers retry)
-        # - Next invocation after fails: NEEDS_INPUT (if needs_input=True)
-        # - All subsequent: final_status
-        if is_init_call:
-            status = "INIT"  # Init always writes INIT to signal successful setup
-        elif invoke <= self._fail_count:
+        # Status written by `speccer run` (with or without --continue):
+        # - First fail_count runs: FAILED (explicit failure, triggers retry)
+        # - Next run after the failures: NEEDS_INPUT (if needs_input=True)
+        # - All subsequent runs: final_status
+        if invoke <= self._fail_count:
             status = "FAILED"
         elif self._needs_input and invoke == self._fail_count + 1:
             status = "NEEDS_INPUT"
         else:
             status = self._final_status
 
-        # Find PROGRESS.md path from cmd or use storage_path
-        progress_path = self._find_progress_path(cmd, storage_path)
         if progress_path:
-            progress_path.parent.mkdir(parents=True, exist_ok=True)
-            progress_path.write_text(f"STATUS: {status}\n")
+            write_speccer_progress(progress_path, status)
             # Write QUESTIONS.md alongside for NEEDS_INPUT scenarios
             if status == "NEEDS_INPUT":
                 questions_path = progress_path.parent / "QUESTIONS.md"
@@ -399,41 +513,48 @@ class MockSpeccer:
                     "**Answer:**\n"
                 )
 
-    def _find_progress_path(self, cmd: str, storage_path: Path | None) -> Path | None:
-        """Try to extract or construct a PROGRESS.md path from the command."""
+    def _find_progress_path(
+        self, options: dict[str, str], storage_path: Path | None
+    ) -> Path | None:
+        """PROGRESS.md the real speccer would write: <project-dir>/docs/<feature>/spec/."""
         if storage_path:
             return storage_path / "PROGRESS.md"
-        # Try to find path in cmd args
-        parts = cmd.split()
-        for i, part in enumerate(parts):
-            if part.endswith("PROGRESS.md"):
-                return Path(part)
-            if "spec" in part and Path(part).is_dir():
-                return Path(part) / "PROGRESS.md"
-
-        # Try to extract --project-dir and feature name from speccer command
-        # Command patterns:
-        #   speccer init <feature> --project-dir <wt> ...
-        #   speccer run --feature <feature> --project-dir <wt> ...
-        project_dir = None
-        feature_name = None
-        for i, part in enumerate(parts):
-            if part == "--project-dir" and i + 1 < len(parts):
-                project_dir = Path(parts[i + 1])
-            elif part == "--feature" and i + 1 < len(parts):
-                feature_name = parts[i + 1]
-            elif (
-                part == "init"
-                and i + 1 < len(parts)
-                and not parts[i + 1].startswith("-")
-            ):
-                # speccer init <feature_name>
-                feature_name = parts[i + 1]
-
-        if project_dir is not None and feature_name is not None:
-            return project_dir / "docs" / feature_name / "spec" / "PROGRESS.md"
-
+        if "--project-dir" in options and "--feature" in options:
+            return (
+                Path(options["--project-dir"]) / "docs" / options["--feature"]
+                / "spec" / "PROGRESS.md"
+            )
         return None
+
+
+def _parse_speccer_cmd(cmd: str) -> tuple[str | None, dict[str, str]]:
+    """Split ``cd <wt> && <bin>/speccer <subcommand> --opt value ...``."""
+    parts = cmd.split("&&")[-1].split()
+    subcommand = None
+    options: dict[str, str] = {}
+    for i, part in enumerate(parts):
+        if subcommand is None and Path(part).name == "speccer" and i + 1 < len(parts):
+            subcommand = parts[i + 1]
+        elif part.startswith("--"):
+            nxt = parts[i + 1] if i + 1 < len(parts) else ""
+            options[part] = "" if nxt.startswith("--") else nxt
+    return subcommand, options
+
+
+def write_generated_run_sh(feature_docs_dir: Path, phases: int = 2) -> Path:
+    """Write a run.sh shaped like `speccer generate` output (PHASES arrays)."""
+    lines = ["#!/bin/bash", 'CONDUCTOR_MODEL="sonnet"']
+    for n in range(1, phases + 1):
+        lines += [
+            f'PHASES[{n}]="phase-{n}.md"',
+            f'PHASE_NAMES[{n}]="Phase {n}"',
+            f'PHASE_TOKENS[{n}]="PHASE_{n}_COMPLETE"',
+        ]
+    run_sh = feature_docs_dir / "run.sh"
+    run_sh.parent.mkdir(parents=True, exist_ok=True)
+    run_sh.write_text("\n".join(lines) + "\n")
+    run_sh.chmod(run_sh.stat().st_mode | stat.S_IEXEC)
+    return run_sh
 
 
 @pytest.fixture
@@ -458,17 +579,10 @@ class MockRunner:
     def write_run_sh(
         self, feature_dir: Path, stall: bool = False, fail: bool = False
     ) -> None:
+        """Write the run.sh that `speccer generate` would leave in docs/<feature>/."""
         self._stall = stall
         self._fail = fail
-        run_sh = feature_dir / "run.sh"
-        feature_dir.mkdir(parents=True, exist_ok=True)
-        content = "#!/bin/bash\n"
-        if not stall:
-            content += "echo 'activity' > activity.log\n"
-        exit_code = 1 if fail else 0
-        content += f"exit {exit_code}\n"
-        run_sh.write_text(content)
-        run_sh.chmod(run_sh.stat().st_mode | stat.S_IEXEC)
+        write_generated_run_sh(feature_dir)
 
     def set_steer_handler(self, handler: Callable) -> None:
         self._steer_handler = handler
@@ -603,6 +717,40 @@ def real_merge_repo(tmp_path) -> RealMergeRepo:
         capture_output=True,
     )
     return RealMergeRepo(repo)
+
+
+@pytest.fixture
+def hermetic_merge(monkeypatch):
+    """Keep run_integration_merge's real-git tests away from Claude, npx and gh sleeps.
+
+    Post-merge validation (smoke via ``npx playwright`` + Claude self-healing) and
+    integration-test generation are replaced with passing stubs, the PR retry
+    delay is zeroed, and every ``run_claude`` binding on the merge path fails the
+    test loudly instead of starting a real (paid) Claude session.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import conductor.core.validation as validation_module
+    import conductor.integration.e2e as e2e_module
+    import conductor.integration.merge as merge_module
+    from conductor.core.models import E2ETestState
+    from conductor.core.validation import ValidationResult
+
+    async def _no_real_claude(*args, **kwargs):
+        # pytest.fail raises a BaseException, so `except Exception` in e2e.py
+        # cannot swallow it.
+        pytest.fail("real Claude CLI must not be invoked from merge tests")
+
+    for module in (merge_module, validation_module, e2e_module):
+        monkeypatch.setattr(module, "run_claude", _no_real_claude)
+
+    validate = AsyncMock(return_value=ValidationResult(passed=True, summary="stubbed"))
+    e2e = AsyncMock(return_value=E2ETestState(skipped=1))
+    monkeypatch.setattr(merge_module, "validate_and_fix", validate)
+    monkeypatch.setattr(e2e_module, "run_integration_testing", e2e)
+    monkeypatch.setattr(merge_module, "_GH_RETRY_DELAY_S", 0)
+    return SimpleNamespace(validate=validate, e2e=e2e)
 
 
 # ---------------------------------------------------------------------------

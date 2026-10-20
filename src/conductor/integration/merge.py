@@ -18,7 +18,6 @@ from conductor.core.models import (
     RunState,
 )
 from conductor.core.validation import ValidationContext, validate_and_fix
-from conductor.core.smoke_test import generate_smoke_test
 
 logger = logging.getLogger(__name__)
 
@@ -362,13 +361,9 @@ async def run_integration_merge(
     _print(f"Merged {len(merged_runs)} runs, pushing {branch_name}")
     await _run_git(["push", "origin", branch_name], wt)
 
-    # --- Generate smoke test ---
-    smoke_src = generate_smoke_test(wt)
-    smoke_path = wt / "tests" / "Playwright" / "tests" / "conductor-smoke.spec.ts"
-    smoke_path.parent.mkdir(parents=True, exist_ok=True)
-    smoke_path.write_text(smoke_src, encoding="utf-8")
-
     # --- Post-merge validation with self-healing ---
+    # The smoke check writes tests/Playwright/tests/conductor-smoke.spec.ts itself
+    # when it falls back to the generated Playwright smoke test.
     _print("Running post-merge validation (smoke + integration-tests)")
     vctx = ValidationContext(
         project_dir=wt,
