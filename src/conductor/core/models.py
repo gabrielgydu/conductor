@@ -68,6 +68,9 @@ class StageState(BaseModel):
     spec_failures: int = 0
     # `speccer run --continue` rounds started with auto-answered questions.
     question_rounds: int = 0
+    # Worktree HEAD when the last failure was handled; a different HEAD at the
+    # next failure means the runner committed in between (real progress).
+    last_failure_head: str | None = None
 
 
 class RunState(BaseModel):

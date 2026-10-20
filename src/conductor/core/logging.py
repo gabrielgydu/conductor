@@ -58,6 +58,7 @@ EVENT_REGISTRY: dict[str, EventConfig] = {
     "AUTO_RESUME":       EventConfig("↻",  True),
     "TRANSIENT_FAILURE": EventConfig("⏳", True),
     "TRANSIENT_RETRY":   EventConfig("↻",  True),
+    "RETRY_BUDGET_RESET": EventConfig("↻", True),
     # Loop events
     "LOOP_START":        EventConfig("●",  True),
     "LOOP_DONE":         EventConfig("■",  True),

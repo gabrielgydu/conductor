@@ -2113,6 +2113,75 @@ def _schedule_backoff(
     return True
 
 
+def _worktree_head(worktree: str | None) -> str | None:
+    """The worktree's HEAD commit, or None if it cannot be read."""
+    if not worktree:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+# A runner that ran this long before a transient failure saw a working API:
+# the failure starts a new 8-hour window.
+TRANSIENT_WINDOW_RESET_S = 2 * 3600
+
+
+def _reset_budgets_after_progress(
+    state: ConductorState,
+    run_idx: int,
+    stage_idx: int,
+    log_path: Path | None,
+    audit_path: Path | None,
+) -> None:
+    """Give a failure that follows real progress fresh infra/transient budgets.
+
+    Progress is a commit since the previous failure, not activity (every
+    restarted session writes its activity log). Without a commit the caps
+    stay, so a crash loop or a long outage still blocks. The logic-retry
+    budget (brain-diagnosed) is never reset here.
+    """
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
+    head = _worktree_head(stage.worktree)
+    committed = bool(head and stage.last_failure_head and head != stage.last_failure_head)
+    long_run = (
+        stage.started_at is not None
+        and stage.first_transient_failure_ts is not None
+        and stage.first_transient_failure_ts < stage.started_at
+        and (datetime.now(timezone.utc) - stage.started_at).total_seconds()
+        > TRANSIENT_WINDOW_RESET_S
+    )
+    if head:
+        stage.last_failure_head = head
+    if not (committed or long_run):
+        return
+    if stage.infra_retries or stage.transient_retries or stage.first_transient_failure_ts:
+        _log(
+            "RETRY_BUDGET_RESET",
+            f"Run {run.name} stage {stage.name}: "
+            + ("new commits since the last failure" if committed else "ran for hours since")
+            + ", infra/transient retry budgets reset",
+            log_path,
+            audit_path,
+            run=run_idx,
+            stage=stage_idx,
+        )
+    if committed:
+        stage.infra_retries = 0
+    stage.transient_retries = 0
+    stage.first_transient_failure_ts = None
+
+
 async def handle_failure(
     state: ConductorState,
     run_idx: int,
@@ -2133,6 +2202,7 @@ async def handle_failure(
         stage,
         [_runner_fail_log(storage, state.project_name, fname)],
     )
+    _reset_budgets_after_progress(state, run_idx, stage_idx, log_path, audit_path)
 
     # Infra failures: auto-retry without brain call, separate budget (cap 5)
     if failure_type == "infra":
