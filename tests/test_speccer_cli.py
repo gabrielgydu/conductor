@@ -310,6 +310,39 @@ async def test_consecutive_rejections_stop_for_a_human(spec_dir, fake_claude):
     assert sc.read_status(spec_dir) == "NEEDS_INPUT"
 
 
+@pytest.mark.asyncio
+async def test_human_reset_after_cap_resumes_without_questions(spec_dir, fake_claude):
+    # A first iteration that wrote no questions, then the cap: QUESTIONS.md stays empty.
+    cap = sc.MAX_REJECTED_COMPLETIONS
+    fake_claude.on_call = lambda n: n <= cap and _domain(spec_dir, "Retention: [NEEDS CLARIFICATION: how long?]")
+    fake_claude.outputs = [_complete() for _ in range(cap + 1)]
+    codes = [await _run(spec_dir, cont=True) for _ in range(cap)]
+    assert codes == [1] * (cap - 1) + [sc.EXIT_NEEDS_HUMAN]
+    assert (spec_dir / "QUESTIONS.md").read_text() == ""
+
+    # What _stop_for_human tells the human to do.
+    _domain(spec_dir, "Retention: 30 days.")
+    sc.update_rejected_completions(spec_dir, 0)
+
+    await _run(spec_dir, cont=True)  # generate then fails its output check; irrelevant here
+
+    assert len(fake_claude.prompts) == cap + 2, "the spec session and generate should have run"
+    assert sc.read_status(spec_dir) == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_continue_still_needs_answers_to_open_questions(spec_dir, fake_claude):
+    sc.update_status(spec_dir, "NEEDS_INPUT")
+    (spec_dir / "QUESTIONS.md").write_text(
+        "## Round 1 Questions\n\n### Q1: Auth\n\n**Answer:**\n", encoding="utf-8",
+    )
+
+    assert await _run(spec_dir, cont=True) == 1
+
+    assert fake_claude.prompts == []
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+
+
 # ---------------------------------------------------------------------------
 # Prompt selection
 # ---------------------------------------------------------------------------

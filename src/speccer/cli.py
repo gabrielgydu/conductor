@@ -522,8 +522,9 @@ def _record_rejection(spec_dir: Path, iteration: int, markers: list[str], reject
 def _stop_for_human(spec_dir: Path, rejected: int) -> None:
     _die(
         f"SPEC_COMPLETE was rejected {rejected} times in a row; {spec_dir}/HANDOFF.md lists "
-        f"the markers that blocked it. Resolve them in {spec_dir}/domains/ by hand, then "
-        f"set REJECTED_COMPLETIONS: 0 in PROGRESS.md to resume the spec loop.",
+        f"the markers that blocked it. Resolve them in {spec_dir}/domains/ by hand and "
+        f"answer any open questions in QUESTIONS.md, then set REJECTED_COMPLETIONS: 0 in "
+        f"PROGRESS.md and run: speccer run --continue --spec-dir {spec_dir}",
         code=EXIT_NEEDS_HUMAN,
     )
 
@@ -674,9 +675,12 @@ Immutable principles that ALL specs and implementations must respect. The spec a
 def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejection: bool) -> None:
     """Check that a NEEDS_INPUT spec may continue, and archive its questions round.
 
-    After a rejected SPEC_COMPLETE no new answers are needed: the next
-    session's job is to resolve the markers listed in HANDOFF.md, and there
-    may be no open questions at all.
+    Answers are required only when QUESTIONS.md asks something. After a
+    rejected SPEC_COMPLETE none are needed either: the next session's job is
+    to resolve the markers listed in HANDOFF.md. That rejection may have
+    come from a first iteration that wrote no questions at all, and once a
+    human has fixed the markers and reset the rejection count, an empty
+    QUESTIONS.md is all that is left.
     """
     if not cont:
         _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
@@ -685,13 +689,12 @@ def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejectio
         _log(f"Then run: {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")
         sys.exit(0)
     questions_file = spec_dir / "QUESTIONS.md"
-    has_answers = questions_file.exists() and any(
-        line.startswith("> ")
-        for line in questions_file.read_text(encoding="utf-8").splitlines()
-    )
-    if not has_answers and not after_rejection:
+    questions = _read_file(questions_file)
+    has_questions = bool(questions.strip())
+    has_answers = any(line.startswith("> ") for line in questions.splitlines())
+    if has_questions and not has_answers and not after_rejection:
         _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
-    if questions_file.exists():
+    if has_questions:
         archive_dir = spec_dir / "questions-archive"
         archive_dir.mkdir(exist_ok=True)
         import shutil
@@ -699,8 +702,10 @@ def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejectio
         _log(f"Archived questions to {_CYAN}questions-archive/round-{iteration}.md{_RESET}")
     if after_rejection:
         _log("Continuing to resolve the markers that blocked SPEC_COMPLETE...")
-    else:
+    elif has_questions:
         _log("Continuing after user answers...")
+    else:
+        _log("QUESTIONS.md asks nothing; continuing...")
 
 
 async def _cmd_run_async(
