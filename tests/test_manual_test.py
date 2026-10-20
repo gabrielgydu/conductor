@@ -437,6 +437,106 @@ def test_invalid_results_block_after_three_attempts_despite_handoffs(tmp_path):
     assert scenario.evidence.notes == ["missing required manual signal tag"]
 
 
+FINDING_RESULT = """<manual-result status="finding">
+  <severity>medium</severity>
+  <category>app_bug</category>
+  <title>Save button does nothing</title>
+  <reproduction><step>Open settings</step><step>Click save</step></reproduction>
+  <expected>Settings saved</expected>
+  <actual>Nothing happens</actual>
+  <evidence><screenshot>artifacts/screenshots/save.png</screenshot></evidence>
+</manual-result>"""
+
+
+def test_signal_parser_ignores_quoted_tags_and_later_text_turns():
+    # Shapes seen in real runs: the previous attempt's tag quoted in backticks,
+    # and a background-task notice after the final tag.
+    quoted = "\n".join(
+        [
+            _assistant_text("Last attempt was rejected for emitting `<manual-pass/>` twice."),
+            _tool_use("Bash", {"command": "ls"}),
+            _assistant_text(PASS_RESULT),
+        ]
+    )
+    background = "\n".join(
+        [
+            _assistant_text(PASS_RESULT),
+            _tool_use("TodoWrite", {"todos": [{"content": "Verify", "status": "completed"}]}),
+            _assistant_text("Background task completed, no action needed."),
+        ]
+    )
+    repeated = "\n".join(
+        [_assistant_text("I will finish with <manual-pass/> once done."), _assistant_text(PASS_RESULT)]
+    )
+    fenced = "```xml\n" + PASS_RESULT + "\n```"
+
+    for output in [quoted, background, repeated, fenced, PASS_RESULT + "."]:
+        signal = parse_manual_signal(output)
+        assert (signal.kind, signal.valid, signal.errors) == ("pass", True, [])
+
+
+def test_signal_parser_still_rejects_work_after_the_tag_and_conflicting_tags():
+    tool_after = "\n".join([_assistant_text(PASS_RESULT), _tool_use("Bash", {"command": "ls"})])
+    text_after = PASS_RESULT + "\nChanged files: app/Foo.php"
+    conflicting = "\n".join([_assistant_text("Found a bug: <manual-finding/>"), _assistant_text(PASS_RESULT)])
+
+    assert parse_manual_signal(tool_after).errors == ["manual signal tag must be the final output"]
+    assert parse_manual_signal(text_after).errors == ["manual signal tag must be the final output"]
+    ambiguous = parse_manual_signal(conflicting)
+    assert ambiguous.kind is None
+    assert ambiguous.errors == ["expected exactly one manual signal tag, found: manual-finding, manual-pass"]
+
+
+def test_signal_parser_uses_the_last_result_block_matching_the_tag():
+    finding_then_pass = FINDING_RESULT + "\n" + PASS_RESULT.replace("<manual-pass/>", "") + "\n<manual-finding/>"
+    draft_then_pass = FINDING_RESULT.replace("Save button", "Draft") + "\nActually it works.\n" + PASS_RESULT
+
+    finding = parse_manual_signal(finding_then_pass)
+    passed = parse_manual_signal(draft_then_pass)
+
+    assert finding.valid is True
+    assert finding.title == "Save button does nothing"
+    assert passed.valid is True
+    assert passed.kind == "pass"
+
+
+def test_blocked_reason_ignores_nested_shortcut_reason():
+    signal = parse_manual_signal(
+        """<manual-result status="blocked">
+  <shortcut><reason>bulk seed</reason><command_or_route>make seed</command_or_route><user_flow_supported>setup</user_flow_supported><approved_by_policy>true</approved_by_policy></shortcut>
+  <reason>SSO provider sandbox is down</reason>
+  <code_read>app/Auth/SsoController.php</code_read>
+  <data_attempts>Retried login three times</data_attempts>
+  <why_not_fixable_now>External sandbox outage</why_not_fixable_now>
+  <evidence><screenshot>artifacts/screenshots/sso.png</screenshot></evidence>
+</manual-result>
+<manual-blocked/>"""
+    )
+
+    assert signal.valid is True
+    assert signal.blocked_reason == "SSO provider sandbox is down"
+
+
+def test_handoff_file_does_not_quote_signal_tags(tmp_path):
+    _, conductor_dir, state = _new_state(tmp_path)
+    generation = manual_test.ManualGeneration(
+        index=1, started_at=manual_test.datetime.now(manual_test.timezone.utc)
+    )
+
+    path = manual_test._write_generation_handoff(
+        state=state,
+        conductor_dir=conductor_dir,
+        generation=generation,
+        scenario=state.scenarios[0],
+        reason="duplicate tag",
+        output_text=PASS_RESULT + "\n<manual-pass/>",
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert "<manual-pass/>" not in content
+    assert "[manual-pass]" in content
+
+
 def test_parse_scenarios_from_table():
     scenarios = parse_scenarios_from_markdown(PLAN_TABLE)
 

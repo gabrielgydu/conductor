@@ -688,26 +688,29 @@ def _stream_events(output: str) -> list[dict]:
     return events
 
 
-def _extract_text_from_stream_json(output: str) -> str:
-    text_parts: list[str] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
+def _assistant_blocks(output: str) -> list[tuple[str, str]]:
+    """Assistant ("text", text) and ("tool_use", tool name) blocks, in session order.
+
+    Output that is not stream-json (or has no assistant text) is one text block.
+    """
+    blocks: list[tuple[str, str]] = []
+    for event in _stream_events(output):
         if event.get("type") != "assistant":
             continue
-        for block in event.get("message", {}).get("content", []):
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-    if text_parts:
-        return "\n".join(text_parts)
-    return output
+        for block in (event.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                blocks.append(("text", str(block.get("text", ""))))
+            elif block.get("type") == "tool_use":
+                blocks.append(("tool_use", str(block.get("name", ""))))
+    if not any(kind == "text" for kind, _ in blocks):
+        return [("text", output)]
+    return blocks
+
+
+def _extract_text_from_stream_json(output: str) -> str:
+    return "\n".join(text for kind, text in _assistant_blocks(output) if kind == "text")
 
 
 def _tag_values(text: str, tag: str) -> list[str]:
@@ -722,14 +725,30 @@ def _tag_value(text: str, tag: str) -> str:
     return values[0] if values else ""
 
 
-def _manual_result_block(text: str) -> tuple[str, str | None]:
-    match = re.search(r"<manual-result\b([^>]*)>(.*?)</manual-result>", text, re.DOTALL | re.I)
-    if not match:
+def _manual_result_block(text: str, kind: str | None = None) -> tuple[str, str | None]:
+    """The first <manual-result> whose status is *kind*, else the first one.
+
+    Sessions sometimes draft a result of another kind before the final one,
+    or report a finding and then summarise with a pass block.
+    """
+    blocks: list[tuple[str, str | None]] = []
+    for match in re.finditer(r"<manual-result\b([^>]*)>(.*?)</manual-result>", text, re.DOTALL | re.I):
+        status_match = re.search(r"status=[\"']([^\"']+)[\"']", match.group(1), re.I)
+        status = status_match.group(1).strip().lower() if status_match else None
+        blocks.append((match.group(2), status))
+    if not blocks:
         return "", None
-    attrs = match.group(1)
-    status_match = re.search(r"status=[\"']([^\"']+)[\"']", attrs, re.I)
-    status = status_match.group(1).strip().lower() if status_match else None
-    return match.group(2), status
+    return next((block for block in blocks if block[1] == kind), blocks[0])
+
+
+_NESTED_RESULT_TAGS = ("shortcut", "data-shortcut", "evidence")
+
+
+def _top_level(block: str) -> str:
+    """*block* without nested <shortcut>/<evidence> elements, for top-level fields."""
+    for tag in _NESTED_RESULT_TAGS:
+        block = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", block, flags=re.DOTALL | re.I)
+    return block
 
 
 def _parse_bool(value: str) -> bool:
@@ -737,9 +756,9 @@ def _parse_bool(value: str) -> bool:
 
 
 def _parse_evidence(block: str) -> ManualEvidence:
-    evidence_block = _tag_value(block, "evidence") or block
+    evidence_block = _tag_value(block, "evidence") or _top_level(block)
     return ManualEvidence(
-        summary=_tag_value(block, "summary"),
+        summary=_tag_value(_top_level(block), "summary"),
         urls=_tag_values(evidence_block, "url"),
         screenshots=_tag_values(evidence_block, "screenshot"),
         traces=_tag_values(evidence_block, "trace"),
@@ -918,16 +937,53 @@ def scan_policy_shortcuts(
     return flags
 
 
-def _signal_tags(text: str) -> list[str]:
-    found: list[tuple[int, str]] = []
-    for tag in SIGNAL_TAGS:
-        for match in re.finditer(rf"<{tag}\s*/>", text, re.I):
-            found.append((match.start(), tag))
-    return [tag for _, tag in sorted(found)]
+_SIGNAL_TAG_RE = re.compile(
+    "<(" + "|".join(re.escape(tag) for tag in SIGNAL_TAGS) + r")\s*/>", re.I
+)
+# Mentions like `<manual-pass/>` in prose (often quoting a previous attempt)
+# are not signals.
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+# What may follow the tag in its text block: a closing code fence or a full stop.
+_AFTER_SIGNAL_RE = re.compile(r"[\s`.!]*")
+# Tool calls that may follow the tag: todo bookkeeping, not work.
+_BOOKKEEPING_TOOLS = {"TodoWrite", "TodoRead", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
 
 
-def _signal_tag_is_final(text: str, tag: str) -> bool:
-    return re.search(rf"<{tag}\s*/>\s*$", text, re.I) is not None
+def _without_inline_code(text: str) -> str:
+    return _INLINE_CODE_RE.sub(lambda match: " " * len(match.group(0)), text)
+
+
+def _find_signal_tag(output: str) -> tuple[str | None, list[str]]:
+    """The authoritative signal tag of a session, and any errors about it.
+
+    The last bare tag wins. It must end its text block, and no tool call may
+    follow it; later text-only turns (e.g. background-task notices) are fine.
+    Earlier mentions of the same tag are ignored; a different one makes the
+    signal ambiguous (no tag).
+    """
+    blocks = _assistant_blocks(output)
+    hits: list[tuple[int, int, str]] = []
+    for index, (kind, text) in enumerate(blocks):
+        if kind != "text":
+            continue
+        for match in _SIGNAL_TAG_RE.finditer(_without_inline_code(text)):
+            hits.append((index, match.end(), match.group(1).lower()))
+    if not hits:
+        return None, ["missing required manual signal tag"]
+
+    index, end, tag = hits[-1]
+    conflicting = sorted({other for _, _, other in hits[:-1] if other != tag})
+    if conflicting:
+        return None, [
+            f"expected exactly one manual signal tag, found: {', '.join(conflicting + [tag])}"
+        ]
+    trailing = _without_inline_code(blocks[index][1])[end:]
+    later_tool_use = any(
+        kind == "tool_use" and name not in _BOOKKEEPING_TOOLS for kind, name in blocks[index + 1:]
+    )
+    if not _AFTER_SIGNAL_RE.fullmatch(trailing) or later_tool_use:
+        return tag, ["manual signal tag must be the final output"]
+    return tag, []
 
 
 def _shortcut_errors(shortcuts: list[DataShortcut]) -> list[str]:
@@ -978,19 +1034,13 @@ def parse_manual_signal(
     text = _extract_text_from_stream_json(output)
     signal = ManualSignal(raw_text=text, policy_flags=policy_flags or [])
 
-    tags = _signal_tags(text)
-    if not tags:
-        signal.errors.append("missing required manual signal tag")
-        return signal
-    if len(tags) > 1:
-        signal.errors.append(f"expected exactly one manual signal tag, found: {', '.join(tags)}")
+    tag, tag_errors = _find_signal_tag(output)
+    signal.errors.extend(tag_errors)
+    if tag is None:
         return signal
 
-    tag = tags[0]
     signal.kind = SIGNAL_TAGS[tag]
-    if not _signal_tag_is_final(text, tag):
-        signal.errors.append("manual signal tag must be the final output")
-    block, result_status = _manual_result_block(text)
+    block, result_status = _manual_result_block(text, signal.kind)
     signal.result_status = result_status
 
     if signal.kind == "handoff":
@@ -1014,13 +1064,14 @@ def parse_manual_signal(
             signal.errors.append("pass result requires at least one evidence item")
 
     elif signal.kind == "finding":
-        signal.severity = _tag_value(block, "severity").lower()
-        signal.category = _tag_value(block, "category").lower()
-        signal.title = _tag_value(block, "title")
-        signal.reproduction = _parse_reproduction(block)
-        signal.expected = _tag_value(block, "expected")
-        signal.actual = _tag_value(block, "actual")
-        signal.suspected_files = _tag_values(block, "suspected_file")
+        top = _top_level(block)
+        signal.severity = _tag_value(top, "severity").lower()
+        signal.category = _tag_value(top, "category").lower()
+        signal.title = _tag_value(top, "title")
+        signal.reproduction = _parse_reproduction(top)
+        signal.expected = _tag_value(top, "expected")
+        signal.actual = _tag_value(top, "actual")
+        signal.suspected_files = _tag_values(top, "suspected_file")
 
         if signal.severity not in ALLOWED_SEVERITIES:
             signal.errors.append("finding severity must be high, medium, low, or ux")
@@ -1040,10 +1091,11 @@ def parse_manual_signal(
             signal.errors.append("finding requires evidence")
 
     elif signal.kind == "blocked":
-        signal.blocked_reason = _tag_value(block, "reason")
-        signal.code_read = _tag_value(block, "code_read")
-        signal.data_attempts = _tag_value(block, "data_attempts")
-        signal.why_not_fixable_now = _tag_value(block, "why_not_fixable_now")
+        top = _top_level(block)
+        signal.blocked_reason = _tag_value(top, "reason")
+        signal.code_read = _tag_value(top, "code_read")
+        signal.data_attempts = _tag_value(top, "data_attempts")
+        signal.why_not_fixable_now = _tag_value(top, "why_not_fixable_now")
         if not signal.blocked_reason.strip():
             signal.errors.append("blocked result requires a reason")
         if not signal.code_read.strip():
@@ -1248,7 +1300,10 @@ Artifacts directory: {conductor_dir / 'artifacts'}
 Read code first, make the smallest correct fix, and run the relevant focused checks.
 Do not mark this verified; a verifier generation must rerun the scenario.
 
-End with <manual-handoff/> and summarize changed files and checks run.
+Do not commit; Conductor commits the fix once a verifier generation confirms it.
+
+Summarize the changed files and the checks you ran, then put <manual-handoff/> on
+the last line, with nothing after it.
 
 ## Original Plan
 
@@ -1316,7 +1371,9 @@ def _safe_name(value: str) -> str:
 
 def _output_tail(text: str, limit: int = 120) -> str:
     lines = _extract_text_from_stream_json(text).splitlines()
-    return "\n".join(lines[-limit:])
+    # The next generation reads this file; a quoted signal tag there tends to
+    # come back as a duplicate tag in its own output.
+    return _SIGNAL_TAG_RE.sub(r"[\1]", "\n".join(lines[-limit:]))
 
 
 def _scenario_handoff_section(scenario: ManualScenario) -> str:
