@@ -747,6 +747,7 @@ def _cmd_run(args):
             check_interval_s=state.check_interval_s,
             max_parallel=state.max_parallel,
             project_root=repo_path,
+            overnight=state.overnight,
         )
 
         print(f"Starting conductor run: {state.project_name}")
