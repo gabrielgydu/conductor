@@ -155,6 +155,37 @@ def _activity_log_path(state: ConductorState, run_idx: int, stage_idx: int) -> P
 
 
 # ---------------------------------------------------------------------------
+# Exit/fail files shared with the tmux wrappers
+# ---------------------------------------------------------------------------
+
+
+def _ipc_dir(storage: StorageResolver, project_name: str) -> Path:
+    """Per-project directory for the exit and fail files the tmux wrappers write.
+
+    Keyed by repo and project (not a global /tmp name), so two conductor
+    projects that share run and stage names cannot read each other's results,
+    and a runner's exit code survives a reboot that clears /tmp.
+    """
+    d = storage.conductor_dir(project_name) / "ipc"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _runner_exit_file(storage: StorageResolver, project_name: str, fname: str) -> Path:
+    return _ipc_dir(storage, project_name) / f"conductor-exit-{fname}"
+
+
+def _runner_fail_log(storage: StorageResolver, project_name: str, fname: str) -> Path:
+    # TmuxManager.spawn_runner_in_window derives this name from the exit file
+    # (conductor-exit-<x> -> conductor-fail-<x>.log in the same directory).
+    return _ipc_dir(storage, project_name) / f"conductor-fail-{fname}.log"
+
+
+def _speccer_exit_file(storage: StorageResolver, project_name: str, fname: str) -> Path:
+    return _ipc_dir(storage, project_name) / f"conductor-speccer-exit-{fname}"
+
+
+# ---------------------------------------------------------------------------
 # Worktree management
 # ---------------------------------------------------------------------------
 
@@ -313,7 +344,7 @@ async def run_speccer_init(
         )
         return
 
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+    exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
     args = [
@@ -432,7 +463,7 @@ async def run_speccer_run(
     wt = stage.worktree
     window_name = f"run{run_idx}:{stage.name}"
 
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+    exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
     cmd = f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt}"
@@ -474,7 +505,7 @@ async def run_speccer_continue(
     wt = stage.worktree
     window_name = f"run{run_idx}:{stage.name}"
 
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+    exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
     cmd = (
@@ -518,7 +549,7 @@ async def run_speccer_generate(
     wt = stage.worktree
     window_name = f"run{run_idx}:{stage.name}-gen"
 
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}-gen")
+    exit_file = _speccer_exit_file(storage, state.project_name, f"{fname}-gen")
     exit_file.unlink(missing_ok=True)
 
     cmd = f"cd {wt} && {_SPECCER_BIN} generate --feature {fname} --project-dir {wt}"
@@ -663,7 +694,7 @@ def speccer_exit_code_handler(
 ) -> None:
     """Check speccer exit file and PROGRESS.md to set the correct stage status."""
     stage = state.runs[run_idx].stages[stage_idx]
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+    exit_file = _speccer_exit_file(storage, state.project_name, fname)
 
     exit_code: int | None = None
     if exit_file.exists():
@@ -1016,9 +1047,9 @@ async def start_runner(
     wt = stage.worktree
     window_name = f"run{run_idx}:{stage.name}-exec"
 
-    exit_file = Path(f"/tmp/conductor-exit-{fname}")
+    exit_file = _runner_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
-    Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
+    _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
 
     # Generate RUN-CONFIG.json from the speccer-generated run.sh
     docs_dir = Path(wt) / "docs" / fname
@@ -1265,7 +1296,11 @@ async def check_stall(
             stage.status = StageStatus.FAILED
 
 
-def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None = None) -> bool:
+def _any_runner_exit_file_ready(
+    state: ConductorState,
+    storage: StorageResolver,
+    session_name: str | None = None,
+) -> bool:
     """Check if any executing stage has a runner exit file or dead window."""
     for ri, run in enumerate(state.runs):
         if run.status != RunStatus.ACTIVE:
@@ -1277,7 +1312,8 @@ def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None 
         if stage.status != StageStatus.EXECUTING:
             continue
         fname = run.name + stage.feature_suffix
-        if Path(f"/tmp/conductor-exit-{fname}").exists():
+        exit_file = _runner_exit_file(storage, state.project_name, fname)
+        if exit_file.exists():
             return True
         # Also detect dead windows (runner crashed without writing exit file)
         if session_name:
@@ -1288,7 +1324,7 @@ def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None 
             )
             if r.returncode == 0 and window_name not in r.stdout.strip().splitlines():
                 # Window is gone — write synthetic exit file
-                Path(f"/tmp/conductor-exit-{fname}").write_text("1")
+                exit_file.write_text("1")
                 return True
             # Check for zombie runner (window alive but Claude process dead)
             if r.returncode == 0 and window_name in r.stdout.strip().splitlines():
@@ -1307,7 +1343,7 @@ def _any_runner_exit_file_ready(state: ConductorState, session_name: str | None 
                             )
                             if _shallow_tree_counts[window_key] >= ZOMBIE_SHALLOW_THRESHOLD:
                                 _shallow_tree_counts.pop(window_key, None)
-                                Path(f"/tmp/conductor-exit-{fname}").write_text("143")
+                                exit_file.write_text("143")
                                 return True
                         else:
                             _shallow_tree_counts.pop(window_key, None)
@@ -1330,7 +1366,7 @@ async def monitor_runner(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    exit_file = Path(f"/tmp/conductor-exit-{fname}")
+    exit_file = _runner_exit_file(storage, state.project_name, fname)
     window_name = f"run{run_idx}:{stage.name}-exec"
 
     if exit_file.exists():
@@ -1354,7 +1390,7 @@ async def monitor_runner(
             stage.completed_at = datetime.now(timezone.utc)
         else:
             # Read captured pane output if available
-            fail_log = Path(f"/tmp/conductor-fail-{fname}.log")
+            fail_log = _runner_fail_log(storage, state.project_name, fname)
             pane_output = ""
             if fail_log.exists():
                 try:
@@ -1451,11 +1487,8 @@ _TRANSIENT_PATTERNS = re.compile(
 )
 
 
-def _is_transient_api_error(fname: str) -> bool:
+def _is_transient_api_error(paths_to_check: list[Path]) -> bool:
     """Check fail logs for transient API error patterns."""
-    paths_to_check = [
-        Path(f"/tmp/conductor-fail-{fname}.log"),
-    ]
     for p in paths_to_check:
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -1466,7 +1499,12 @@ def _is_transient_api_error(fname: str) -> bool:
     return False
 
 
-def classify_failure(fname: str, exit_code: int | None, stage: StageState) -> str:
+def classify_failure(
+    fname: str,
+    exit_code: int | None,
+    stage: StageState,
+    fail_logs: list[Path] | None = None,
+) -> str:
     """Classify failure as 'infra', 'transient', or 'logic'.
 
     - Exit 137/143 (signal kills) → infra
@@ -1477,7 +1515,7 @@ def classify_failure(fname: str, exit_code: int | None, stage: StageState) -> st
     if exit_code in (137, 143):
         return "infra"
     if exit_code == 1:
-        if _is_transient_api_error(fname):
+        if _is_transient_api_error(fail_logs or []):
             return "transient"
         if stage.worktree:
             activity_log = Path(stage.worktree) / "docs" / fname / "activity.log"
@@ -1504,7 +1542,12 @@ async def handle_failure(
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
 
-    failure_type = classify_failure(fname, stage.last_exit_code, stage)
+    failure_type = classify_failure(
+        fname,
+        stage.last_exit_code,
+        stage,
+        [_runner_fail_log(storage, state.project_name, fname)],
+    )
 
     # Infra failures: auto-retry without brain call, separate budget (cap 5)
     if failure_type == "infra":
@@ -1702,9 +1745,9 @@ async def restart_stage(
             and "PHASES[" in run_sh.read_text(encoding="utf-8")
         )
         if run_sh_valid:
-            exit_file = Path(f"/tmp/conductor-exit-{fname}")
+            exit_file = _runner_exit_file(storage, state.project_name, fname)
             exit_file.unlink(missing_ok=True)
-            Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
+            _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
             stage.status = StageStatus.GENERATED
         else:
             # run.sh missing or malformed — delete it and consult speccer progress
@@ -1712,8 +1755,8 @@ async def restart_stage(
             # `speccer generate` (which errors if the spec is still at INIT).
             if run_sh and run_sh.exists():
                 run_sh.unlink()
-            Path(f"/tmp/conductor-speccer-exit-{fname}-gen").unlink(missing_ok=True)
-            Path(f"/tmp/conductor-speccer-exit-{fname}").unlink(missing_ok=True)
+            _speccer_exit_file(storage, state.project_name, f"{fname}-gen").unlink(missing_ok=True)
+            _speccer_exit_file(storage, state.project_name, fname).unlink(missing_ok=True)
 
             progress_file = _progress_file_path(state, run_idx, stage_idx)
             speccer_status = (
@@ -1743,14 +1786,14 @@ async def restart_stage(
         StageStatus.SPEC_NEEDS_INPUT,
     ):
         pre_reset_speccer_status(state, run_idx, stage_idx, storage)
-        exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
+        exit_file = _speccer_exit_file(storage, state.project_name, fname)
         exit_file.unlink(missing_ok=True)
         stage.status = StageStatus.SPEC_INIT
 
     elif current_status in (StageStatus.EXECUTING, StageStatus.STALLED):
-        exit_file = Path(f"/tmp/conductor-exit-{fname}")
+        exit_file = _runner_exit_file(storage, state.project_name, fname)
         exit_file.unlink(missing_ok=True)
-        Path(f"/tmp/conductor-fail-{fname}.log").unlink(missing_ok=True)
+        _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
         stage.status = StageStatus.GENERATED
 
     elif current_status in (StageStatus.GENERATED,):
@@ -2575,7 +2618,9 @@ async def conductor_run_loop(
             while elapsed < config.check_interval_s:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
-                if _any_runner_exit_file_ready(state, session_name=f"conductor-{state.project_name}"):
+                if _any_runner_exit_file_ready(
+                    state, storage, session_name=f"conductor-{state.project_name}"
+                ):
                     break
 
     else:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -191,54 +192,50 @@ def test_pre_reset_no_progress_file_is_noop(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _ipc_storage(tmp_path: Path) -> SimpleNamespace:
+    """Storage stub whose conductor_dir is a real directory under tmp_path."""
+    return SimpleNamespace(conductor_dir=lambda name: tmp_path / "conductor-home" / name)
+
+
+def _write_speccer_exit(storage, fname: str, code: str) -> Path:
+    exit_file = orch._speccer_exit_file(storage, "proj", fname)
+    exit_file.write_text(code)
+    return exit_file
+
+
 def test_exit_handler_exit_0_calls_sync(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "COMPLETE")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "0")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("0")
-
-    try:
-        with patch.object(orch, "sync_speccer_status") as mock_sync:
-            speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        mock_sync.assert_called_once()
-    finally:
-        exit_file.unlink(missing_ok=True)
+    with patch.object(orch, "sync_speccer_status") as mock_sync:
+        speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    mock_sync.assert_called_once()
 
 
 def test_exit_handler_nonzero_recoverable_calls_sync(tmp_path):
     """Non-zero exit + PROGRESS shows NEEDS_INPUT -> sync (not failed)."""
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "NEEDS_INPUT")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "1")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("1")
-
-    try:
-        with patch.object(orch, "sync_speccer_status") as mock_sync:
-            speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        mock_sync.assert_called_once()
-        assert state.runs[0].stages[0].status != StageStatus.FAILED
-    finally:
-        exit_file.unlink(missing_ok=True)
+    with patch.object(orch, "sync_speccer_status") as mock_sync:
+        speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    mock_sync.assert_called_once()
+    assert state.runs[0].stages[0].status != StageStatus.FAILED
 
 
 def test_exit_handler_nonzero_nonrecoverable_sets_failed(tmp_path):
     """Non-zero exit + PROGRESS shows INIT -> stage set to FAILED."""
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "INIT")
+    storage = _ipc_storage(tmp_path)
+    _write_speccer_exit(storage, "run-0", "2")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.write_text("2")
-
-    try:
-        speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
-        assert state.runs[0].stages[0].status == StageStatus.FAILED
-    finally:
-        exit_file.unlink(missing_ok=True)
+    speccer_exit_code_handler(state, 0, 0, "run-0", storage)
+    assert state.runs[0].stages[0].status == StageStatus.FAILED
 
 
 def test_exit_handler_no_exit_file_recoverable_status_syncs(tmp_path):
@@ -246,12 +243,8 @@ def test_exit_handler_no_exit_file_recoverable_status_syncs(tmp_path):
     state, wt = _make_state_with_worktree(tmp_path)
     _write_progress(wt, "run-0", "GENERATED")
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.unlink(missing_ok=True)
-
     with patch.object(orch, "sync_speccer_status") as mock_sync:
-        speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
+        speccer_exit_code_handler(state, 0, 0, "run-0", _ipc_storage(tmp_path))
 
     mock_sync.assert_called_once()
 
@@ -265,13 +258,41 @@ def test_exit_handler_no_exit_file_no_progress_sets_failed(tmp_path):
     )
     state = ConductorState(project_name="proj", base_branch="main", runs=[run])
 
-    fname = "run-0"
-    exit_file = Path(f"/tmp/conductor-speccer-exit-{fname}")
-    exit_file.unlink(missing_ok=True)
-
-    speccer_exit_code_handler(state, 0, 0, fname, _make_storage())
+    speccer_exit_code_handler(state, 0, 0, "run-0", _ipc_storage(tmp_path))
 
     assert state.runs[0].stages[0].status == StageStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Exit/fail files are per project, not global /tmp names
+# ---------------------------------------------------------------------------
+
+
+def test_exit_files_of_two_projects_do_not_collide(tmp_path):
+    """Project B must not pick up project A's result for a same-named run."""
+    storage_a = _ipc_storage(tmp_path / "repo-a")
+    storage_b = _ipc_storage(tmp_path / "repo-b")
+    _write_speccer_exit(storage_a, "run-0", "0")
+
+    state, wt = _make_state_with_worktree(tmp_path)
+    _write_progress(wt, "run-0", "SPECCING")  # B's speccer is still mid-run
+    speccer_exit_code_handler(state, 0, 0, "run-0", storage_b)
+
+    assert state.runs[0].stages[0].status == StageStatus.FAILED
+    for path in (
+        orch._runner_exit_file(storage_b, "proj", "run-0"),
+        orch._runner_fail_log(storage_b, "proj", "run-0"),
+        orch._speccer_exit_file(storage_b, "proj", "run-0"),
+    ):
+        assert path.is_relative_to(tmp_path / "repo-b"), path
+
+
+def test_runner_fail_log_matches_tmux_wrapper_naming(tmp_path):
+    """spawn_runner_in_window writes the fail log next to the exit file it is given."""
+    storage = _ipc_storage(tmp_path)
+    exit_file = orch._runner_exit_file(storage, "proj", "run-0")
+    derived = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
+    assert Path(derived) == orch._runner_fail_log(storage, "proj", "run-0")
 
 
 # ---------------------------------------------------------------------------

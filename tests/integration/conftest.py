@@ -207,7 +207,7 @@ class MockTmux:
         self._spawn_callback = callback
 
     def cleanup(self) -> None:
-        """Delete the exit files this fake wrote (production puts them in /tmp)."""
+        """Delete the exit files this fake wrote."""
         for path in self._files_written:
             path.unlink(missing_ok=True)
         self._files_written.clear()
@@ -376,36 +376,6 @@ def isolated_run_loop(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(merge, "run_integration_merge", mocks.integration_merge)
     monkeypatch.setattr(orch, "_shallow_tree_counts", {})
     return mocks
-
-
-@pytest.fixture(autouse=True)
-def clean_tmp_files():
-    """Clean up conductor temp files before each test."""
-    import glob
-
-    # Remove old conductor exit and activity files to avoid test pollution
-    for pattern in [
-        "/tmp/conductor-exit-*",
-        "/tmp/conductor-activity-*",
-        "/tmp/conductor-speccer-exit-*",
-    ]:
-        for f in glob.glob(pattern):
-            try:
-                Path(f).unlink()
-            except (OSError, FileNotFoundError):
-                pass
-    yield
-    # Also clean up after test
-    for pattern in [
-        "/tmp/conductor-exit-*",
-        "/tmp/conductor-activity-*",
-        "/tmp/conductor-speccer-exit-*",
-    ]:
-        for f in glob.glob(pattern):
-            try:
-                Path(f).unlink()
-            except (OSError, FileNotFoundError):
-                pass
 
 
 @pytest.fixture(autouse=True)

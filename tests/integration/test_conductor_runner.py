@@ -142,9 +142,9 @@ async def test_conductor_detects_runner_completion(
     mock_tmux.set_window_alive(window_name, False)
     mock_tmux.set_window_exit_code(window_name, 0)
 
-    # Write exit file that the orchestrator will read
-    # The orchestrator looks for /tmp/conductor-exit-{fname}
-    exit_file = Path(f"/tmp/conductor-exit-test-run")
+    # The runner's tmux wrapper wrote its exit file into the project's ipc dir
+    exit_file = tmp_storage_dir / "conductor" / "test-project" / "ipc" / "conductor-exit-test-run"
+    exit_file.parent.mkdir(parents=True, exist_ok=True)
     exit_file.write_text("0")
 
     result = await conductor_run_loop(state, config)
