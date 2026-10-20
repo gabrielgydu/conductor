@@ -221,6 +221,18 @@ async def test_backend_generate_keeps_backend_template_after_rewrite(spec_dir, f
 
 
 @pytest.mark.asyncio
+async def test_header_restored_after_one_line_progress_without_newline(spec_dir, fake_claude):
+    fake_claude.on_call = lambda n: (spec_dir / "PROGRESS.md").write_text("STATUS: SPECCING", encoding="utf-8")
+    fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]
+
+    assert await _run(spec_dir) == 0
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
+    assert sc.read_mode(spec_dir) == "backend"
+    assert sc.read_preset(spec_dir) == "toy"
+
+
+@pytest.mark.asyncio
 async def test_header_rebuilt_when_agent_deletes_progress(spec_dir, fake_claude):
     fake_claude.on_call = lambda n: (spec_dir / "PROGRESS.md").unlink()
     fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]

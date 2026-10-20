@@ -106,6 +106,8 @@ def _write_field(progress_file: Path, field: str, value: str) -> None:
     if n == 0:
         # Insert after the first line
         lines = text.splitlines(keepends=True)
+        if lines and not lines[0].endswith("\n"):
+            lines[0] += "\n"
         lines.insert(1, f"{replacement}\n")
         new_text = "".join(lines)
     progress_file.write_text(new_text, encoding="utf-8")
