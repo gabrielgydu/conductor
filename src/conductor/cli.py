@@ -384,12 +384,156 @@ def _parse_plan_output(output_text: str) -> tuple[list, dict[str, str]]:
 
     descriptions: dict[str, str] = {}
     for desc_match in re.finditer(
-        r'<description\s+name="([\w\-]+)">\s*\n(.*?)</description>',
+        r"""<description\s+name=["']([\w\-]+)["']\s*>(.*?)</description>""",
         output_text,
         re.DOTALL,
     ):
         descriptions[desc_match.group(1)] = desc_match.group(2).strip()
 
+    return runs_json, descriptions
+
+
+# Run and stage names become branch names, worktree paths and tmux windows.
+_PLAN_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SPEC_MODES = {"fullstack", "frontend", "backend", "testing"}  # speccer --mode choices
+
+
+def _plan_problems(runs_json, descriptions: dict[str, str]) -> list[str]:
+    """Everything wrong with a parsed plan that would only fail later, at run time."""
+    if not isinstance(runs_json, list) or not runs_json:
+        return ["the conductor-state block must be a non-empty JSON array of runs"]
+    problems: list[str] = []
+    run_names: set[str] = set()
+    stage_counts: dict[int, int] = {}
+    for i, run in enumerate(runs_json):
+        if not isinstance(run, dict):
+            problems.append(f"run {i} is not a JSON object")
+            continue
+        name = run.get("name")
+        if not isinstance(name, str) or not _PLAN_NAME_RE.fullmatch(name):
+            problems.append(f"run {i}: name {name!r} must be kebab-case ([a-z0-9-])")
+        elif name in run_names:
+            problems.append(f"run {i}: name {name!r} is used twice")
+        else:
+            run_names.add(name)
+        if "index" in run and run["index"] != i:
+            problems.append(f"run {i}: \"index\" is {run['index']!r}; runs must be numbered 0..n-1 in order")
+        deps = run.get("depends_on", [])
+        if not isinstance(deps, list) or not all(isinstance(d, int) and not isinstance(d, bool) for d in deps):
+            problems.append(f"run {i}: depends_on must be a list of run indexes")
+        constitution = run.get("constitution", [])
+        if not isinstance(constitution, list) or not all(isinstance(c, str) for c in constitution):
+            problems.append(f"run {i}: constitution must be a list of strings")
+        if not isinstance(run.get("description", ""), str):
+            problems.append(f"run {i}: description must be a string")
+        stages = run.get("stages")
+        if not isinstance(stages, list) or not stages:
+            problems.append(f"run {i}: needs a non-empty \"stages\" list")
+            continue
+        stage_counts[i] = len(stages)
+        stage_names: set[str] = set()
+        for s, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                problems.append(f"run {i} stage {s} is not a JSON object")
+                continue
+            stage_name = stage.get("name")
+            if not isinstance(stage_name, str) or not _PLAN_NAME_RE.fullmatch(stage_name):
+                problems.append(f"run {i} stage {s}: name {stage_name!r} must be kebab-case ([a-z0-9-])")
+                continue
+            if stage_name in stage_names:
+                problems.append(f"run {i}: stage name {stage_name!r} is used twice")
+            stage_names.add(stage_name)
+            spec_mode = stage.get("spec_mode", stage_name)
+            if spec_mode not in _SPEC_MODES:
+                problems.append(
+                    f"run {i} stage {stage_name}: spec_mode {spec_mode!r} must be one of {sorted(_SPEC_MODES)}"
+                )
+            if not descriptions.get(f"run-{i}-{stage_name}"):
+                problems.append(f'missing <description name="run-{i}-{stage_name}"> block')
+
+    # Context wiring points at another stage's worktree, so that stage must be
+    # done before this one starts: an earlier stage of the same run, or a stage
+    # of a run this one depends on.
+    for i, run in enumerate(runs_json):
+        if not isinstance(run, dict) or i not in stage_counts:
+            continue
+        deps = run.get("depends_on", [])
+        for s, stage in enumerate(run["stages"]):
+            wiring = stage.get("context_wiring") if isinstance(stage, dict) else None
+            if wiring is None:
+                continue
+            where = f"run {i} stage {s} context_wiring"
+            if not isinstance(wiring, dict):
+                problems.append(f"{where} must be an object or null")
+            elif wiring.get("type") == "external":
+                if not wiring.get("source_path"):
+                    problems.append(f"{where}: external wiring needs a source_path")
+            else:
+                src_run, src_stage = wiring.get("source_run"), wiring.get("source_stage")
+                if not (isinstance(src_run, int) and isinstance(src_stage, int) and wiring.get("source_path")):
+                    problems.append(f"{where}: needs integer source_run and source_stage and a source_path")
+                elif src_run not in stage_counts or not 0 <= src_stage < stage_counts[src_run]:
+                    problems.append(f"{where}: run {src_run} stage {src_stage} does not exist")
+                elif src_run == i and src_stage >= s:
+                    problems.append(f"{where}: must point at an earlier stage of the same run")
+                elif src_run != i and isinstance(deps, list) and src_run not in deps:
+                    problems.append(f"{where}: run {src_run} must be in depends_on")
+
+    if not problems:
+        try:
+            validate_dag([
+                RunState(index=i, name=run["name"], description="", depends_on=run.get("depends_on", []))
+                for i, run in enumerate(runs_json)
+            ])
+        except ValueError as e:
+            problems.append(f"invalid dependency graph: {e}")
+    return problems
+
+
+def _generate_plan_once(prompt: str, repo_path: Path, run_claude) -> tuple[list, dict[str, str], list[str]]:
+    """One Claude planning call. Returns (runs, descriptions, problems)."""
+    _plan_progress_callback._session_logged = False
+    result = asyncio.run(
+        run_claude(
+            prompt,
+            model="claude-opus-4-8",
+            max_turns=10,
+            cwd=str(repo_path),
+            on_event=_plan_progress_callback,
+        )
+    )
+
+    if result.exit_code != 0:
+        print(f"Error: Claude exited with code {result.exit_code}")
+        sys.exit(1)
+
+    full_text = _extract_text_from_stream_json(result.output)
+    try:
+        runs_json, descriptions = _parse_plan_output(full_text)
+    except (ValueError, json.JSONDecodeError) as e:
+        return [], {}, [f"could not parse the plan: {e}"]
+    return runs_json, descriptions, _plan_problems(runs_json, descriptions)
+
+
+def _generate_valid_plan(prompt: str, repo_path: Path, run_claude) -> tuple[list, dict[str, str]]:
+    """Generate a plan; if the output is malformed, ask once more with the problems listed."""
+    runs_json, descriptions, problems = _generate_plan_once(prompt, repo_path, run_claude)
+    if problems:
+        print("Plan output has problems — asking Claude to fix them:", file=sys.stderr)
+        for problem in problems:
+            print(f"  • {problem}", file=sys.stderr)
+        prompt += (
+            "\n\n## Problems with a previous attempt\n"
+            "A previous answer to this prompt could not be used. Produce the complete plan "
+            "again, in the required format, without these problems:\n"
+            + "".join(f"- {problem}\n" for problem in problems)
+        )
+        runs_json, descriptions, problems = _generate_plan_once(prompt, repo_path, run_claude)
+    if problems:
+        print("Error: Claude's plan is still invalid:")
+        for problem in problems:
+            print(f"  • {problem}")
+        sys.exit(1)
     return runs_json, descriptions
 
 
@@ -402,28 +546,7 @@ def _generate_and_review_plan(
     """Generate plan, review for completeness, re-generate if needed (max 1 retry)."""
     # Step 1: Generate plan
     print("Invoking Claude to generate plan...", file=sys.stderr)
-    _plan_progress_callback._session_logged = False
-    result = asyncio.run(
-        run_claude(
-            prompt,
-            model="claude-opus-4-8",
-            max_turns=10,
-            cwd=str(repo_path),
-            on_event=_plan_progress_callback,
-        )
-    )
-
-    if result.exit_code != 0:
-        print(f"Error: Claude exited with code {result.exit_code}")
-        sys.exit(1)
-
-    full_text = _extract_text_from_stream_json(result.output)
-
-    try:
-        runs_json, descriptions = _parse_plan_output(full_text)
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    runs_json, descriptions = _generate_valid_plan(prompt, repo_path, run_claude)
 
     # Step 2: Completeness review
     review_feedback = _run_completeness_review(
@@ -435,32 +558,7 @@ def _generate_and_review_plan(
 
     # Step 3: Re-generate once with feedback (no second review)
     print("Review found gaps — re-generating plan...", file=sys.stderr)
-    prompt = prompt + "\n\n" + review_feedback
-
-    _plan_progress_callback._session_logged = False
-    result = asyncio.run(
-        run_claude(
-            prompt,
-            model="claude-opus-4-8",
-            max_turns=10,
-            cwd=str(repo_path),
-            on_event=_plan_progress_callback,
-        )
-    )
-
-    if result.exit_code != 0:
-        print(f"Error: Claude exited with code {result.exit_code}")
-        sys.exit(1)
-
-    full_text = _extract_text_from_stream_json(result.output)
-
-    try:
-        runs_json, descriptions = _parse_plan_output(full_text)
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-
-    return runs_json, descriptions
+    return _generate_valid_plan(prompt + "\n\n" + review_feedback, repo_path, run_claude)
 
 
 def _run_completeness_review(
@@ -683,13 +781,6 @@ def _cmd_plan(args, *, next_steps: bool = True):
                 stages=stages,
             )
         )
-
-    # Validate DAG
-    try:
-        validate_dag(runs)
-    except ValueError as e:
-        print(f"Error: Invalid dependency graph: {e}")
-        sys.exit(1)
 
     # Write description files
     for i, run_data in enumerate(runs_json):
