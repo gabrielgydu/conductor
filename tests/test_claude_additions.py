@@ -1,4 +1,4 @@
-"""Additional tests for conductor.core.claude — resolve_model, calculate_cost, NDJSON."""
+"""Additional tests for conductor.core.claude — resolve_model, NDJSON."""
 
 from __future__ import annotations
 
@@ -7,9 +7,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from conductor.core.claude import (
-    ClaudeResult,
     resolve_model,
-    calculate_cost,
     run_claude_steerable,
 )
 
@@ -41,77 +39,6 @@ def test_resolve_model_unknown_passthrough():
 
 def test_resolve_model_empty_string_passthrough():
     assert resolve_model("") == ""
-
-
-# ---------------------------------------------------------------------------
-# calculate_cost
-# ---------------------------------------------------------------------------
-
-
-def test_calculate_cost_none_input():
-    assert calculate_cost(None) is None
-
-
-def test_calculate_cost_empty_dict():
-    assert calculate_cost({}) is None
-
-
-def test_calculate_cost_known_values():
-    tokens = {
-        "input_tokens": 1_000_000,
-        "output_tokens": 1_000_000,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-    }
-    cost = calculate_cost(tokens)
-    # input: 1M * 15.0 / 1M = 15.0
-    # output: 1M * 75.0 / 1M = 75.0
-    assert cost == pytest.approx(90.0)
-
-
-def test_calculate_cost_cache_read():
-    tokens = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 1_000_000,
-        "cache_creation_input_tokens": 0,
-    }
-    cost = calculate_cost(tokens)
-    assert cost == pytest.approx(1.5)
-
-
-def test_calculate_cost_cache_write():
-    tokens = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 1_000_000,
-    }
-    cost = calculate_cost(tokens)
-    assert cost == pytest.approx(18.75)
-
-
-def test_calculate_cost_all_zeros():
-    tokens = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-    }
-    cost = calculate_cost(tokens)
-    assert cost == pytest.approx(0.0)
-
-
-def test_calculate_cost_small_values():
-    tokens = {
-        "input_tokens": 100,
-        "output_tokens": 50,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-    }
-    cost = calculate_cost(tokens)
-    expected = 100 * 15.0 / 1_000_000 + 50 * 75.0 / 1_000_000
-    assert cost == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------

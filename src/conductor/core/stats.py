@@ -7,16 +7,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
+from conductor.core.model_catalog import ModelPricing, pricing_for
+
 # Re-exported: the runner resolves phase models through conductor.core.stats.
 from conductor.core.model_catalog import resolve_model as resolve_model
-
-
-@dataclass(frozen=True)
-class ModelPricing:
-    input_per_mtok: float
-    output_per_mtok: float
-    cache_read_per_mtok: float
-    cache_write_per_mtok: float
 
 
 @dataclass
@@ -39,20 +33,9 @@ class StatsEntry:
     model: str
 
 
-_PRICING_TABLE: list[tuple[str, ModelPricing]] = [
-    ("opus", ModelPricing(15.00, 75.00, 1.50, 18.75)),
-    ("haiku", ModelPricing(0.80, 4.00, 0.08, 1.00)),
-]
-_DEFAULT_PRICING = ModelPricing(3.00, 15.00, 0.30, 3.75)
-
-
-def get_pricing(model: str) -> ModelPricing:
-    """Return pricing for a model, defaulting to sonnet pricing for unknowns."""
-    lower = model.lower()
-    for pattern, pricing in _PRICING_TABLE:
-        if pattern in lower:
-            return pricing
-    return _DEFAULT_PRICING
+def get_pricing(model: str) -> ModelPricing | None:
+    """List prices for a model, or None when the catalog has no price for it."""
+    return pricing_for(model)
 
 
 def find_result_event(stream_json_output: str) -> dict | None:
@@ -107,14 +90,32 @@ def extract_reported_cost(stream_json_output: str) -> float | None:
     return result_cost_usd(find_result_event(stream_json_output))
 
 
-def calculate_cost(tokens: TokenStats, pricing: ModelPricing) -> float:
-    """Calculate cost in USD from token counts and pricing."""
+def calculate_cost(tokens: TokenStats, pricing: ModelPricing | None) -> float:
+    """Calculate cost in USD from token counts and pricing.
+
+    pricing=None (get_pricing knows no price for the model) gives 0.0 rather
+    than a guess. Prefer the CLI-reported cost (result_cost_usd), and use
+    estimate_cost, which returns None there, to tell "unknown" from "free".
+    """
+    if pricing is None:
+        return 0.0
     return (
         tokens.input * pricing.input_per_mtok
         + tokens.output * pricing.output_per_mtok
         + tokens.cache_read * pricing.cache_read_per_mtok
         + tokens.cache_write * pricing.cache_write_per_mtok
     ) / 1_000_000
+
+
+def estimate_cost(tokens: TokenStats, model: str | None) -> float | None:
+    """Estimate a session's cost from list prices; None if the model has no known price.
+
+    Only a fallback for when the CLI reported no total_cost_usd.
+    """
+    pricing = pricing_for(model) if model else None
+    if pricing is None:
+        return None
+    return calculate_cost(tokens, pricing)
 
 
 def _entry_to_dict(entry: StatsEntry) -> dict[str, Any]:

@@ -473,15 +473,3 @@ async def run_claude_steerable(
     await proc.stdin.drain()
 
     return SteerableSession(proc, start)
-
-
-def calculate_cost(tokens: dict[str, int] | None) -> float | None:
-    """Calculate cost from token usage. Returns None if tokens is None."""
-    if not tokens:
-        return None
-    # Pricing per million tokens (as of 2025)
-    input_cost = tokens.get("input_tokens", 0) * 15.0 / 1_000_000
-    output_cost = tokens.get("output_tokens", 0) * 75.0 / 1_000_000
-    cache_read_cost = tokens.get("cache_read_input_tokens", 0) * 1.5 / 1_000_000
-    cache_write_cost = tokens.get("cache_creation_input_tokens", 0) * 18.75 / 1_000_000
-    return input_cost + output_cost + cache_read_cost + cache_write_cost

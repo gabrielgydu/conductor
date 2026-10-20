@@ -3,7 +3,7 @@
 import pytest
 
 from conductor.core import claude, stats
-from conductor.core.model_catalog import MODEL_ALIASES, resolve_model
+from conductor.core.model_catalog import MODEL_ALIASES, canonical_model_id, pricing_for, resolve_model
 
 
 @pytest.mark.parametrize(
@@ -39,3 +39,21 @@ def test_claude_and_stats_share_one_resolver():
     assert claude.resolve_model is resolve_model
     for alias in MODEL_ALIASES:
         assert stats.resolve_model(alias) == claude.resolve_model(alias)
+
+
+@pytest.mark.parametrize(
+    "model, canonical",
+    [
+        ("opus", "claude-opus-4-8"),
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("Claude-Haiku-4-5-20251001", "claude-haiku-4-5"),
+        ("claude-opus-5-5", "claude-opus-5-5"),
+    ],
+)
+def test_canonical_model_id(model, canonical):
+    assert canonical_model_id(model) == canonical
+
+
+def test_every_alias_target_has_a_price():
+    for model_id in MODEL_ALIASES.values():
+        assert pricing_for(model_id) is not None, model_id

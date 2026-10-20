@@ -15,6 +15,7 @@ from conductor.core.stats import (
     extract_reported_cost,
     find_result_event,
     calculate_cost,
+    estimate_cost,
     record_stats,
     format_tokens,
     format_duration,
@@ -66,18 +67,29 @@ def test_resolve_model_passthrough():
 
 def test_get_pricing_opus():
     pricing = get_pricing("claude-opus-4-8")
-    assert pricing.input_per_mtok == 15.00
-    assert pricing.output_per_mtok == 75.00
-    assert pricing.cache_read_per_mtok == 1.50
-    assert pricing.cache_write_per_mtok == 18.75
+    assert pricing.input_per_mtok == 5.00
+    assert pricing.output_per_mtok == 25.00
+    assert pricing.cache_read_per_mtok == 0.50
+    assert pricing.cache_write_per_mtok == 10.00
 
 
-def test_get_pricing_sonnet_default():
-    pricing = get_pricing("unknown-model-xyz")
-    assert pricing.input_per_mtok == 3.00
-    assert pricing.output_per_mtok == 15.00
-    assert pricing.cache_read_per_mtok == 0.30
-    assert pricing.cache_write_per_mtok == 3.75
+def test_get_pricing_resolves_aliases_and_variants():
+    opus = get_pricing("claude-opus-4-8")
+    assert get_pricing("opus") == opus
+    assert get_pricing("claude-opus-4-8[1m]") == opus
+    # modelUsage reports dated snapshot IDs
+    assert get_pricing("claude-haiku-4-5-20251001") == get_pricing("haiku")
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])
+def test_get_pricing_knows_claude_5(model):
+    assert get_pricing(model) is not None
+
+
+@pytest.mark.parametrize("model", ["unknown-model-xyz", "claude-fable-5-1", ""])
+def test_get_pricing_unknown_model_is_none(model):
+    # No guessing: an unknown model used to get Sonnet prices.
+    assert get_pricing(model) is None
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +189,23 @@ def test_calculate_cost_zero_tokens():
     )
     tokens = TokenStats()
     assert calculate_cost(tokens, pricing) == 0.0
+
+
+def test_calculate_cost_without_pricing_is_zero():
+    assert calculate_cost(TokenStats(input=1_000_000), None) == 0.0
+
+
+@pytest.mark.parametrize("fixture", ["success", "error_max_turns"])
+def test_estimate_cost_matches_cli_reported_cost(fixture):
+    """The fallback prices reproduce the CLI's own total_cost_usd."""
+    output = load_stream_json(fixture)
+    estimate = estimate_cost(extract_stats(output), "claude-haiku-5-5")
+    assert estimate == pytest.approx(extract_reported_cost(output), rel=1e-6)
+
+
+@pytest.mark.parametrize("model", [None, "", "claude-fable-5-1"])
+def test_estimate_cost_unknown_model_is_none(model):
+    assert estimate_cost(TokenStats(input=1000), model) is None
 
 
 # ---------------------------------------------------------------------------

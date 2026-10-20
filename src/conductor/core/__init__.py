@@ -33,6 +33,7 @@ from conductor.core.stats import (
     extract_stats,
     extract_reported_cost,
     calculate_cost,
+    estimate_cost,
     record_stats,
     format_tokens,
     format_duration,
@@ -69,7 +70,7 @@ __all__ = [
     "resolve_model",
     # stats
     "get_pricing", "find_result_event", "result_token_stats", "result_cost_usd",
-    "extract_stats", "extract_reported_cost", "calculate_cost", "record_stats",
+    "extract_stats", "extract_reported_cost", "calculate_cost", "estimate_cost", "record_stats",
     "format_tokens", "format_duration", "ModelPricing", "TokenStats", "StatsEntry",
     # logging
     "live_log", "header", "error", "die",
