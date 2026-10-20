@@ -23,7 +23,6 @@ from conductor.core.orchestrator import (
     compute_progress_hash,
     pre_reset_speccer_status,
     speccer_exit_code_handler,
-    sync_speccer_status,
 )
 
 

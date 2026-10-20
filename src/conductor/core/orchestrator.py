@@ -1728,9 +1728,7 @@ def compute_progress_hash(
     storage: StorageResolver,
 ) -> str | None:
     """Hash last 20 lines of the activity log for the executing stage."""
-    run = state.runs[run_idx]
-    stage = run.stages[stage_idx]
-    fname = run.name + stage.feature_suffix
+    stage = state.runs[run_idx].stages[stage_idx]
 
     if stage.status in (StageStatus.SPEC_RUNNING, StageStatus.SPEC_INIT):
         progress_file = _progress_file_path(state, run_idx, stage_idx)
