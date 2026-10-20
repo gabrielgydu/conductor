@@ -259,47 +259,56 @@ async def test_clean_merge_dag_order(storage, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_theirs_strategy_fallback(storage):
+async def test_theirs_strategy_is_last_resort_and_recorded(storage):
+    """Conflicts go to Claude first; -X theirs only after Claude fails, and it is
+    recorded as unresolved (PARTIAL, draft PR) because it drops the earlier side."""
     from conductor.integration.merge import run_integration_merge
 
     run0 = _make_run(0, "feat-a")
     run1 = _make_run(1, "feat-b")
     state = _make_state(run0, run1)
 
-    call_count = {"merge": 0, "merge_theirs": 0}
+    events = []
 
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
         args_str = " ".join(str(a) for a in args)
-        if (
-            "merge" in args_str
-            and "-X" not in args_str
-            and "abort" not in args_str
-            and "--no-edit" in args_str
-        ):
-            call_count["merge"] += 1
-            # fail for feature branches (not initial branch creation)
-            if "feature/run-" in args_str:
+        proc.returncode = 0
+        stdout = b""
+        if "merge" in args_str and "feature/run-1" in args_str:
+            events.append("theirs" if "-X" in args_str else "merge")
+            if "-X" not in args_str:
                 proc.returncode = 1
-            else:
-                proc.returncode = 0
-        elif "merge" in args_str and "-X" in args_str:
-            call_count["merge_theirs"] += 1
-            proc.returncode = 0
-        else:
-            proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+        if "pr" in args_str and "list" in args_str:
+            stdout = b"[]"
+        if "pr" in args_str and "create" in args_str:
+            events.append(("pr", "--draft" in args))
+        proc.communicate = AsyncMock(return_value=(stdout, b""))
         return proc
+
+    async def claude_fails(files, description, cwd):
+        events.append(("claude", list(files)))
+        return False
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
         with patch(
             "conductor.integration.merge._get_conflicting_files",
             return_value=["src/foo.py"],
         ):
-            result = await run_integration_merge(state, storage)
+            with patch(
+                "conductor.integration.merge.resolve_conflicts_with_claude",
+                side_effect=claude_fails,
+            ):
+                result = await run_integration_merge(state, storage)
 
-    assert result.status == IntegrationStatus.DONE
-    assert len(result.conflicts_resolved) > 0
+    assert events == ["merge", ("claude", ["src/foo.py"]), "theirs", ("pr", True)]
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0, 1]
+    assert result.conflicts_resolved == []
+    [record] = result.conflicts_unresolved
+    assert record.file == "src/foo.py"
+    assert record.feature_b == "feat-b"
+    assert record.description.startswith("theirs overwrote ")
 
 
 @pytest.mark.asyncio
@@ -647,6 +656,7 @@ async def test_skip_run_with_no_branch(storage):
 
 @pytest.mark.asyncio
 async def test_mixed_conflicts(storage):
+    """Clean merge, Claude-resolved conflict, and -X theirs fallback in one integration."""
     from conductor.integration.merge import run_integration_merge
 
     run0 = _make_run(0, "feat-a")
@@ -654,42 +664,37 @@ async def test_mixed_conflicts(storage):
     run2 = _make_run(2, "feat-c")
     state = _make_state(run0, run1, run2)
 
-    merge_attempt = {"count": 0}
-
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
         args_str = " ".join(str(a) for a in args)
-        if (
-            "merge" in args_str
-            and "abort" not in args_str
-            and "feature/run-" in args_str
-        ):
-            merge_attempt["count"] += 1
-            if merge_attempt["count"] == 1:
-                # First run: clean merge
-                proc.returncode = 0
-            elif merge_attempt["count"] == 2:
-                # Second run: fails clean, theirs works (handled by -X theirs)
-                if "-X" in args_str:
-                    proc.returncode = 0
-                else:
-                    proc.returncode = 1
-            else:
-                proc.returncode = 0
+        conflicted = "feature/run-1" in args_str or "feature/run-2" in args_str
+        if "merge" in args_str and conflicted and "-X" not in args_str:
+            proc.returncode = 1
         else:
             proc.returncode = 0
         proc.communicate = AsyncMock(return_value=(b"", b""))
         return proc
+
+    async def claude(files, description, cwd):
+        return "feat-b" in description  # resolves run 1, gives up on run 2
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
         with patch(
             "conductor.integration.merge._get_conflicting_files",
             return_value=["src/foo.py"],
         ):
-            result = await run_integration_merge(state, storage)
+            with patch(
+                "conductor.integration.merge.resolve_conflicts_with_claude",
+                side_effect=claude,
+            ):
+                result = await run_integration_merge(state, storage)
 
-    assert result.status == IntegrationStatus.DONE
-    assert len(result.conflicts_resolved) > 0
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0, 1, 2]
+    assert [(c.feature_b, c.description) for c in result.conflicts_resolved] == [
+        ("feat-b", "Resolved by Claude AI")
+    ]
+    assert [c.feature_b for c in result.conflicts_unresolved] == ["feat-c"]
 
 
 @pytest.mark.asyncio

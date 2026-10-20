@@ -65,7 +65,7 @@ def _build_pr_body(
         lines.append("")
         lines.append("## Unresolved Conflicts")
         for c in conflicts_unresolved:
-            lines.append(f"- `{c.file}`: contains conflict markers")
+            lines.append(f"- `{c.file}`: {c.description}")
 
     return "\n".join(lines)
 
@@ -133,6 +133,18 @@ async def _remove_worktree(wt: Path, repo_root: Path) -> None:
             logger.warning("Failed to remove worktree %s: %s", wt, err.strip())
     except Exception as e:
         logger.warning("Exception removing worktree %s: %s", wt, e)
+
+
+async def _runs_touching(path: str, runs: list[RunState], start: str, cwd: Path) -> list[str]:
+    """Names of *runs* whose branch changed *path* since *start* (the merge base)."""
+    names = []
+    for run in runs:
+        rc, _, _ = await _run_git(
+            ["diff", "--quiet", f"{start}...{run.stages[-1].branch}", "--", path], cwd
+        )
+        if rc == 1:
+            names.append(run.name)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +335,8 @@ async def _integrate(
 
     # --- Merge loop ---
     _print(f"Worktree created at {wt}")
+    _, start, _ = await _run_git(["rev-parse", "HEAD"], wt)
+    start = start.strip()
     for run in eligible_runs:
         if not run.stages:
             logger.warning("Run %s has no stages, skipping", run.index)
@@ -341,28 +355,11 @@ async def _integrate(
             merged_runs.append(run)
             continue
 
-        # Abort and try -X theirs
-        await _run_git(["merge", "--abort"], wt)
-        rc, _, _ = await _run_git(["merge", "-X", "theirs", branch, "--no-edit"], wt)
-        if rc == 0:
-            conflicting = _get_conflicting_files(wt)
-            for f in conflicting:
-                conflicts_resolved.append(
-                    ConflictRecord(
-                        file=f,
-                        feature_a=state.project_name,
-                        feature_b=run.name,
-                        description=f"Resolved with -X theirs strategy",
-                    )
-                )
-            merged_runs.append(run)
-            continue
-
-        # Abort and try Claude resolution
-        await _run_git(["merge", "--abort"], wt)
-        # Re-merge without strategy to get conflict markers
-        await _run_git(["merge", branch, "--no-edit"], wt)
+        # Conflicts: record the files while the markers are in the tree (after a
+        # merge completes, --diff-filter=U is empty) and let Claude combine both sides.
         conflicting = _get_conflicting_files(wt)
+        _print(f"  Conflicts in {len(conflicting)} file(s): {', '.join(conflicting)}")
+        earlier = {f: await _runs_touching(f, merged_runs, start, wt) for f in conflicting}
 
         run_description = f"Merging run {run.index}: {run.name}\n{run.description}"
         claude_ok = await resolve_conflicts_with_claude(
@@ -372,40 +369,70 @@ async def _integrate(
         if claude_ok:
             await _run_git(["add", "."], wt)
             await _run_git(["commit", "--no-edit"], wt)
+            _print("  ✓ Resolved by Claude")
             for f in conflicting:
                 conflicts_resolved.append(
                     ConflictRecord(
                         file=f,
-                        feature_a=state.project_name,
+                        feature_a=", ".join(earlier[f]) or branch_name,
                         feature_b=run.name,
-                        description=f"Resolved by Claude AI",
+                        description="Resolved by Claude AI",
                     )
                 )
             merged_runs.append(run)
-        else:
-            # Partial: commit whatever we have
-            await _run_git(["add", "."], wt)
-            await _run_git(
-                [
-                    "commit",
-                    "--no-verify",
-                    "--no-edit",
-                    "-m",
-                    f"Partial merge: {run.name}",
-                ],
-                wt,
-            )
+            continue
+
+        # Last resort: -X theirs keeps this run's side of every conflicting
+        # hunk and drops the integration branch's (the earlier runs') side.
+        # Recorded as unresolved so the status and PR cannot claim a clean merge.
+        await _run_git(["merge", "--abort"], wt)
+        rc, _, _ = await _run_git(["merge", "-X", "theirs", branch, "--no-edit"], wt)
+        if rc == 0:
+            _print(f"  ! Claude could not resolve; -X theirs overwrote: {', '.join(conflicting)}")
             for f in conflicting:
+                overwritten = ", ".join(earlier[f]) or branch_name
                 conflicts_unresolved.append(
                     ConflictRecord(
                         file=f,
-                        feature_a=state.project_name,
+                        feature_a=overwritten,
                         feature_b=run.name,
-                        description=f"Claude could not resolve conflict",
+                        description=(
+                            f"theirs overwrote {overwritten}: Claude could not resolve, "
+                            f"so -X theirs kept {run.name}'s side of each conflicting "
+                            "hunk; review manually"
+                        ),
                     )
                 )
             has_partial = True
             merged_runs.append(run)
+            continue
+
+        # -X theirs failed too (modify/delete, rename): re-merge without a
+        # strategy and commit whatever we have
+        await _run_git(["merge", "--abort"], wt)
+        await _run_git(["merge", branch, "--no-edit"], wt)
+        await _run_git(["add", "."], wt)
+        await _run_git(
+            [
+                "commit",
+                "--no-verify",
+                "--no-edit",
+                "-m",
+                f"Partial merge: {run.name}",
+            ],
+            wt,
+        )
+        for f in conflicting:
+            conflicts_unresolved.append(
+                ConflictRecord(
+                    file=f,
+                    feature_a=", ".join(earlier[f]) or branch_name,
+                    feature_b=run.name,
+                    description="Claude could not resolve conflict",
+                )
+            )
+        has_partial = True
+        merged_runs.append(run)
 
     _print(f"Merged {len(merged_runs)} runs")
 
@@ -480,6 +507,8 @@ async def _integrate(
         else:
             body = _build_pr_body(merged_runs, conflicts_resolved, conflicts_unresolved)
             title = f"Integration: {state.project_name}"
+            # Unresolved conflicts need a human before this can be merged.
+            draft = ["--draft"] if has_partial else []
             for attempt in range(3):
                 rc, stdout, stderr = await _run_git_gh(
                     [
@@ -488,6 +517,7 @@ async def _integrate(
                         "--body", body,
                         "--head", branch_name,
                         "--base", state.base_branch,
+                        *draft,
                     ],
                     wt,
                 )

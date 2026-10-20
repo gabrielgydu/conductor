@@ -114,61 +114,103 @@ async def test_full_merge_real_git(real_merge_repo, tmp_path, hermetic_merge):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Conflict resolved with -X theirs
+# Test 2: Content conflicts go to Claude; -X theirs is a recorded last resort
 # ---------------------------------------------------------------------------
 
 
+def _same_line_conflict(repo) -> None:
+    """main has app.txt; conflict-a and conflict-b both rewrite line 2."""
+    (repo.path / "app.txt").write_text("l1\nl2\nl3\nl4\nl5\n")
+    subprocess.run(["git", "-C", str(repo.path), "add", "app.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo.path), "commit", "-q", "-m", "add app"], check=True
+    )
+    repo.create_branch("conflict-a", {"app.txt": "l1\nA-feature\nl3\nl4\nl5\n"})
+    repo.create_branch("conflict-b", {"app.txt": "l1\nB-feature\nl3\nl4\nB-l5\n"})
+
+
+def _show(repo, ref: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo.path), "show", ref],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
 @pytest.mark.asyncio
-async def test_conflict_theirs_real_git(real_merge_repo, tmp_path):
-    """Both branches modify same line → -X theirs resolves conflict."""
-    # Add shared.txt to main
-    shared = real_merge_repo.path / "shared.txt"
-    shared.write_text("original content\n")
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "add", "shared.txt"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "commit", "-m", "add shared"],
-        check=True,
-        capture_output=True,
-    )
+async def test_content_conflict_goes_to_claude(real_merge_repo, tmp_path):
+    """A same-line conflict reaches Claude with the markers still in the tree."""
+    from conductor.integration import merge as merge_module
 
-    real_merge_repo.create_branch(
-        "conflict-a", {"shared.txt": "version from branch-a\n"}
-    )
-    real_merge_repo.create_branch(
-        "conflict-b", {"shared.txt": "version from branch-b\n"}
-    )
-
+    _same_line_conflict(real_merge_repo)
     project_name = _project_name(tmp_path)
     state = _make_state(
         tmp_path,
         _done_run_with_branch(0, "feat-a", "conflict-a"),
         _done_run_with_branch(1, "feat-b", "conflict-b"),
     )
-    storage = FakeStorage(real_merge_repo.path)
+    seen: list[tuple[list[str], str]] = []
 
-    with patch(
-        "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+    async def claude_merges_both(conflicting_files, run_description, cwd):
+        seen.append((conflicting_files, (cwd / "app.txt").read_text()))
+        (cwd / "app.txt").write_text("l1\nA-feature\nB-feature\nl3\nl4\nB-l5\n")
+        return True
+
+    with patch.object(
+        merge_module, "resolve_conflicts_with_claude", side_effect=claude_merges_both
     ):
-        result = await run_integration_merge(state, storage)
+        with patch(
+            "conductor.integration.merge._run_git_gh",
+            new_callable=AsyncMock,
+            return_value=(1, "", "no remote"),
+        ):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
+    [(files, content)] = seen
+    assert files == ["app.txt"]
+    assert "<<<<<<<" in content and ">>>>>>>" in content
     assert result.status == IntegrationStatus.DONE
-    assert 0 in result.merged_runs
-    assert 1 in result.merged_runs
-
-    # "Theirs" (conflict-b) content should win
-    branch_name = f"integration/{project_name}"
-    show = subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "show", f"{branch_name}:shared.txt"],
-        capture_output=True,
-        text=True,
+    assert result.merged_runs == [0, 1]
+    [record] = result.conflicts_resolved
+    assert (record.file, record.feature_a, record.feature_b) == ("app.txt", "feat-a", "feat-b")
+    assert result.conflicts_unresolved == []
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == (
+        "l1\nA-feature\nB-feature\nl3\nl4\nB-l5\n"
     )
-    assert "version from branch-b" in show.stdout
+
+
+@pytest.mark.asyncio
+async def test_theirs_fallback_is_recorded_as_unresolved(real_merge_repo, tmp_path):
+    """When Claude fails, -X theirs drops feat-a's hunk: that must not look clean."""
+    from conductor.integration import merge as merge_module
+
+    _same_line_conflict(real_merge_repo)
+    project_name = _project_name(tmp_path)
+    state = _make_state(
+        tmp_path,
+        _done_run_with_branch(0, "feat-a", "conflict-a"),
+        _done_run_with_branch(1, "feat-b", "conflict-b"),
+    )
+    gh = AsyncMock(return_value=(1, "", "no remote"))
+
+    with patch.object(
+        merge_module, "resolve_conflicts_with_claude", AsyncMock(return_value=False)
+    ):
+        with patch("conductor.integration.merge._run_git_gh", gh):
+            result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
+
+    assert result.status == IntegrationStatus.PARTIAL
+    assert result.merged_runs == [0, 1]
+    assert result.conflicts_resolved == []
+    [record] = result.conflicts_unresolved
+    assert (record.file, record.feature_a, record.feature_b) == ("app.txt", "feat-a", "feat-b")
+    assert record.description.startswith("theirs overwrote feat-a")
+    assert _show(real_merge_repo, f"integration/{project_name}:app.txt") == (
+        "l1\nB-feature\nl3\nl4\nB-l5\n"
+    )
+    pr_create = [c.args[0] for c in gh.await_args_list if c.args[0][:3] == ["gh", "pr", "create"]]
+    assert pr_create and all("--draft" in args for args in pr_create)
 
 
 # ---------------------------------------------------------------------------
