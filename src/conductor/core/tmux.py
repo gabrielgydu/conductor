@@ -11,6 +11,9 @@ from pathlib import Path
 # (shell → python → claude = 3 processes)
 MIN_HEALTHY_TREE_DEPTH = 3
 
+# Seconds between pane checks while spawn_in_window_and_wait waits
+_WAIT_POLL_SECS = 2.0
+
 
 def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
     """Check if a process tree has at least `depth` PIDs (sync).
@@ -46,6 +49,20 @@ def window_target(session: str, window: str) -> str:
     ``run0:api-exec`` when ``run0:api`` itself is gone.
     """
     return f"={session}:={window}"
+
+
+def _record_exit_code(cmd: str, exit_file: Path) -> str:
+    """Clear *exit_file* and wrap bash script *cmd* to write its exit code there."""
+    exit_file.unlink(missing_ok=True)
+    return f"{cmd}\n_rc=$?; echo $_rc > {shlex.quote(str(exit_file))}; exit $_rc"
+
+
+def _read_exit_code(exit_file: Path) -> int | None:
+    """Exit code a window wrapper wrote to *exit_file*; None if missing or garbled."""
+    try:
+        return int(exit_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 class TmuxManager:
@@ -134,33 +151,46 @@ class TmuxManager:
     ) -> int:
         """Spawn bash script *cmd* in a tmux window, wait for it to finish, return exit code.
 
-        Uses tmux wait-for to block until the command completes.
-        Writes exit code to exit_file if provided.
+        Polls the window until its command has exited; remain-on-exit keeps
+        the dead pane and its exit status around. (``tmux wait-for`` is not
+        used: its channels are global to the tmux server and latch a signal
+        nobody waits for, so another project's window of the same name, or a
+        window that finished while conductor was down, released the wait
+        early.) Writes the exit code to *exit_file* if provided. A command
+        that leaves no exit code behind (window killed, shell killed by a
+        signal) counts as failed: 1.
         """
-        # Build the command that writes exit code and signals completion
-        wait_channel = f"conductor-{name}-done"
-        signal_done = f"tmux wait-for -S {shlex.quote(wait_channel)}"
-        if exit_file:
-            wrapped = f"{cmd}\necho $? > {shlex.quote(str(exit_file))}; {signal_done}"
-        else:
-            wrapped = f"{cmd}\n{signal_done}"
-
+        wrapped = _record_exit_code(cmd, exit_file) if exit_file else cmd
         self._new_window(name, wrapped, cwd=cwd, detached=False, log_file=log_file)
 
-        # Block until signal
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self._run_tmux("wait-for", wait_channel, check=False),
-        )
+        finished, status = self._pane_exit_status(name)
+        while not finished:
+            await asyncio.sleep(_WAIT_POLL_SECS)
+            finished, status = self._pane_exit_status(name)
 
-        # Read exit code from file if available
-        if exit_file and exit_file.exists():
-            try:
-                return int(exit_file.read_text().strip())
-            except (ValueError, OSError):
-                return 1
-        return 0
+        if exit_file:
+            code = _read_exit_code(exit_file)
+            if code is not None:
+                return code
+        return status if status is not None else 1
+
+    def _pane_exit_status(self, name: str) -> tuple[bool, int | None]:
+        """(finished, exit status) of the command in window *name*.
+
+        The status is None while the command runs, and also when it finished
+        without a known status (window killed, or shell died from a signal).
+        """
+        r = self._run_tmux(
+            "list-panes", "-t", self._window(name),
+            "-F", "#{pane_dead} #{pane_dead_status}",
+            check=False,
+        )
+        if r.returncode != 0:
+            return True, None
+        dead, _, status = (r.stdout.splitlines() or [""])[0].partition(" ")
+        if dead != "1":
+            return False, None
+        return True, int(status) if status.isdigit() else None
 
     async def spawn_runner_in_window(
         self,

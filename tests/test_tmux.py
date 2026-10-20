@@ -8,20 +8,37 @@ where they do not call back into tmux.
 from __future__ import annotations
 
 import subprocess
+from typing import Callable
 
 import pytest
 
+import conductor.core.tmux as tmux_module
 from conductor.core.tmux import TmuxManager, session_target, window_target
 
 
 class TmuxRecorder:
-    """Records every tmux argv and reports success."""
+    """Records every tmux argv and reports success.
+
+    ``list-panes`` answers come from ``pane_states`` in order (a
+    ``"#{pane_dead} #{pane_dead_status}"`` line, or None for "can't find
+    window"); ``on_dead`` runs right before the first dead-pane answer.
+    """
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.pane_states: list[str | None] = []
+        self.on_dead: Callable[[], object] | None = None
 
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         self.calls.append(list(args))
+        if args[0] == "list-panes" and self.pane_states:
+            state = self.pane_states.pop(0)
+            if state is None:
+                return subprocess.CompletedProcess(["tmux", *args], 1, "", "can't find window")
+            if state.startswith("1") and self.on_dead is not None:
+                self.on_dead()
+                self.on_dead = None
+            return subprocess.CompletedProcess(["tmux", *args], 0, stdout=f"{state}\n", stderr="")
         return subprocess.CompletedProcess(["tmux", *args], 0, stdout="", stderr="")
 
     def commands(self, name: str) -> list[list[str]]:
@@ -32,6 +49,7 @@ class TmuxRecorder:
 def recorder(monkeypatch) -> TmuxRecorder:
     rec = TmuxRecorder()
     monkeypatch.setattr(TmuxManager, "_run_tmux", lambda _self, *a, **kw: rec.run(*a, **kw))
+    monkeypatch.setattr(tmux_module, "_WAIT_POLL_SECS", 0)
     return rec
 
 
@@ -43,7 +61,8 @@ def _script(new_window: list[str]) -> str:
 
 def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a wrapper the way tmux would (kept out of the async tests' bodies)."""
-    return subprocess.run(argv, check=True, **kwargs)
+    kwargs.setdefault("check", True)
+    return subprocess.run(argv, **kwargs)
 
 
 async def test_spawn_in_window_execs_bash_argv_style(recorder):
@@ -122,3 +141,41 @@ async def test_every_tmux_target_is_exact(recorder, tmp_path):
 def test_target_helpers():
     assert session_target("conductor-loop-x") == "=conductor-loop-x"
     assert window_target("conductor-x", "run0:backend") == "=conductor-x:=run0:backend"
+
+
+# -- spawn_in_window_and_wait ------------------------------------------------
+
+
+async def test_wait_returns_only_after_the_command_exits(recorder, tmp_path):
+    """A latched or foreign wait-for signal used to end the wait early and read as 0."""
+    exit_file = tmp_path / "speccer exit"
+    exit_file.write_text("0")  # stale result from an earlier spawn
+    recorder.pane_states = ["0 ", "0 ", "1 4"]
+    recorder.on_dead = lambda: _run(
+        ["bash", "-c", _script(recorder.commands("new-window")[0])], check=False,
+    )
+
+    rc = await TmuxManager("conductor-x").spawn_in_window_and_wait(
+        "run0:backend", "(exit 4)", exit_file=exit_file,
+    )
+
+    assert rc == 4
+    assert exit_file.read_text().strip() == "4"
+    assert len(recorder.commands("list-panes")) == 3
+    assert not recorder.commands("wait-for")
+
+
+async def test_wait_reports_failure_when_window_vanishes(recorder, tmp_path):
+    exit_file = tmp_path / "exit"
+    exit_file.write_text("0")  # stale: must not be mistaken for this command's result
+    recorder.pane_states = ["0 ", None]
+
+    rc = await TmuxManager("conductor-x").spawn_in_window_and_wait("w", "sleep 60", exit_file=exit_file)
+
+    assert rc == 1
+
+
+async def test_wait_without_exit_file_uses_dead_pane_status(recorder):
+    recorder.pane_states = ["1 3"]
+
+    assert await TmuxManager("conductor-x").spawn_in_window_and_wait("w", "exit 3") == 3
