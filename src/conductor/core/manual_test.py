@@ -63,6 +63,8 @@ MAX_SCENARIO_INVALID_RESULTS = 3
 MAX_SCENARIO_HANDOFFS = 5
 # How much of the previous handoff file is inlined into the next prompt.
 HANDOFF_EXCERPT_CHARS = 4000
+# A finding is handed to a human after this many failed fixer attempts.
+MAX_FIX_ATTEMPTS = 3
 
 
 class ManualEvidence(BaseModel):
@@ -102,6 +104,24 @@ class DataShortcut(BaseModel):
     approved_by_policy: bool = False
 
 
+class ManualFixAttempt(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    number: int
+    # Why the attempt failed; empty while it runs and when it was verified.
+    outcome: str = ""
+    # Files the fixer changed, relative to the repo root.
+    files: list[str] = Field(default_factory=list)
+    # Stash commit holding a failed attempt's changes.
+    stash: str = ""
+    # Cut short by a paused run: not the fixer's failure, so it does not count.
+    interrupted: bool = False
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.outcome) and not self.interrupted
+
+
 class ManualFinding(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -117,6 +137,7 @@ class ManualFinding(BaseModel):
     suspected_files: list[str] = Field(default_factory=list)
     status: str = "open"
     fix_commits: list[str] = Field(default_factory=list)
+    fix_attempts: list[ManualFixAttempt] = Field(default_factory=list)
     verification: list[str] = Field(default_factory=list)
 
 
@@ -628,6 +649,10 @@ def generate_manual_report(state: ManualTestState) -> str:
                 f"- {finding.id}: {finding.severity}/{finding.category}, "
                 f"scenario {finding.scenario_index}, {finding.status}: {finding.title}"
             )
+            for attempt in finding.fix_attempts:
+                if attempt.outcome:
+                    stash = f"; changes in stash {attempt.stash[:12]}" if attempt.stash else ""
+                    lines.append(f"  - fix attempt {attempt.number}: {attempt.outcome}{stash}")
     else:
         lines.append("- none")
 
@@ -1517,6 +1542,23 @@ def build_fixer_prompt(
     conductor_dir: Path,
 ) -> str:
     evidence = _format_evidence_lines(finding.evidence) if finding.evidence else []
+    attempts = [attempt for attempt in finding.fix_attempts if attempt.outcome]
+    previous = ""
+    if attempts:
+        rows = []
+        for attempt in attempts:
+            row = f"- Attempt {attempt.number}: {attempt.outcome}"
+            if attempt.stash:
+                row += (
+                    f"\n  Its changes are stashed: `git stash show -p --include-untracked {attempt.stash}`"
+                )
+            rows.append(row)
+        previous = (
+            "\n## Previous Fix Attempts\n\n"
+            "These attempts failed and were taken out of the worktree. Do not repeat them blindly.\n\n"
+            + "\n".join(rows)
+            + "\n"
+        )
     return f"""\
 You are fixing a manual-test finding with minimal code changes.
 
@@ -1537,7 +1579,7 @@ Do not commit; Conductor commits the fix once a verifier generation confirms it.
 
 Summarize the changed files and the checks you ran, then put <manual-handoff/> on
 the last line, with nothing after it.
-
+{previous}
 ## Original Plan
 
 {plan_content}
@@ -1817,6 +1859,31 @@ def _commit_verified_finding(
     return result.stdout.strip() or None
 
 
+def _stash_files(cwd: Path, files: list[str], message: str) -> str:
+    """Stash the changes to *files* (new files included); return the stash commit or ""."""
+    root = _git_root(cwd)
+
+    def stash_head() -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", "refs/stash"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    before = stash_head()
+    subprocess.run(
+        [*_GIT, "stash", "push", "--include-untracked", "-m", message, "--", *files],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    after = stash_head()
+    return after if after != before else ""
+
+
 def _process_error_text(exc: subprocess.CalledProcessError) -> str:
     output = exc.stderr or exc.stdout or b""
     text = output.decode(errors="replace") if isinstance(output, bytes) else str(output)
@@ -1846,10 +1913,16 @@ def _scenario_has_open_findings(state: ManualTestState, scenario: ManualScenario
 
 
 def _should_fix_finding(finding: ManualFinding) -> bool:
+    """Open, fixable and not out of attempts.
+
+    "needs_human" (attempts exhausted) is not retried but still counts as an
+    open finding for its scenario.
+    """
     return (
         finding.status in {"open", "fixing"}
         and finding.category in FIXABLE_FINDING_CATEGORIES
         and finding.severity in {"high", "medium", "low", "ux"}
+        and sum(1 for attempt in finding.fix_attempts if attempt.failed) < MAX_FIX_ATTEMPTS
     )
 
 
@@ -2213,8 +2286,24 @@ async def _fix_and_verify_finding(
         save_manual_state(state, conductor_dir)
         return
 
+    attempt = ManualFixAttempt(number=len(finding.fix_attempts) + 1)
+    finding.fix_attempts.append(attempt)
     finding.status = "fixing"
     save_manual_state(state, conductor_dir)
+
+    def fail(outcome: str, interrupted: bool = False) -> None:
+        attempt.interrupted = interrupted
+        _shelve_failed_fix(
+            state=state,
+            project_dir=project_dir,
+            conductor_dir=conductor_dir,
+            finding=finding,
+            attempt=attempt,
+            outcome=outcome,
+            preexisting_files=preexisting_files,
+            log_path=log_path,
+            audit_path=audit_path,
+        )
 
     try:
         signal, output_text = await _run_generation_retrying(
@@ -2231,8 +2320,10 @@ async def _fix_and_verify_finding(
             policy=policy,
             fatal_scope="commands",
         )
-    except ManualRunPaused:
-        finding.status = "open"
+    except ManualRunPaused as exc:
+        # Claude could not run, which is not the fixer's failure. Clear the
+        # tree so the next attempt starts clean on resume.
+        fail(f"Interrupted, the run paused: {exc}", interrupted=True)
         raise
     generation = state.generations[-1]
     if not signal.valid:
@@ -2244,26 +2335,21 @@ async def _fix_and_verify_finding(
             reason="fixer generation did not produce valid handoff signal",
             output_text=output_text,
         )
-        finding.status = "open"
-        finding.verification.append("Fixer did not produce a valid handoff signal")
-        save_manual_state(state, conductor_dir)
+        detail = f": {'; '.join(signal.errors)}" if signal.errors else ""
+        fail(f"Fixer did not produce a valid handoff signal{detail}")
         return
 
-    all_changed = _git_changed_files(project_dir)
-    fixer_files = [
-        f for f in all_changed if f not in preexisting_files and not _is_test_artifact(f)
-    ]
+    fixer_files = _fixer_changed_files(project_dir, preexisting_files)
+    attempt.files = fixer_files
     if not fixer_files:
-        finding.status = "open"
-        finding.verification.append("Fixer produced no new file changes")
-        save_manual_state(state, conductor_dir)
+        fail("Fixer produced no new file changes")
         return
 
     checks_passed, check_summaries = _run_relevant_checks(project_dir, fixer_files, policy=policy)
     finding.verification.extend(check_summaries)
     if not checks_passed:
-        finding.status = "open"
-        save_manual_state(state, conductor_dir)
+        failed_checks = [line for line in check_summaries if ": exit 0;" not in line]
+        fail(_clip("Focused checks failed: " + " / ".join(failed_checks), 600))
         return
 
     finding.status = "fixed"
@@ -2321,11 +2407,7 @@ async def _fix_and_verify_finding(
         return
 
     if verifier_signal.kind == "finding" and verifier_signal.valid:
-        finding.status = "open"
-        finding.verification.append(
-            f"Verifier still failing: {verifier_signal.title or verifier_signal.actual}"
-        )
-        save_manual_state(state, conductor_dir)
+        fail(f"Verifier still failing: {verifier_signal.title or verifier_signal.actual}")
         return
 
     _write_generation_handoff(
@@ -2336,10 +2418,74 @@ async def _fix_and_verify_finding(
         reason="verifier generation did not produce valid pass/finding signal",
         output_text=verifier_output,
     )
-    finding.status = "open"
-    finding.verification.append(
-        "Verifier did not produce a valid pass/finding signal: " + "; ".join(verifier_signal.errors)
-    )
+    fail("Verifier did not produce a valid pass/finding signal: " + "; ".join(verifier_signal.errors))
+
+
+def _fixer_changed_files(project_dir: Path, preexisting_files: set[str]) -> list[str]:
+    return [
+        path
+        for path in _git_changed_files(project_dir)
+        if path not in preexisting_files and not _is_test_artifact(path)
+    ]
+
+
+def _shelve_failed_fix(
+    *,
+    state: ManualTestState,
+    project_dir: Path,
+    conductor_dir: Path,
+    finding: ManualFinding,
+    attempt: ManualFixAttempt,
+    outcome: str,
+    preexisting_files: set[str],
+    log_path: Path,
+    audit_path: Path,
+) -> None:
+    """End a failed fix attempt: stash its changes and reopen (or give up on) the finding.
+
+    The fixer only runs on a tree without other changes, so its changes are
+    exactly the non-artifact files that changed since. Stashing them gives
+    the next attempt a clean tree (and later scenarios working code), keeps
+    the attempt recoverable, and lets the next fixer prompt point at it.
+    An interrupted attempt is reopened without counting against the limit.
+    """
+    files = _fixer_changed_files(project_dir, preexisting_files)
+    if files:
+        attempt.files = files
+        try:
+            attempt.stash = _stash_files(
+                project_dir,
+                files,
+                f"conductor manual-test: failed fix {finding.id} attempt {attempt.number}",
+            )
+        except subprocess.CalledProcessError as exc:
+            finding.verification.append(
+                f"Could not stash the failed fix ({_format_files_for_log(files)}): "
+                f"{_process_error_text(exc)}"
+            )
+        if attempt.stash:
+            finding.verification.append(
+                f"Fix attempt {attempt.number} changes stashed as {attempt.stash[:12]} "
+                f"({_format_files_for_log(files)})"
+            )
+            _log(
+                "MANUAL_FIX_STASHED",
+                f"{finding.id}: attempt {attempt.number} changes stashed as {attempt.stash[:12]}",
+                log_path,
+                audit_path,
+                finding_id=finding.id,
+                attempt=attempt.number,
+                stash=attempt.stash,
+                files=files,
+            )
+    attempt.outcome = outcome
+    finding.verification.append(f"Fix attempt {attempt.number}: {outcome}")
+    failed = sum(1 for item in finding.fix_attempts if item.failed)
+    if failed >= MAX_FIX_ATTEMPTS:
+        finding.status = "needs_human"
+        finding.verification.append(f"Gave up after {failed} failed fix attempts")
+    else:
+        finding.status = "open"
     save_manual_state(state, conductor_dir)
 
 

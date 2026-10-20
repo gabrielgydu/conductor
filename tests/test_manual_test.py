@@ -1250,12 +1250,14 @@ def _git_project(tmp_path: Path, files: dict[str, str] | None = None):
     return repo, conductor_dir, state, finding
 
 
-def _script_generations(monkeypatch, state, steps):
+def _script_generations(monkeypatch, state, steps, prompts=None):
     """Fake _run_generation: each call pops (final text, side effect) and records its label."""
     calls = []
 
     async def fake_run_generation(**kwargs):
         calls.append(kwargs["label"])
+        if prompts is not None:
+            prompts.append(kwargs["prompt"])
         state.generations.append(
             manual_test.ManualGeneration(
                 index=len(state.generations) + 1,
@@ -1391,6 +1393,96 @@ async def test_failed_fix_commit_is_reported_and_leaves_nothing_staged(tmp_path,
     assert _git(repo, "diff", "--cached", "--name-only") == ""
     assert _git(repo, "status", "--porcelain") == " M app/Foo.php\n"
     assert _audit_events(conductor_dir, "MANUAL_COMMIT_FAILED")[0]["files"] == ["app/Foo.php"]
+
+
+GREP_CHECK = ManualTestPolicy(
+    check_commands=[CheckCommandRule(argv=["grep", "-q", "fixed", "{path}"], suffixes=[".php"])]
+)
+
+
+def _edit(repo: Path, content: str, name: str = "app/Foo.php"):
+    return lambda: (repo / name).write_text(content, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_failed_fix_starts_clean_and_commits_the_reedited_file(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    prompts: list[str] = []
+    calls = _script_generations(
+        monkeypatch,
+        state,
+        [
+            (FIXER_HANDOFF, _edit(repo, "<?php // wrong guess\n")),
+            (FIXER_HANDOFF, _edit(repo, "<?php // fixed\n")),
+            (PASS_RESULT, None),
+        ],
+        prompts,
+    )
+
+    await _fix(repo, conductor_dir, state, finding, GREP_CHECK)
+
+    assert finding.status == "open"
+    first = finding.fix_attempts[0]
+    assert first.outcome.startswith("Focused checks failed: grep -q fixed app/Foo.php: exit 1")
+    assert first.files == ["app/Foo.php"]
+    assert first.stash
+    assert manual_test._git_changed_files(repo) == []
+    assert "conductor manual-test: failed fix MT-001 attempt 1" in _git(repo, "stash", "list")
+    assert _audit_events(conductor_dir, "MANUAL_FIX_STASHED")[0]["stash"] == first.stash
+
+    await _fix(repo, conductor_dir, state, finding, GREP_CHECK)
+
+    assert calls == ["fix-MT-001", "fix-MT-001", "verify-MT-001"]
+    assert f"git stash show -p --include-untracked {first.stash}" in prompts[1]
+    assert "Focused checks failed" in prompts[1]
+    assert finding.status == "verified"
+    assert _committed_files(repo) == ["app/Foo.php"]
+    assert (repo / "app/Foo.php").read_text(encoding="utf-8") == "<?php // fixed\n"
+    report = generate_manual_report(state)
+    assert "  - fix attempt 1: Focused checks failed" in report
+    assert f"changes in stash {first.stash[:12]}" in report
+
+
+@pytest.mark.asyncio
+async def test_finding_needs_a_human_after_three_failed_fixes(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+    still_failing = FINDING_RESULT.replace("Save button does nothing", "Still broken") + "\n<manual-finding/>"
+    steps = []
+    for n in range(3):
+        steps += [(FIXER_HANDOFF, _edit(repo, f"<?php // fixed, try {n}\n", f"app/Try{n}.php")), (still_failing, None)]
+    calls = _script_generations(monkeypatch, state, steps)
+
+    for _ in range(4):
+        await _fix(repo, conductor_dir, state, finding)
+
+    assert calls == ["fix-MT-001", "verify-MT-001"] * 3
+    assert finding.status == "needs_human"
+    assert [attempt.outcome for attempt in finding.fix_attempts] == ["Verifier still failing: Still broken"] * 3
+    assert len({attempt.stash for attempt in finding.fix_attempts}) == 3
+    assert manual_test._git_changed_files(repo) == []
+    assert manual_test._should_fix_finding(finding) is False
+    assert manual_test._scenario_has_open_findings(state, state.scenarios[0]) is True
+
+
+@pytest.mark.asyncio
+async def test_pause_during_a_fix_stashes_it_without_using_up_an_attempt(tmp_path, monkeypatch):
+    repo, conductor_dir, state, finding = _git_project(tmp_path)
+
+    def edit_then_pause():
+        (repo / "app/Foo.php").write_text("<?php // half done\n", encoding="utf-8")
+        raise manual_test.ManualRunPaused("usage limit reached")
+
+    _script_generations(monkeypatch, state, [(FIXER_HANDOFF, edit_then_pause)])
+
+    with pytest.raises(manual_test.ManualRunPaused):
+        await _fix(repo, conductor_dir, state, finding)
+
+    attempt = finding.fix_attempts[0]
+    assert finding.status == "open"
+    assert attempt.interrupted and attempt.stash
+    assert attempt.outcome == "Interrupted, the run paused: usage limit reached"
+    assert manual_test._git_changed_files(repo) == []
+    assert manual_test._should_fix_finding(finding) is True
 
 
 def test_git_changed_files_includes_staged_files(tmp_path):
@@ -1597,7 +1689,7 @@ async def test_fix_and_verify_ignores_preexisting_test_artifacts(tmp_path, monke
 
     assert calls == ["fix-MT-001"]
     assert finding.status == "open"
-    assert finding.verification == ["Fixer produced no new file changes"]
+    assert finding.verification == ["Fix attempt 1: Fixer produced no new file changes"]
 
 
 def test_manual_test_cli_init_status_report(tmp_path):
