@@ -904,13 +904,18 @@ _POLICY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
     (
         "framework console",
+        # Running the test suite (`artisan test --filter=<flag>`) is not a shortcut.
         re.compile(
             r"\b(artisan|bin/console|doctrine|manage\.py|django-admin|rake"
-            r"|rails\s+(runner|r|console|c|dbconsole|db:\S+))\b",
+            r"|rails\s+(runner|r|console|c|dbconsole|db:\S+))\b(?!\s+(test|spec)\b)",
             re.I,
         ),
     ),
-    ("fixture command", re.compile(r"\b(seed|seeder|factory|fixture|dump|reset-db)\b", re.I)),
+    (
+        "fixture command",
+        # A dump command, not json.dump() or PHP's dump()/var_dump().
+        re.compile(r"\b(seed|seeder|factory|fixture|reset-db)\b|(?<![.\w])dump\b(?!\s*\()", re.I),
+    ),
     (
         "browser storage mutation",
         re.compile(r"\b(localStorage|sessionStorage|document\.cookie)\b", re.I),
@@ -982,8 +987,10 @@ _READ_SQL = re.compile(
     r"|\b(DESCRIBE|EXPLAIN)\s+\w",
     re.I,
 )
+# SQL a shell command does not show: sourced, redirected in from a file (not
+# a heredoc, here-string or process substitution) or piped into a client.
 _SQL_SCRIPT = re.compile(
-    r"\bsource\b|\\i\b|\.read\b|<|\|\s*\S*\b(mysql|mariadb|mycli|psql|pgcli|sqlite3)\b", re.I
+    r"\bsource\b|\\i\b|\.read\b|(?<!<)<(?![<(=>])|\|\s*\S*\b(mysql|mariadb|mycli|psql|pgcli|sqlite3)\b", re.I
 )
 # Browser-code tools (browser_evaluate, browser_run_code) act when the script
 # writes storage or sends requests; reading a checkbox's state does not.
@@ -1144,14 +1151,21 @@ def _state_changing_calls(command: str, written: dict[str, str], depth: int = 0)
 _TOOL_METADATA_KEYS = {"description", "timeout", "run_in_background", "activeForm"}
 
 
-def _is_sql_readback(text: str) -> bool:
-    return bool(_READ_SQL.search(text)) and not _MUTATING_SQL.search(text) and not _SQL_SCRIPT.search(text)
+def _is_sql_readback(sql: str) -> bool:
+    return bool(_READ_SQL.search(sql)) and not _MUTATING_SQL.search(sql)
 
 
-def _is_acting_command(command: str) -> bool:
-    """True when a shell command matches a shortcut detector (other than a DB readback)."""
+def _is_acting_command(command: str, text: str) -> bool:
+    """True when a shell command matches a shortcut detector (other than a DB readback).
+
+    *text* is what runs (the command without comments). A DB call is a
+    readback when all its SQL is in the command, heredocs included, and only
+    reads.
+    """
+    without_heredocs = _HEREDOC_RE.sub(lambda match: "<< heredoc" + match.group("rest"), command)
+    readback = _is_sql_readback(text) and not _SQL_SCRIPT.search(without_heredocs)
     return any(
-        pattern.search(command) and not (label == "database cli" and _is_sql_readback(command))
+        pattern.search(text) and not (label == "database cli" and readback)
         for label, pattern in _POLICY_PATTERNS
     )
 
@@ -1229,7 +1243,7 @@ def _fatal_tool_input(
         # Match what runs: shell comments are not part of it.
         tokens = _shell_tokens(command)
         text = " ".join(tokens) if tokens is not None else command
-        if _is_read_only_command(command) or not _is_acting_command(text):
+        if _is_read_only_command(command) or not _is_acting_command(command, text):
             return "", "", False
         calls = _state_changing_calls(command, written if check_written_files else {})
         candidates = [(text, calls)]

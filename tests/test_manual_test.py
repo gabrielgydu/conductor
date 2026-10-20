@@ -1155,11 +1155,41 @@ def test_fatal_patterns_apply_to_every_acting_tool_input(events):
         [_tool_use("Bash", {"command": "curl -s http://app.test/api/config | jq .useNewCheckout"})],
         [_tool_use("mcp__playwright__browser_evaluate", {"function": "() => document.getElementById('useNewCheckout').checked"})],
         [_tool_use("mcp__db__query", {"sql": "SELECT useNewCheckout FROM tenants"})],
+        [_tool_use("mcp__db__query", {"sql": "SELECT useNewCheckout FROM tenants WHERE id < 10"})],
+        [_tool_use("Bash", {"command": "mysql app <<< 'SELECT useNewCheckout FROM tenants'"})],
+        # Shapes from real runs: a PDO readback script written through a heredoc,
+        # notes saved with json.dump(), and the fixer's focused test run.
+        [
+            _tool_use(
+                "Bash",
+                {
+                    "command": (
+                        "cat > /tmp/q.php << 'EOF'\n<?php\n$pdo = new PDO('mysql:host=db;dbname=app', 'root', 'root');\n"
+                        "echo json_encode($pdo->query(\"SELECT useNewCheckout FROM tenants WHERE id = 4\")->fetch());\n"
+                        "EOF\n./scripts/env.sh exec app \"php /tmp/q.php\""
+                    )
+                },
+            )
+        ],
+        [
+            _tool_use(
+                "Bash",
+                {
+                    "command": (
+                        "python3 << 'PYEOF'\nimport json\n"
+                        "notes = {'summary': 'useNewCheckout enabled via the admin UI'}\n"
+                        "json.dump(notes, open('/tmp/notes.json', 'w'))\nPYEOF"
+                    )
+                },
+            )
+        ],
+        [_tool_use("Bash", {"command": "php artisan test --filter=useNewCheckout"})],
     ],
     ids=[
         "grep-tool", "bash-grep", "git-log", "select-readback", "ui-click", "subagent-prompt",
         "unused-write", "bash-description", "shell-comment", "xargs-grep", "docker-readback",
-        "screenshot-name", "curl-get", "evaluate-read", "mcp-select",
+        "screenshot-name", "curl-get", "evaluate-read", "mcp-select", "mcp-select-comparison",
+        "here-string-select", "heredoc-pdo-readback", "json-dump-notes", "test-run-filter",
     ],
 )
 def test_fatal_patterns_skip_reads_and_ui_actions(events):
