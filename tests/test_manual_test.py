@@ -1,5 +1,6 @@
 import json
 import subprocess
+import uuid
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -159,7 +160,8 @@ def _new_state(tmp_path: Path):
     plan.write_text(PLAN_TABLE, encoding="utf-8")
     conductor_dir = tmp_path / "conductor" / "checkout-manual"
     state = initialize_manual_state(
-        name="checkout-manual",
+        # Unique: _run_generation's exit file lives in /tmp, keyed by this name.
+        name=f"checkout-manual-{uuid.uuid4().hex[:8]}",
         project_dir=repo,
         plan_file=plan,
         conductor_dir=conductor_dir,
@@ -956,6 +958,164 @@ def test_policy_scanner_auto_approve_is_default_and_keeps_fatal_patterns():
     assert relaxed_signal.valid is True
     assert relaxed_fatal.valid is False
     assert "toggled through the admin UI" in "; ".join(relaxed_fatal.errors)
+
+
+FLAG_POLICY = ManualTestPolicy(fatal_patterns=POLICY.fatal_patterns)
+
+
+def _signal_for(*events: str, policy: ManualTestPolicy = FLAG_POLICY, final: str = PASS_RESULT, **scan_kwargs):
+    output = "\n".join([*events, _assistant_text(final)])
+    flags = scan_policy_shortcuts(output, policy, **scan_kwargs)
+    return parse_manual_signal(output, policy_flags=flags, policy=policy)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [_tool_use("Bash", {"command": "php bin/console app:feature-flag:set useNewCheckout on"})],
+        [_tool_use("Bash", {"command": "curl -d '{\"useNewCheckout\":true}' http://localhost/api/admin/flags"})],
+        [_tool_use("Bash", {"command": "mariadb -e 'update tenants set useNewCheckout=1'"})],
+        [_tool_use("Bash", {"command": "python manage.py shell -c 'Tenant.objects.update(useNewCheckout=True)'"})],
+        [_tool_use("Bash", {"command": "grep -c x y && mysql -e 'update tenants set useNewCheckout=1'"})],
+        [_tool_use("mcp__playwright__browser_evaluate", {"function": "() => localStorage.setItem('useNewCheckout', '1')"})],
+        [_tool_use("mcp__playwright__browser_navigate", {"url": "http://app.test/_test/flags?useNewCheckout=1"})],
+        [_tool_use("mcp__db__query", {"sql": "UPDATE tenants SET useNewCheckout = 1"})],
+        [
+            _tool_use("Write", {"file_path": "/tmp/enable.sql", "content": "UPDATE tenants SET useNewCheckout=1;"}),
+            _tool_use("Bash", {"command": "mysql app < /tmp/enable.sql"}),
+        ],
+    ],
+    ids=[
+        "console", "curl-implicit-post", "mariadb", "django-shell", "chained", "browser-evaluate",
+        "navigate", "mcp-sql", "written-sql-file",
+    ],
+)
+def test_fatal_patterns_apply_to_every_acting_tool_input(events):
+    signal = _signal_for(*events)
+
+    assert signal.valid is False
+    assert "toggled through the admin UI" in "; ".join(signal.errors)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [_tool_use("Grep", {"pattern": "useNewCheckout", "path": "app/"})],
+        [_tool_use("Bash", {"command": "grep -rn 'useNewCheckout|showNewCheckout' app/ 2>/dev/null | head -20"})],
+        [_tool_use("Bash", {"command": "cd app && git log -S useNewCheckout --oneline"})],
+        [_tool_use("Bash", {"command": "mysql -e 'select useNewCheckout from tenants where id = 4'"})],
+        [_tool_use("mcp__playwright__browser_click", {"element": "useNewCheckout checkbox", "ref": "e12"})],
+        [_tool_use("Task", {"prompt": "Toggle useNewCheckout through the admin UI"})],
+        [_tool_use("Write", {"file_path": "/tmp/notes.md", "content": "useNewCheckout is on"})],
+        [_tool_use("Bash", {"command": "make up", "description": "Start env before enabling useNewCheckout"})],
+        [_tool_use("Bash", {"command": "# is useNewCheckout on?\nphp artisan config:show app"})],
+        [_tool_use("Bash", {"command": "find app -name '*.php' | xargs grep -l useNewCheckout"})],
+        [_tool_use("Bash", {"command": "docker exec db mysql -N -e 'SELECT useNewCheckout FROM tenants'"})],
+        [_tool_use("Bash", {"command": "playwright-cli screenshot --filename=shots/useNewCheckout-on.png"})],
+        [_tool_use("Bash", {"command": "curl -s http://app.test/api/config | jq .useNewCheckout"})],
+        [_tool_use("mcp__playwright__browser_evaluate", {"function": "() => document.getElementById('useNewCheckout').checked"})],
+        [_tool_use("mcp__db__query", {"sql": "SELECT useNewCheckout FROM tenants"})],
+    ],
+    ids=[
+        "grep-tool", "bash-grep", "git-log", "select-readback", "ui-click", "subagent-prompt",
+        "unused-write", "bash-description", "shell-comment", "xargs-grep", "docker-readback",
+        "screenshot-name", "curl-get", "evaluate-read", "mcp-select",
+    ],
+)
+def test_fatal_patterns_skip_reads_and_ui_actions(events):
+    assert _signal_for(*events).valid is True
+
+
+def test_fatal_patterns_ignore_prose_that_only_mentions_the_flag():
+    prose = _assistant_text(
+        "I checked with curl that the login page loads.\n"
+        "Then I toggled useNewCheckout in the admin UI; the form did a POST and saved."
+    )
+
+    signal = _signal_for(prose, _tool_use("mcp__playwright__browser_click", {"element": "Save", "ref": "e3"}))
+
+    assert signal.valid is True
+    assert all(not flag.fatal_reason for flag in signal.policy_flags)
+
+
+def test_fatal_patterns_invalidate_handoffs():
+    signal = _signal_for(
+        _tool_use("Bash", {"command": "mysql -e 'update tenants set useNewCheckout=1'"}),
+        final="Set the flag up, continuing next generation.\n<manual-handoff/>",
+    )
+
+    assert signal.kind == "handoff"
+    assert signal.valid is False
+
+
+def test_fixer_may_run_code_it_edited():
+    events = [
+        _tool_use(
+            "Edit",
+            {"file_path": "/repo/db/seeds/flags.sql", "old_string": "x", "new_string": "INSERT INTO flags VALUES ('useNewCheckout')"},
+        ),
+        _tool_use("Bash", {"command": "mysql app_test < /repo/db/seeds/flags.sql"}),
+    ]
+
+    assert _signal_for(*events).valid is False
+    assert _signal_for(*events, fatal_scope="commands").valid is True
+    assert _signal_for(_tool_use("Bash", {"command": "mysql -e 'update t set useNewCheckout=1'"}), fatal_scope="commands").valid is False
+    assert _signal_for(_tool_use("Bash", {"command": "mysql -e 'update t set useNewCheckout=1'"}), fatal_scope="none").valid is True
+
+
+def test_fatal_violation_ends_the_scenario_as_policy_violation(tmp_path):
+    _, conductor_dir, state = _new_state(tmp_path)
+    scenario = state.scenarios[0]
+    output = "\n".join(
+        [
+            _tool_use("Bash", {"command": "mysql -e 'update tenants set useNewCheckout=1'"}),
+            _assistant_text("Flag set, handing off.\n<manual-handoff/>"),
+        ]
+    )
+    scenario.attempts += 1
+    generation = manual_test.ManualGeneration(
+        index=1, started_at=manual_test.datetime.now(manual_test.timezone.utc), scenario_index=0
+    )
+
+    manual_test._apply_signal_to_scenario(
+        state=state,
+        conductor_dir=conductor_dir,
+        scenario=scenario,
+        generation=generation,
+        signal=parse_manual_signal(
+            output, policy_flags=scan_policy_shortcuts(output, FLAG_POLICY), policy=FLAG_POLICY
+        ),
+        output_text=output,
+    )
+
+    assert scenario.status == "policy_violation"
+    assert "toggled through the admin UI" in scenario.evidence.notes[0]
+    assert manual_test._next_open_scenario(state).index == 1
+
+
+def test_read_only_command_detection():
+    read_only = [
+        "grep -rn foo src | head",
+        "rg foo && cat a.txt",
+        "FOO=1 git --no-pager log -p",
+        "find . -name '*.php'",
+        "git show HEAD 2>&1 | head",
+        "ls # useNewCheckout",
+    ]
+    acting = [
+        "grep foo src > out.txt",
+        "find . -name x -delete",
+        "git commit -m x",
+        "mysql app < dump.sql",
+        "psql -c 'select 1'",
+        "echo $(curl -X POST x)",
+        "sed -i s/a/b/ f",
+        "echo 'unbalanced",
+        "grep x\nmysql -e 'select 1'; php artisan tinker",
+    ]
+
+    assert [cmd for cmd in read_only if not manual_test._is_read_only_command(cmd)] == []
+    assert [cmd for cmd in acting if manual_test._is_read_only_command(cmd)] == []
 
 
 def test_status_and_report_output(tmp_path):

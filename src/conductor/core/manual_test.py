@@ -833,14 +833,25 @@ def _parse_shortcuts(block: str) -> list[DataShortcut]:
 
 
 _POLICY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("database cli", re.compile(r"\b(mysql|psql|sqlite3|mongo|redis-cli)\b", re.I)),
     (
-        "mutating http",
-        re.compile(r"\b(curl|httpie|wget)\b.*\b(POST|PUT|PATCH|DELETE)\b", re.I | re.S),
+        "database cli",
+        re.compile(r"\b(mysql|mariadb|mycli|psql|pgcli|sqlite3|mongo|mongosh|redis-cli)\b", re.I),
     ),
     (
-        "db framework command",
-        re.compile(r"\b(artisan\s+tinker|php\s+artisan\s+db|doctrine|bin/console\s+doctrine)\b", re.I),
+        "mutating http",
+        re.compile(
+            r"\b(curl|httpie|wget)\b.*(\b(POST|PUT|PATCH|DELETE)\b"
+            r"|(?-i:\s(-d|--data\S*|--json|-F|--form\S*|-T|--upload-file|--post-data|--post-file))(\s|=|$))",
+            re.I | re.S,
+        ),
+    ),
+    (
+        "framework console",
+        re.compile(
+            r"\b(artisan|bin/console|doctrine|manage\.py|django-admin|rake"
+            r"|rails\s+(runner|r|console|c|dbconsole|db:\S+))\b",
+            re.I,
+        ),
     ),
     ("fixture command", re.compile(r"\b(seed|seeder|factory|fixture|dump|reset-db)\b", re.I)),
     (
@@ -881,59 +892,263 @@ def _is_auto_approved(flag: "PolicyFlag", policy: ManualTestPolicy | None = None
     return (policy or ManualTestPolicy()).auto_approve_shortcuts
 
 
-def _iter_tool_inputs(output: str) -> list[str]:
-    values: list[str] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
+# Tool-input keys the built-in _POLICY_PATTERNS are matched against.
+_POLICY_INPUT_KEYS = ("command", "cmd", "url", "query", "script", "code", "function", "sql")
+
+# Tools whose inputs never trip a fatal pattern: they read code, keep todos,
+# delegate (a subagent's own tool calls are scanned), or drive the UI that the
+# policy asks for, so naming a protected flag there is expected.
+_FATAL_EXEMPT_TOOLS = {
+    "Read", "Grep", "Glob", "LS", "NotebookRead", "WebSearch", "Task", "Agent",
+    "ExitPlanMode", "ToolSearch", "Skill", "TodoWrite", "TodoRead",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+}
+_UI_ACTION_TOOL_RE = re.compile(
+    r"browser_(click|type|fill_form|select_option|hover|drag|press_key|snapshot|"
+    r"take_screenshot|wait_for|tabs?|close|resize|console_messages|network_requests|"
+    r"handle_dialog|file_upload|navigate_back|navigate_forward)"
+)
+# Written content is checked when a later tool call runs or reads the file
+# (e.g. Write x.sql, then `mysql app < x.sql`), not when it is written.
+_FILE_EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+_SHELL_OPERATOR_CHARS = frozenset(";&|<>()\n")
+_READ_ONLY_PROGRAMS = {
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "head", "tail", "less", "more",
+    "ls", "tree", "find", "wc", "sort", "uniq", "cut", "tr", "nl", "diff", "file", "stat",
+    "pwd", "cd", "echo", "printf", "true", "jq", "which", "type",
+}
+_READ_ONLY_GIT_COMMANDS = {"grep", "log", "show", "diff", "blame", "status", "ls-files"}
+# A database call is a readback when its SQL is inline and only reads.
+_READ_SQL = re.compile(
+    r"\bSELECT\b[\s\S]*\bFROM\b|\bSHOW\s+(TABLES|COLUMNS|CREATE|VARIABLES|DATABASES|INDEX)\b"
+    r"|\b(DESCRIBE|EXPLAIN)\s+\w",
+    re.I,
+)
+_SQL_SCRIPT = re.compile(
+    r"\bsource\b|\\i\b|\.read\b|<|\|\s*\S*\b(mysql|mariadb|mycli|psql|pgcli|sqlite3)\b", re.I
+)
+# Browser-code tools (browser_evaluate, browser_run_code) act when the script
+# writes storage or sends requests; reading a checkbox's state does not.
+_BROWSER_CODE_TOOL_RE = re.compile(r"browser_(evaluate|run_code)")
+_JS_MUTATION = re.compile(
+    r"\b(localStorage|sessionStorage|document\.cookie|fetch|XMLHttpRequest|ajax|axios|sendBeacon)\b", re.I
+)
+_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+_COMMAND_PREFIXES = {"sudo", "env", "time", "nice", "nohup", "command", "builtin", "exec"}
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Shell words and operators of *command*, comments dropped; None if unparsable."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="".join(_SHELL_OPERATOR_CHARS))
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _is_read_only_command(command: str) -> bool:
+    """True for a shell command that only searches or reads.
+
+    Covers grep/rg/cat-style programs (also behind xargs) and read-only git
+    subcommands. Anything it cannot parse, any output redirection to a file
+    and any other program counts as not read-only.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return False
+
+    segments: list[list[str]] = [[]]
+    for index, token in enumerate(tokens):
+        if not set(token) <= _SHELL_OPERATOR_CHARS:
+            segments[-1].append(token)
+        elif ">" in token:
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if target != "/dev/null" and not target.isdigit():
+                return False
+        elif "<" not in token:
+            segments.append([])
+
+    for words in segments:
+        while words and (
+            words[0] in _COMMAND_PREFIXES or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])
+        ):
+            words = words[1:]
+        if not words:
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+        program, args = Path(words[0]).name, words[1:]
+        if program == "git":
+            subcommand = next((arg for arg in args if not arg.startswith("-")), "")
+            if subcommand not in _READ_ONLY_GIT_COMMANDS:
+                return False
+        elif program == "find":
+            if _FIND_ACTIONS.intersection(args):
+                return False
+        elif program == "xargs":
+            if next((arg for arg in args if not arg.startswith("-")), "") not in _READ_ONLY_PROGRAMS:
+                return False
+        elif program not in _READ_ONLY_PROGRAMS:
+            return False
+    return True
+
+
+# Tool-input keys that describe a call rather than make it.
+_TOOL_METADATA_KEYS = {"description", "timeout", "run_in_background", "activeForm"}
+
+
+def _is_sql_readback(text: str) -> bool:
+    return bool(_READ_SQL.search(text)) and not _MUTATING_SQL.search(text) and not _SQL_SCRIPT.search(text)
+
+
+def _is_acting_command(command: str) -> bool:
+    """True when a shell command matches a shortcut detector (other than a DB readback)."""
+    return any(
+        pattern.search(command) and not (label == "database cli" and _is_sql_readback(command))
+        for label, pattern in _POLICY_PATTERNS
+    )
+
+
+def _string_leaves(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            leaf
+            for key, item in value.items()
+            if key not in _TOOL_METADATA_KEYS
+            for leaf in _string_leaves(item)
+        ]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return []
+
+
+def _tool_uses(output: str) -> list[tuple[str, object]]:
+    uses: list[tuple[str, object]] = []
+    for event in _stream_events(output):
+        if event.get("type") != "assistant":
             continue
-        if not isinstance(event, dict) or event.get("type") != "assistant":
-            continue
-        for block in event.get("message", {}).get("content", []):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            tool_input = block.get("input", {})
-            if isinstance(tool_input, dict):
-                for key in ["command", "cmd", "url", "query", "script", "code"]:
-                    value = tool_input.get(key)
-                    if isinstance(value, str):
-                        values.append(value)
-            elif isinstance(tool_input, str):
-                values.append(tool_input)
-    return values
+        for block in (event.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                uses.append((str(block.get("name", "")), block.get("input", {})))
+    return uses
+
+
+def _excerpt(value: str, pattern: str, width: int = 150) -> str:
+    match = re.search(pattern, value, re.I)
+    if match is None or len(value) <= 2 * width:
+        return value
+    start, end = max(match.start() - width, 0), match.end() + width
+    return ("..." if start else "") + value[start:end] + ("..." if end < len(value) else "")
+
+
+def _shorten(text: str, limit: int = 300) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _fatal_tool_input(
+    name: str,
+    tool_input: object,
+    written: dict[str, str],
+    policy: ManualTestPolicy,
+    check_written_files: bool,
+) -> tuple[str, str]:
+    """(reason, offending text) when a tool call matches a preset fatal pattern.
+
+    Only calls that can change state count. Shell commands must match a
+    shortcut detector (DB CLI other than a readback, mutating HTTP, framework
+    console, fixtures, browser storage, test route); then the command and any
+    file this session wrote that it refers to are checked. Browser-code tools
+    count when the script writes storage or sends requests. Any other tool
+    that does not just read or drive the UI is checked in full, minus SQL
+    readbacks. A bare flag name in a pattern would otherwise reject every
+    screenshot named after the flag and every grep or GET readback of it.
+    """
+    tool = name.rsplit("__", 1)[-1]
+    if tool in _FATAL_EXEMPT_TOOLS or tool in _FILE_EDIT_TOOLS or _UI_ACTION_TOOL_RE.fullmatch(tool):
+        return "", ""
+    if tool == "Bash":
+        command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else str(tool_input)
+        # Match what runs: shell comments are not part of it.
+        tokens = _shell_tokens(command)
+        text = " ".join(tokens) if tokens is not None else command
+        if _is_read_only_command(command) or not _is_acting_command(text):
+            return "", ""
+        candidates = [text]
+        if check_written_files:
+            candidates += [
+                content for path, content in written.items() if path in text or Path(path).name in text
+            ]
+    elif _BROWSER_CODE_TOOL_RE.fullmatch(tool):
+        candidates = [leaf for leaf in _string_leaves(tool_input) if _JS_MUTATION.search(leaf)]
+    else:
+        candidates = [leaf for leaf in _string_leaves(tool_input) if not _is_sql_readback(leaf)]
+    for value in candidates:
+        for fatal in policy.fatal_patterns:
+            if re.search(fatal.pattern, value, re.I):
+                return fatal.reason, _excerpt(value, fatal.pattern)
+    return "", ""
 
 
 def scan_policy_shortcuts(
-    output: str, policy: ManualTestPolicy | None = None
+    output: str,
+    policy: ManualTestPolicy | None = None,
+    *,
+    fatal_scope: str = "all",
 ) -> list[PolicyFlag]:
+    """Flag shortcut-like tool calls and prose, and fatal policy violations.
+
+    Built-in _POLICY_PATTERNS only flag (for the audit log, or for a strict
+    preset's <shortcut> requirement). The preset's fatal patterns are checked
+    against the inputs of every tool call that acts (see _fatal_tool_input),
+    never against prose: describing a UI flow that names a protected flag is
+    not a violation. *fatal_scope* is "all", "commands" (the fixer: editing
+    code is its job, so content it wrote is not checked when it runs checks
+    on it) or "none" (coverage, which only reads code and edits the matrix).
+    """
+    policy = policy or ManualTestPolicy()
+    check_fatal = bool(policy.fatal_patterns) and fatal_scope != "none"
     flags: list[PolicyFlag] = []
     seen: set[tuple[str, str]] = set()
-    candidates = [("tool", value) for value in _iter_tool_inputs(output)]
-    text = _extract_text_from_stream_json(output)
-    if text.strip():
-        candidates.append(("text", text))
 
-    for source, value in candidates:
-        for label, pattern in _POLICY_PATTERNS:
-            match = pattern.search(value)
-            if match:
-                flagged_value = value if source == "tool" else match.group(0)
-                key = (label, flagged_value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                flags.append(
-                    PolicyFlag(
-                        pattern=label,
-                        value=flagged_value,
-                        source=source,
-                        fatal_reason=_fatal_policy_reason(flagged_value, policy),
-                    )
-                )
+    def add(label: str, value: str, source: str, fatal_reason: str = "") -> None:
+        if (label, value) not in seen:
+            seen.add((label, value))
+            flags.append(PolicyFlag(pattern=label, value=value, source=source, fatal_reason=fatal_reason))
+
+    written: dict[str, str] = {}
+    for name, tool_input in _tool_uses(output):
+        fatal_reason, fatal_value = "", ""
+        if check_fatal:
+            fatal_reason, fatal_value = _fatal_tool_input(
+                name, tool_input, written, policy, fatal_scope == "all"
+            )
+        if isinstance(tool_input, dict):
+            values = [tool_input[key] for key in _POLICY_INPUT_KEYS if isinstance(tool_input.get(key), str)]
+        else:
+            values = [tool_input] if isinstance(tool_input, str) else []
+        flagged = False
+        for value in values:
+            for label, pattern in _POLICY_PATTERNS:
+                if pattern.search(value):
+                    flagged = True
+                    add(label, value, "tool", fatal_reason)
+        if fatal_reason and not flagged:
+            add("fatal pattern", fatal_value, "tool", fatal_reason)
+        if name.rsplit("__", 1)[-1] in _FILE_EDIT_TOOLS and isinstance(tool_input, dict):
+            path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+            if path:
+                content = "\n".join(leaf for leaf in _string_leaves(tool_input) if leaf != path)
+                written[path] = written.get(path, "") + "\n" + content
+
+    text = _extract_text_from_stream_json(output)
+    for label, pattern in _POLICY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            add(label, match.group(0), "text")
     return flags
 
 
@@ -1043,6 +1258,13 @@ def parse_manual_signal(
     block, result_status = _manual_result_block(text, signal.kind)
     signal.result_status = result_status
 
+    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
+    if fatal_flags:
+        signal.errors.append(
+            "policy scanner flagged forbidden shortcut: "
+            + "; ".join(f"{flag.fatal_reason}: {_shorten(flag.value)}" for flag in fatal_flags)
+        )
+
     if signal.kind == "handoff":
         signal.valid = not signal.errors
         return signal
@@ -1108,15 +1330,6 @@ def parse_manual_signal(
             signal.errors.append("blocked result requires evidence")
         if _is_missing_data_reason(signal.blocked_reason, policy):
             signal.errors.append("blocked reason cannot be only missing data")
-
-    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
-    if fatal_flags:
-        signal.errors.append(
-            "policy scanner flagged forbidden shortcut: "
-            + "; ".join(
-                f"{flag.fatal_reason}: {flag.value}" for flag in fatal_flags
-            )
-        )
 
     missing_shortcuts = [
         flag
@@ -1316,7 +1529,10 @@ def build_verifier_prompt(
     plan_content: str,
     finding: ManualFinding,
     conductor_dir: Path,
+    policy: ManualTestPolicy | None = None,
 ) -> str:
+    policy = policy or ManualTestPolicy()
+    project_rules = f"\n## Project Rules\n{policy.policy_text}\n" if policy.policy_text else ""
     return f"""\
 You are verifying a fixed manual-test finding.
 
@@ -1329,7 +1545,7 @@ Artifacts directory: {conductor_dir / 'artifacts'}
 Rerun the exact reproduction through the UI/browser, then run the relevant focused checks.
 Record fresh evidence. End with a full manual-result block plus <manual-pass/> if verified
 or <manual-finding/> if it still fails.
-
+{project_rules}
 Pass format:
 <manual-result status="pass">
   <summary>...</summary>
@@ -1718,6 +1934,7 @@ async def _run_generation(
     audit_path: Path,
     write_markdown_on_finish: bool = True,
     policy: ManualTestPolicy | None = None,
+    fatal_scope: str = "all",
 ) -> tuple[ManualSignal, str]:
     from conductor.core.loop import _wait_for_exit
 
@@ -1775,7 +1992,7 @@ async def _run_generation(
     await _wait_for_exit(exit_file, output_file, tmux, window_name, log_path, audit_path)
     exit_code, output_text, stderr_text = _read_generation_result(exit_file, output_file, stderr_file)
 
-    policy_flags = scan_policy_shortcuts(output_text, policy)
+    policy_flags = scan_policy_shortcuts(output_text, policy, fatal_scope=fatal_scope)
     signal = parse_manual_signal(output_text, policy_flags=policy_flags, policy=policy)
     if not signal.valid:
         signal.infra_error = _claude_failure(output_text, exit_code, stderr_text)
@@ -1855,6 +2072,19 @@ def _apply_signal_to_scenario(
     for shortcut in signal.shortcuts:
         shortcut.scenario_index = scenario.index
     scenario.shortcuts.extend(signal.shortcuts)
+
+    fatal_flags = [flag for flag in signal.policy_flags if flag.fatal_reason]
+    if fatal_flags:
+        # The forbidden change has already happened, so a retry would only
+        # test against polluted state (and could then "pass").
+        scenario.status = "policy_violation"
+        scenario.evidence = ManualEvidence(
+            summary="Generation used a shortcut the preset forbids",
+            notes=[f"{flag.fatal_reason}: {_shorten(flag.value)}" for flag in fatal_flags],
+        )
+        scenario.completed_at = now
+        state.current_scenario_index = scenario.index + 1
+        return
 
     if signal.kind == "pass" and signal.valid:
         scenario.status = "passed"
@@ -1971,6 +2201,7 @@ async def _fix_and_verify_finding(
             log_path=log_path,
             audit_path=audit_path,
             policy=policy,
+            fatal_scope="commands",
         )
     except ManualRunPaused:
         finding.status = "open"
@@ -2014,7 +2245,7 @@ async def _fix_and_verify_finding(
         project_dir=project_dir,
         conductor_dir=conductor_dir,
         tmux=tmux,
-        prompt=build_verifier_prompt(state, plan_content, finding, conductor_dir),
+        prompt=build_verifier_prompt(state, plan_content, finding, conductor_dir, policy=policy),
         label=f"verify-{finding.id}",
         model=model,
         scenario=_scenario_for_finding(state, finding),
@@ -2062,7 +2293,9 @@ async def _fix_and_verify_finding(
         output_text=verifier_output,
     )
     finding.status = "open"
-    finding.verification.append("Verifier did not produce a valid pass/finding signal")
+    finding.verification.append(
+        "Verifier did not produce a valid pass/finding signal: " + "; ".join(verifier_signal.errors)
+    )
     save_manual_state(state, conductor_dir)
 
 
@@ -2210,6 +2443,7 @@ async def _run_manual_phases(
             audit_path=audit_path,
             write_markdown_on_finish=False,
             policy=policy,
+            fatal_scope="none",
         )
         generation = state.generations[-1]
         if not signal.valid:
