@@ -41,8 +41,9 @@ def get_pricing(model: str) -> ModelPricing | None:
 def find_result_event(stream_json_output: str) -> dict | None:
     """Return the last `result` event in Claude CLI stream-json output, or None.
 
-    The CLI ends every `-p` session with one result event. Its `result` field is
-    the final text (absent on some errors); `usage`, `total_cost_usd`,
+    The CLI emits one result event per turn, so a `-p` session that waits for a
+    background task has more than one. Its `result` field is that turn's final
+    text (absent on some errors); `usage`, `total_cost_usd`,
     `modelUsage`, `num_turns`, `is_error` and `subtype` are top-level fields.
     See tests/fixtures/stream_json/ for captured examples.
     """

@@ -131,6 +131,20 @@ def test_final_message_skips_background_subagent_text():
     assert sc._detect_promise(sc._final_message_text(out)) == "NEEDS_INPUT"
 
 
+def test_verdict_survives_a_later_background_task_turn():
+    # Recorded shape (owner pane logs): the verdict ends one turn, then the
+    # CLI wakes the agent for a background task's notification and it answers
+    # without a token.
+    out = _stream(
+        _text(f"Questions written.\n{NEEDS_INPUT}"),
+        _result(f"Questions written.\n{NEEDS_INPUT}", index=0),
+        json.dumps({"type": "system", "subtype": "task_notification", "status": "completed"}),
+        _text("The background task completed; no action needed."),
+        _result("The background task completed; no action needed.", index=1),
+    )
+    assert sc._detect_promise(sc._final_message_text(out)) == "NEEDS_INPUT"
+
+
 def test_final_message_skips_earlier_turn_text():
     out = _stream(
         _text(f"Plan: I will only emit {COMPLETE} once every question is answered."),
@@ -177,6 +191,18 @@ async def test_token_only_in_tool_input_does_not_complete_spec(spec_dir, fake_cl
     assert code == 1
     assert sc.read_status(spec_dir) == "INIT"
     assert len(fake_claude.prompts) == 1, "generate must not run without a verdict"
+
+
+@pytest.mark.asyncio
+async def test_first_round_verdict_before_background_chatter_is_kept(spec_dir, fake_claude):
+    fake_claude.outputs = [_stream(
+        _result(f"Spec drafted, questions written.\n{NEEDS_INPUT}", index=0),
+        _result("Last background task done. All clear.", index=1),
+    )]
+
+    assert await _run(spec_dir) == 0
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
 
 
 # ---------------------------------------------------------------------------

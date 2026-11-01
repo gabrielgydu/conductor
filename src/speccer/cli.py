@@ -397,18 +397,20 @@ def build_generate_prompt(
 def _final_message_text(output: str) -> str:
     """Return the text of the session's final top-level assistant message.
 
-    The CLI reports it as the ``result`` of the last ``result`` event. A
-    session that waits for a background subagent ends more than one turn and
-    the CLI emits one result per turn, in order, so the last one wins. If the
-    stream has no result event, fall back to the last top-level assistant
-    event that carries text.
+    The CLI reports it as the ``result`` of a ``result`` event, one per turn,
+    in order. A session that waits for a background task ends more than one
+    turn: the verdict can follow a "WAITING" turn, or come before a turn that
+    only acknowledges the task's notification. So the last result that holds
+    a promise token wins, and without one the last result. If the stream has
+    no result event, fall back to the last top-level assistant event that
+    carries text.
 
     Events with a ``parent_tool_use_id`` come from subagents and are skipped,
     and tool inputs and results are never read: a promise token quoted in a
     file the agent wrote, or in a reviewer's reply, is not the agent's verdict.
     """
     import json
-    result_text: str | None = None
+    results: list[str] = []
     last_text = ""
     for line in output.splitlines():
         line = line.strip()
@@ -422,7 +424,7 @@ def _final_message_text(output: str) -> str:
             continue
         if event.get("type") == "result":
             result = event.get("result")
-            result_text = result if isinstance(result, str) else ""
+            results.append(result if isinstance(result, str) else "")
         elif event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
             if isinstance(content, str):
@@ -438,7 +440,9 @@ def _final_message_text(output: str) -> str:
             text = "\n".join(t for t in texts if t)
             if text:
                 last_text = text
-    return result_text if result_text is not None else last_text
+    if not results:
+        return last_text
+    return next((r for r in reversed(results) if _detect_promise(r)), results[-1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
