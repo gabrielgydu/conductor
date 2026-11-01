@@ -266,3 +266,58 @@ async def test_rejection_without_questions_continues(tmp_path, monkeypatch, over
     assert sessions.calls == 2
     assert fake_brain.answer_calls == 0
     assert (spec / "QUESTIONS.md").read_text() == questions
+
+
+# ---------------------------------------------------------------------------
+# Rounds that ask for input again without a new question
+# ---------------------------------------------------------------------------
+
+
+def _asks_once_then_repeats(spec_dir: Path, n: int) -> str:
+    (spec_dir / "domains" / "api.md").write_text("# API\n\nStore users in Postgres.\n")
+    if n == 1:
+        (spec_dir / "QUESTIONS.md").write_text(Q1)
+    # Later sessions keep asking for input but leave QUESTIONS.md, and the
+    # answers in it, as they are.
+    return NEEDS_INPUT
+
+
+@pytest.mark.asyncio
+async def test_overnight_rounds_without_new_questions_are_bounded(tmp_path, monkeypatch):
+    state, storage, spec = _env(tmp_path, overnight=True)
+    sessions = SpeccerSessions(_asks_once_then_repeats)
+    monkeypatch.setattr(claude_mod, "run_claude", sessions)
+    fake_brain = Brain()
+    monkeypatch.setattr(brain, "run_claude", fake_brain)
+
+    outcome = await _drive(state, storage, _tmux([]), True, steps=60)
+
+    assert outcome == "human"
+    assert sessions.calls <= orch.MAX_AUTO_QUESTION_ROUNDS + 1
+    assert fake_brain.answer_calls == 1
+    assert "asked for input again" in orch._questions_waiting_message(state, state.runs[0], True)
+
+    # A person adds an answer: conductor continues once more.
+    (spec / "QUESTIONS.md").write_text((spec / "QUESTIONS.md").read_text() + "> Use RDS.\n")
+    assert orch._waiting_reason(state, state.runs[0], True, orch.datetime.now(orch.timezone.utc)) is None
+    before = sessions.calls
+    await advance_run(state, 0, _tmux([]), storage, ConductorConfig(check_interval_s=0))
+    assert sessions.calls == before + 1
+
+
+@pytest.mark.asyncio
+async def test_no_overnight_waits_after_a_round_without_new_questions(tmp_path, monkeypatch):
+    state, storage, spec = _env(tmp_path, overnight=False)
+    sessions = SpeccerSessions(_asks_once_then_repeats)
+    monkeypatch.setattr(claude_mod, "run_claude", sessions)
+    monkeypatch.setattr(brain, "run_claude", Brain())
+    tmux = _tmux([])
+
+    assert await _drive(state, storage, tmux, False) == "human"
+    (spec / "QUESTIONS.md").write_text(Q1 + "> Postgres.\n")  # a person answers Q1
+    outcome = await _drive(state, storage, tmux, False)
+
+    assert outcome == "human"
+    assert sessions.calls == 2
+    assert state.runs[0].stages[0].spec_failures == 1
+    assert "asked for input again" in orch._questions_waiting_message(state, state.runs[0], False)

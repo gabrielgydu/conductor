@@ -69,6 +69,10 @@ class StageState(BaseModel):
     spec_failures: int = 0
     # `speccer run --continue` rounds started with auto-answered questions.
     question_rounds: int = 0
+    # Digest of QUESTIONS.md when conductor last started `speccer run
+    # --continue`; None once that run failed. A round that asks for input
+    # again and leaves the file as it was has asked nothing new.
+    questions_digest: str | None = None
     # Worktree HEAD when the last failure was handled; a different HEAD at the
     # next failure means the runner committed in between (real progress).
     last_failure_head: str | None = None

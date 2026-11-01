@@ -316,6 +316,43 @@ async def test_human_answers_after_the_auto_answer_cap_continue(tmp_path, monkey
     assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]
 
 
+def test_answers_after_the_cap_must_be_new(tmp_path):
+    """The answers the last --continue already had do not lift the cap."""
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, _, spec = _env(tmp_path, questions=answered)
+    run = state.runs[0]
+    stage = run.stages[0]
+    stage.question_rounds = orch.MAX_AUTO_QUESTION_ROUNDS
+    stage.questions_digest = orch._questions_digest(spec / "QUESTIONS.md")
+
+    assert orch._awaits_human(run, stage, overnight=True)
+    (spec / "QUESTIONS.md").write_text(answered + "> Q2: sessions expire after a day.\n")
+    assert not orch._awaits_human(run, stage, overnight=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("code", "failures"), [(0, 1), (1, 1)])
+async def test_continue_round_that_asks_nothing_new(tmp_path, monkeypatch, code, failures):
+    """A clean round that asks nothing new is counted; a failed one keeps its answers usable."""
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, storage, _ = _env(tmp_path, questions=answered)
+    state.overnight = False
+    tmux = _tmux()
+
+    def spawn(name, cmd, *, exit_file, **_):
+        Path(exit_file).write_text(str(code))  # QUESTIONS.md left as it was
+
+    tmux.spawn_runner_in_window = AsyncMock(side_effect=spawn)
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    stage = state.runs[0].stages[0]
+    assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+    assert stage.spec_failures == failures
+    # After a clean round the same answers are stale; after a failed one they are not.
+    assert orch._awaits_human(state.runs[0], stage, overnight=False) == (code == 0)
+
+
 # ---------------------------------------------------------------------------
 # speccer exits that leave the spec waiting for input
 # ---------------------------------------------------------------------------
