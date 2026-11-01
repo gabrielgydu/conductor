@@ -3793,15 +3793,23 @@ async def _review_learnings(
             changed.append(target_file)
 
     state.learnings_reviewed = digest
-    # Persist only this field: the caller's snapshot may be older than the file
-    # (`conductor learnings` runs for minutes next to a live orchestrator).
     state_path = storage.conductor_state(state.project_name)
-    try:
-        on_disk = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        on_disk = state
-    on_disk.learnings_reviewed = digest
-    atomic_save(on_disk, state_path)
+
+    def persist(run: RunState | None = None) -> None:
+        # Persist only what the review changed: the caller's snapshot may be older
+        # than the file (`conductor learnings` runs for minutes next to a live
+        # orchestrator).
+        try:
+            on_disk = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            on_disk = state
+        on_disk.learnings_reviewed = digest
+        saved = next((r for r in on_disk.runs if run and r.index == run.index), None)
+        if run is not None and saved is not None and saved.stages:
+            saved.stages[-1].head_sha = run.stages[-1].head_sha
+        atomic_save(on_disk, state_path)
+
+    persist()
     if not changed:
         _log("POST_RUN", "Learnings review: no changes needed", log_path, audit_path)
         return
@@ -3813,6 +3821,7 @@ async def _review_learnings(
     committed = _commit_paths(root, rels, "Record conductor learnings in CLAUDE.md")
     if committed and target_run is not None:
         target_run.stages[-1].head_sha = _worktree_head(str(root)) or target_run.stages[-1].head_sha
+        persist(target_run)
     previous = state.integration
     delivered = (
         target_run is not None

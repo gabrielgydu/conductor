@@ -134,6 +134,22 @@ async def test_review_persists_only_its_own_field(project, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_review_persists_the_tip_its_commit_moved(project, monkeypatch):
+    # The learnings commit moves the run's tip; head_sha is how a run whose
+    # branch was deleted is still found, so the saved state must have it.
+    from conductor.core.models import atomic_save
+
+    path = project.storage.conductor_state("p")
+    atomic_save(project.state, path)
+    monkeypatch.setattr(brain, "run_claude", _FakeClaude("<<<FILE: CLAUDE.md>>>\n- A rule.\n<<<END>>>\n"))
+
+    await orch._review_learnings(project.state.model_copy(deep=True), project.storage)
+
+    saved = ConductorState.model_validate_json(path.read_text(encoding="utf-8"))
+    assert saved.runs[0].stages[-1].head_sha == _git(project.wt, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("integrated", "expected"),
     [([], "they go out with the run's PR"), ([0], "push or merge it by hand")],
