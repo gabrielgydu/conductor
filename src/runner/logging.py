@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 _RED = "\033[31m"
 _GREEN = "\033[32m"
@@ -20,7 +20,8 @@ def _isatty() -> bool:
 
 
 def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+    # No zone is printed, so use local time like conductor's terminal lines.
+    return datetime.now().astimezone().strftime("%H:%M:%S")
 
 
 def _c(text: str, code: str) -> str:

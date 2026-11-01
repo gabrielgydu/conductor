@@ -162,7 +162,9 @@ def _now_iso() -> str:
 
 
 def _now_dim() -> str:
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    # Terminal lines carry no zone, so they use the reader's local time; the
+    # markdown and audit logs keep UTC with an explicit offset.
+    ts = datetime.now().astimezone().strftime("%H:%M:%S")
     return dim(ts)
 
 
