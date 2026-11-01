@@ -143,7 +143,7 @@ async def test_answers_are_the_final_message_not_the_preamble(tmp_path, monkeypa
     assert "Let me check" not in text
     # Grounded in the project's code, read-only.
     assert fake.calls[0]["cwd"] == str(tmp_path / "wt")
-    assert fake.calls[0]["append_args"] == ["--tools", "Read,Grep,Glob"]
+    assert fake.calls[0]["append_args"] == ["--tools", "Read,Grep,Glob", "--strict-mcp-config"]
 
 
 @pytest.mark.asyncio
