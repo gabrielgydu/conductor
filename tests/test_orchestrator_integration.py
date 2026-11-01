@@ -373,7 +373,10 @@ async def test_learnings_are_reviewed_before_the_runs_are_merged(tmp_path):
     [
         {"merge_error": RuntimeError("no network")},
         # merge.py reports a failed `git worktree add` this way, without raising
-        {"merge_result": IntegrationState(status="failed", branch="integration/test-proj")},
+        {"merge_result": IntegrationState(
+            status="failed", branch="integration/test-proj", failure="setup",
+            failure_detail="git worktree add failed",
+        )},
     ],
     ids=["raised", "returned"],
 )

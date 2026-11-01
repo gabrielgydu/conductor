@@ -19,10 +19,21 @@ from pathlib import Path
 import conductor.core.tmux as _tmux_module
 from conductor.core import brain
 from conductor.core.claude import resolve_model
-from conductor.core.enums import IntegrationStatus, RunStatus, StageStatus
+from conductor.core.enums import (
+    IntegrationFailure,
+    IntegrationStatus,
+    RunStatus,
+    StageStatus,
+)
 from conductor.core.lock import acquire_project_lock, release_project_lock
 from conductor.core.logging import live_log
-from conductor.core.models import ConductorState, RunState, StageState, atomic_save
+from conductor.core.models import (
+    ConductorState,
+    IntegrationState,
+    RunState,
+    StageState,
+    atomic_save,
+)
 from conductor.core.presets import Preset, PresetConfig, load_preset
 from conductor.core.storage import StorageResolver
 
@@ -64,6 +75,8 @@ class ConductorConfig:
     project_root: Path | None = None
     # None: use state.overnight (set from --no-overnight); a bool overrides it.
     overnight: bool | None = None
+    # --reintegrate: one integration attempt even if it is not due.
+    reintegrate: bool = False
 
 
 def _overnight(config: ConductorConfig, state: ConductorState) -> bool:
@@ -88,14 +101,19 @@ async def _push_and_pr_for_branch(
     branch: str,
     base_branch: str,
     project_name: str,
-    run: "RunState",
+    run: "RunState | None",
     storage: "StorageResolver",
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    draft: bool = False,
 ) -> str:
-    """Push a branch to origin and open a non-draft PR; return the PR URL.
+    """Push a branch to origin and open a PR for it; return the PR URL.
 
     Raises RuntimeError when the push or the PR creation fails, so the
     caller never reports a PR that does not exist. A PR that already exists
-    for the branch (a resumed run) counts as success.
+    for the branch (a resumed run) counts as success. *title* and *body*
+    default to the single-run PR's, made from *run*.
     """
     project_dir = Path(storage.repo_root)
 
@@ -112,15 +130,19 @@ async def _push_and_pr_for_branch(
         )
 
     # Create PR with retry
-    title = f"{run.name}: {run.description[:60]}" if run.description else run.name
+    if title is None:
+        title = f"{run.name}: {run.description[:60]}" if run.description else run.name
+    if body is None:
+        body = f"Conductor single-run output for **{project_name}**."
     error = ""
     for attempt in range(3):
         proc = await asyncio.create_subprocess_exec(
             "gh", "pr", "create",
             "--title", title,
-            "--body", f"Conductor single-run output for **{project_name}**.",
+            "--body", body,
             "--head", branch,
             "--base", base_branch,
+            *(["--draft"] if draft else []),
             cwd=str(project_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -137,15 +159,24 @@ async def _push_and_pr_for_branch(
     raise RuntimeError(f"gh pr create failed after 3 attempts: {error[-500:]}")
 
 
-def _integration_due(state: ConductorState) -> tuple[list[int], str] | None:
+# A failed setup (worktree, checked-out branch) or publish (push, PR) may be
+# transient: it is retried in this many sessions in a row, then left to
+# --reintegrate. Other failures are retried only once more runs finish.
+MAX_INTEGRATION_RETRIES = 3
+_RETRIED_FAILURES = (IntegrationFailure.SETUP, IntegrationFailure.PUBLISH)
+
+
+def _integration_due(
+    state: ConductorState, *, force: bool = False
+) -> tuple[list[int], str] | None:
     """The DONE runs to integrate now and why, or None if integration is current.
 
-    Integration is due when runs finished since the last attempt (for
-    example BLOCKED runs resumed in a later session) or when the last
-    attempt failed before it could merge anything. Any other finished
-    attempt, PARTIAL and NEEDS_FIX included, is not repeated: each one
-    rebuilds the integration branch and can spend Claude calls on the same
-    conflicts.
+    Integration is due for the first DONE runs, for runs finished since the
+    last attempt (for example BLOCKED runs resumed in a later session), and
+    when *force*d (--reintegrate). A failed attempt is repeated as is only
+    for a setup or publish failure, in up to MAX_INTEGRATION_RETRIES
+    sessions in a row. Any other finished attempt, PARTIAL and NEEDS_FIX
+    included, is not repeated: the next one starts from its branch anyway.
     """
     done = [r.index for r in state.runs if r.status == RunStatus.DONE]
     if not done:
@@ -153,14 +184,113 @@ def _integration_due(state: ConductorState) -> tuple[list[int], str] | None:
     previous = state.integration
     if previous is None:
         return done, "first integration"
-    covered = set(previous.considered_runs or previous.merged_runs)
-    new = [i for i in done if i not in covered]
+    if force:
+        return done, "requested with --reintegrate"
+    if previous.failure is not None and set(done) == set(previous.attempted_runs):
+        if (
+            previous.failure in _RETRIED_FAILURES
+            and previous.failed_attempts < MAX_INTEGRATION_RETRIES
+        ):
+            return done, (
+                f"retrying after a {previous.failure} failure (attempt "
+                f"{previous.failed_attempts + 1} of {MAX_INTEGRATION_RETRIES})"
+            )
+        return None
+    new = [i for i in done if i not in previous.considered_runs]
     if not new:
         return None
-    if not covered:
-        return done, f"previous attempt {previous.status} before merging"
+    if not previous.considered_runs:
+        # Written by an older version whose attempt merged nothing.
+        return done, f"the last attempt ({previous.status}) merged nothing"
     names = ", ".join(r.name for r in state.runs if r.index in new)
     return done, f"finished since the last integration: {names}"
+
+
+def _integration_retry_note(integration: IntegrationState | None) -> str | None:
+    """How the last failed integration attempt gets retried, or None."""
+    if integration is None or integration.failure is None:
+        return None
+    what = f"last attempt failed ({integration.failure}): {integration.failure_detail}"
+    if (
+        integration.failure in _RETRIED_FAILURES
+        and integration.failed_attempts < MAX_INTEGRATION_RETRIES
+    ):
+        return (
+            f"{what}; retried on the next run ({integration.failed_attempts} of "
+            f"{MAX_INTEGRATION_RETRIES} attempts made)"
+        )
+    return (
+        f"{what}; not retried until another run finishes: fix that, then "
+        "re-run `conductor run` (or `go`) with --reintegrate"
+    )
+
+
+def _record_attempt(
+    previous: IntegrationState | None, result: IntegrationState, done: list[int]
+) -> IntegrationState:
+    """The integration to keep after *result*, an attempt over the DONE runs *done*.
+
+    An attempt that merged nothing changed nothing either: the integration
+    from before stays (its PR, merged and considered runs), with the failure
+    recorded next to it.
+    """
+    if result.failure is None:
+        return result.model_copy(update={"considered_runs": done})
+    repeated = (
+        previous is not None
+        and previous.failure is not None
+        and set(previous.attempted_runs) == set(done)
+    )
+    update: dict = {
+        "failure": result.failure,
+        "failure_detail": result.failure_detail,
+        "failed_attempts": previous.failed_attempts + 1 if repeated else 1,
+        "attempted_runs": done,
+    }
+    if result.merged_runs:
+        # Merged but not published: this is the integration now.
+        return result.model_copy(update={**update, "considered_runs": done})
+    if result.failure == IntegrationFailure.NOTHING_MERGEABLE:
+        # The merge loop ran: the same runs would fail the same way.
+        update["considered_runs"] = done
+    elif result.failure == IntegrationFailure.DIVERGED:
+        update["status"] = IntegrationStatus.NEEDS_FIX  # someone has to reconcile them
+    return (previous or result).model_copy(update=update)
+
+
+async def _publish_integration(
+    state: ConductorState, integration: IntegrationState, storage: StorageResolver
+) -> tuple[IntegrationState, str]:
+    """Retry only the push and the PR of an integration that merged but was
+    not published; returns the integration to keep and what happened."""
+    from conductor.integration.merge import _build_pr_body, _final_status
+
+    runs = {r.index: r for r in state.runs}
+    merged = [runs[i] for i in integration.merged_runs if i in runs]
+    left_out = [
+        (runs[i], "not merged")
+        for i in integration.considered_runs
+        if i in runs and i not in integration.merged_runs
+    ]
+    partial = integration.status == IntegrationStatus.PARTIAL
+    try:
+        pr_url = await _push_and_pr_for_branch(
+            integration.branch, state.base_branch, state.project_name, None, storage,
+            title=f"Integration: {state.project_name}",
+            body=_build_pr_body(
+                merged, integration.conflicts_resolved, integration.conflicts_unresolved, left_out
+            ),
+            draft=partial,
+        )
+    except (RuntimeError, OSError) as exc:  # failed push or PR; gh missing
+        update = {"failure_detail": str(exc), "failed_attempts": integration.failed_attempts + 1}
+        return integration.model_copy(update=update), f"Publishing {integration.branch} failed: {exc}"
+    status = _final_status(partial, integration.validation_passed is not False, True)
+    update = {
+        "status": status, "pr_url": pr_url, "published": True,
+        "failure": None, "failure_detail": None, "failed_attempts": 0,
+    }
+    return integration.model_copy(update=update), f"Published {integration.branch}: {pr_url}"
 
 
 async def _integrate(
@@ -173,9 +303,11 @@ async def _integrate(
 ) -> bool:
     """Deliver the DONE runs: one run gets a PR from its branch, several are
     merged into the integration branch. Returns False if there was nothing
-    to deliver (a single run without a branch)."""
-    from conductor.core.models import IntegrationState
+    to deliver (a single run without a branch).
 
+    Delivered means pushed with a PR. An integration that merged but was not
+    published retries only the push and the PR (_publish_integration).
+    """
     previous = state.integration
     if len(done) == 1:
         run = next(r for r in state.runs if r.index == done[0])
@@ -187,37 +319,48 @@ async def _integrate(
                 branch, state.base_branch, state.project_name, run, storage
             )
         except Exception as exc:
-            state.integration = IntegrationState(status=IntegrationStatus.FAILED, branch=branch)
+            result = IntegrationState(
+                status=IntegrationStatus.NEEDS_FIX, branch=branch, merged_runs=done,
+                published=False, failure=IntegrationFailure.PUBLISH, failure_detail=str(exc),
+            )
             message = f"Single-run push/PR failed: {exc}"
         else:
-            state.integration = IntegrationState(
-                status=IntegrationStatus.DONE,
-                branch=branch,
-                merged_runs=done,
-                considered_runs=done,
-                pr_url=pr_url,
+            result = IntegrationState(
+                status=IntegrationStatus.DONE, branch=branch, merged_runs=done,
+                pr_url=pr_url, published=True,
             )
             message = f"Single-run PR: {pr_url}"
+        state.integration = _record_attempt(previous, result, done)
+    elif (
+        previous is not None
+        and previous.failure == IntegrationFailure.PUBLISH
+        and set(done) <= set(previous.considered_runs)
+    ):
+        state.integration, message = await _publish_integration(state, previous, storage)
     else:
         from conductor.integration.merge import run_integration_merge
 
-        # Each attempt rebuilds the integration branch from all DONE runs;
-        # merge.py sees it as a first integration.
-        state.integration = None
         try:
             result = await run_integration_merge(state, storage)
         except Exception as exc:
-            state.integration = IntegrationState(status=IntegrationStatus.FAILED, branch="")
-            message = f"Integration merge failed: {exc}"
+            result = IntegrationState(
+                status=IntegrationStatus.FAILED,
+                branch=previous.branch if previous is not None else "",
+                failure=IntegrationFailure.SETUP,
+                failure_detail=f"integration merge raised: {exc}",
+            )
+        state.integration = _record_attempt(previous, result, done)
+        if result.failure is not None and not result.merged_runs:
+            message = f"Integration attempt failed ({result.failure}): {result.failure_detail}"
+            if previous is not None:
+                message += "; the integration from before is kept"
         else:
-            # merge.py returns FAILED with nothing merged when it cannot even
-            # set up the integration worktree; leave considered_runs empty so
-            # _integration_due retries that like a raised error.
-            if result.status != IntegrationStatus.FAILED or result.merged_runs:
-                result.considered_runs = done
-            state.integration = result
             message = f"Integration merge status={result.status}"
-            if previous is not None and previous.pr_url and previous.pr_url != result.pr_url:
+            if result.pr_url:
+                message += f", PR {result.pr_url}"
+            if result.published is False:
+                message += f", not published: {result.failure_detail}"
+            if previous is not None and previous.pr_url and previous.branch != result.branch:
                 message += f"; the earlier PR {previous.pr_url} is superseded but still open"
     atomic_save(state, storage.conductor_state(state.project_name))
     _log("CONDUCTOR_EXIT", f"{message} ({reason})", log_path, audit_path)
@@ -3425,9 +3568,7 @@ async def _review_learnings(
     branch = target_run.stages[-1].branch or "(detached)"
     committed = _commit_paths(root, rels, "Record conductor learnings in CLAUDE.md")
     previous = state.integration
-    delivered = previous is not None and target_run.index in (
-        previous.considered_runs or previous.merged_runs
-    )
+    delivered = previous is not None and target_run.index in previous.considered_runs
     if not committed:
         message = f"Learnings written to {', '.join(rels)} in {root} but not committed"
     elif delivered:
@@ -3803,7 +3944,7 @@ async def _conductor_run_loop(
         )
 
         if all_terminal:
-            due = _integration_due(state)
+            due = _integration_due(state, force=config.reintegrate)
             if due is not None:
                 # Commit learnings on the run branch before it is pushed or
                 # merged, so they reach the PR; post-run finds them reviewed.
@@ -3811,9 +3952,10 @@ async def _conductor_run_loop(
             if due is None or not await _integrate(
                 state, due[0], due[1], storage, log_path, audit_path
             ):
+                note = _integration_retry_note(state.integration)
                 _log(
                     "CONDUCTOR_EXIT",
-                    "All runs complete",
+                    "All runs complete" + (f"; integration {note}" if note else ""),
                     log_path,
                     audit_path,
                     reason="all_done",

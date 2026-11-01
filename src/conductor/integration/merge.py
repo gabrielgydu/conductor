@@ -12,12 +12,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from conductor.core.claude import run_claude
-from conductor.core.enums import IntegrationStatus, RunStatus
+from conductor.core.enums import IntegrationFailure, IntegrationStatus, RunStatus
 from conductor.core.models import (
     ConductorState,
     ConflictRecord,
+    E2ETestState,
     IntegrationState,
     RunState,
+    StageState,
 )
 from conductor.core.presets import Preset, load_preset
 from conductor.core.validation import (
@@ -186,16 +188,61 @@ async def _link_node_modules(repo_root: Path, wt: Path) -> None:
     _print(f"Linked the packages in {src} into the worktree")
 
 
-async def _runs_touching(path: str, runs: list[RunState], start: str, cwd: Path) -> list[str]:
-    """Names of *runs* whose branch changed *path* since *start* (the merge base)."""
+async def _runs_touching(
+    path: str, runs: list[RunState], tips: dict[int, str], start: str, cwd: Path
+) -> list[str]:
+    """Names of *runs* whose tip (*tips*) changed *path* since *start* (the merge base)."""
     names = []
     for run in runs:
         rc, _, _ = await _run_git(
-            ["diff", "--quiet", f"{start}...{run.stages[-1].branch}", "--", path], cwd
+            ["diff", "--quiet", f"{start}...{tips[run.index]}", "--", path], cwd
         )
         if rc == 1:
             names.append(run.name)
     return names
+
+
+async def _rev(ref: str, cwd: Path) -> str | None:
+    """The commit *ref* names, or None if there is none."""
+    rc, out, _ = await _run_git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd)
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+async def _is_ancestor(ref: str, of: str, cwd: Path) -> bool:
+    """Whether *of* already contains *ref*."""
+    rc, _, _ = await _run_git(["merge-base", "--is-ancestor", ref, of], cwd)
+    return rc == 0
+
+
+async def _stage_tip(stage: StageState, cwd: Path) -> str | None:
+    """What to merge for a run's last *stage* (StageState.work_refs); None if
+    its work is gone."""
+    for ref, name in stage.work_refs():
+        if await _rev(ref, cwd) is not None:
+            return name
+    return None
+
+
+async def _checked_out_at(branch: str, repo_root: Path) -> str | None:
+    """Path of an existing worktree (the main checkout included) that has *branch*."""
+    _, out, _ = await _run_git(["worktree", "list", "--porcelain"], repo_root)
+    path = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}" and path and Path(path).exists():
+            return path
+    return None
+
+
+def _final_status(has_partial: bool, validation_passed: bool, published: bool) -> IntegrationStatus:
+    """PARTIAL while a run or a conflict resolution is missing; DONE only once
+    validation passed and the branch is pushed with a PR; NEEDS_FIX otherwise."""
+    if has_partial:
+        return IntegrationStatus.PARTIAL
+    if not validation_passed or not published:
+        return IntegrationStatus.NEEDS_FIX
+    return IntegrationStatus.DONE
 
 
 # Merge commits skip hooks, like every commit conductor makes outside the
@@ -356,7 +403,16 @@ async def run_integration_merge(
     state: ConductorState,
     storage,  # StorageResolver
 ) -> IntegrationState:
-    """Merge all DONE runs into an integration branch and open a PR."""
+    """Merge the DONE runs into integration/<project> and open (or reuse) its PR.
+
+    Incremental and never destructive: the integration branch is not deleted
+    or force-pushed. An attempt starts from the existing branch (the newer of
+    the local one and origin's), merges only the runs it does not contain
+    yet, and moves and pushes the branch (fast-forward) only after new merges
+    or while it is not published. A checkout that has the branch, or local
+    and origin branches that diverged, stop the attempt before anything
+    changes (failure SETUP or DIVERGED).
+    """
     eligible_runs = get_activation_order(state)
 
     branch_name = f"integration/{state.project_name}"
@@ -371,47 +427,60 @@ async def run_integration_merge(
             merged_runs=[],
         )
 
-    # --- Cleanup phase (ignore errors) ---
+    def stop(failure: IntegrationFailure, detail: str, status=IntegrationStatus.FAILED):
+        _print(f"Integration stopped, nothing changed: {detail}")
+        return IntegrationState(
+            status=status, branch=branch_name, failure=failure, failure_detail=detail
+        )
+
+    # Integration and stage branches that exist only on origin count too
+    # (ignore errors: no origin, offline).
+    await _run_git(["fetch", "--quiet", "origin"], repo_root)
+
+    # --- Our worktree from an earlier attempt (ignore errors) ---
     await _run_git(["worktree", "remove", "--force", str(worktree_path)], repo_root)
     if not state.worktrees_base:
         # A worktree left at the old location, even one whose directory is
-        # gone, keeps the branch checked out: `branch -D` and the add would fail.
+        # gone, would keep the branch checked out.
         legacy = _LEGACY_WORKTREE_BASE / f"conductor-integration-{state.project_name}"
         await _run_git(["worktree", "remove", "--force", str(legacy)], repo_root)
-    await _run_git(["branch", "-D", branch_name], repo_root)
-    await _run_git(["push", "origin", "--delete", branch_name], repo_root)
-
-    # --- Create worktree ---
-    rc, _, _ = await _run_git(
-        [
-            "worktree",
-            "add",
-            str(worktree_path),
-            "-b",
-            branch_name,
-            f"origin/{state.base_branch}",
-        ],
-        repo_root,
-    )
-    if rc != 0:
-        # Fallback: use local base branch
-        rc2, _, err = await _run_git(
-            [
-                "worktree",
-                "add",
-                str(worktree_path),
-                "-b",
-                branch_name,
-                state.base_branch,
-            ],
-            repo_root,
+    holder = await _checked_out_at(branch_name, repo_root)
+    if holder is not None:
+        return stop(
+            IntegrationFailure.SETUP,
+            f"{branch_name} is checked out in {holder}; switch that checkout to "
+            "another branch",
         )
-        if rc2 != 0:
-            logger.error("Failed to create worktree: %s", err)
-            return IntegrationState(
-                status=IntegrationStatus.FAILED,
-                branch=branch_name,
+
+    # --- Start from the integration branch when there is one ---
+    local = await _rev(f"refs/heads/{branch_name}", repo_root)
+    remote = await _rev(f"refs/remotes/origin/{branch_name}", repo_root)
+    start = local or remote
+    if local and remote and local != remote:
+        if await _is_ancestor(local, remote, repo_root):
+            start = remote
+        elif not await _is_ancestor(remote, local, repo_root):
+            return stop(
+                IntegrationFailure.DIVERGED,
+                f"{branch_name} and origin/{branch_name} have diverged; merge one "
+                "into the other (or reset one), then re-run with --reintegrate",
+                IntegrationStatus.NEEDS_FIX,
             )
+
+    # --- Create worktree (detached: the branch moves only at the end) ---
+    starts = [start] if start else [f"origin/{state.base_branch}", state.base_branch]
+    for ref in starts:
+        rc, _, err = await _run_git(
+            ["worktree", "add", "--detach", str(worktree_path), ref], repo_root
+        )
+        if rc == 0:
+            break
+    else:
+        logger.error("Failed to create worktree: %s", err)
+        return stop(
+            IntegrationFailure.SETUP,
+            f"git worktree add {worktree_path} failed: {err.strip()}",
+        )
 
     # From the repo root, like the runs: an uncommitted .conductor/preset.toml
     # is not in the worktree.
@@ -423,7 +492,8 @@ async def run_integration_merge(
 
     try:
         return await _integrate(
-            state, repo_root, worktree_path, branch_name, eligible_runs, preset
+            state, repo_root, worktree_path, branch_name, eligible_runs, preset,
+            local=local, remote=remote,
         )
     finally:
         await _remove_worktree(worktree_path, repo_root)
@@ -436,39 +506,62 @@ async def _integrate(
     branch_name: str,
     eligible_runs: list[RunState],
     preset: Preset | None,
+    *,
+    local: str | None,
+    remote: str | None,
 ) -> IntegrationState:
-    """Merge, validate, commit, push and open the PR inside worktree *wt*."""
-    merged_runs: list[RunState] = []
+    """Merge, validate, commit, push and open the PR inside worktree *wt*.
+
+    *local* and *remote* are the integration branch's tips before this
+    attempt (None where it does not exist); *wt* starts at the newer one.
+    """
+    previous = state.integration
+    on_branch = bool(local or remote)
+    merged_runs: list[RunState] = []  # on the branch: merged now or already in it
+    new_runs: list[RunState] = []  # merged by this attempt
+    tips: dict[int, str] = {}
     not_merged: list[tuple[RunState, str]] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     has_partial = False
+    start_label = branch_name if on_branch else state.base_branch
 
     def skip(run: RunState, reason: str) -> None:
         _print(f"  ✗ Run {run.index} ({run.name}) not merged: {reason}")
         not_merged.append((run, reason))
 
+    def contained(run: RunState) -> None:
+        _print(f"  ✓ Run {run.index} ({run.name}) already in {start_label}")
+        merged_runs.append(run)
+
     # --- Merge loop ---
-    _print(f"Worktree created at {wt}")
+    _print(f"Worktree created at {wt}, starting from {start_label}")
     _, start, _ = await _run_git(["rev-parse", "HEAD"], wt)
     start = start.strip()
     for run in eligible_runs:
-        branch = run.stages[-1].branch if run.stages else None
-        if branch is None:
-            skip(run, "no branch recorded for its last stage")
+        stage = run.stages[-1] if run.stages else None
+        tip = await _stage_tip(stage, wt) if stage else None
+        if tip is None:
+            if on_branch and previous is not None and run.index in previous.merged_runs:
+                # Merged by an earlier attempt; its branch is gone since.
+                contained(run)
+            elif stage is None or not stage.branch:
+                skip(run, "no branch recorded for its last stage")
+            else:
+                skip(run, f"branch {stage.branch} does not exist")
             continue
-
-        _print(f"Merging run {run.index}: {run.name} ({branch})")
-        rc, _, _ = await _run_git(["rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"], wt)
-        if rc != 0:
-            skip(run, f"branch {branch} does not exist")
+        if await _is_ancestor(tip, "HEAD", wt):
+            contained(run)
             continue
+        tips[run.index] = tip
 
+        _print(f"Merging run {run.index}: {run.name} ({tip})")
         # Try clean merge
-        rc, out, err = await _run_git([*_MERGE, branch], wt)
+        rc, out, err = await _run_git([*_MERGE, tip], wt)
         if rc == 0:
             _print("  ✓ Clean merge")
             merged_runs.append(run)
+            new_runs.append(run)
             continue
 
         # Conflicts: record the files while the markers are in the tree (after a
@@ -481,7 +574,7 @@ async def _integrate(
             skip(run, f"git merge failed: {reason or f'exit {rc}'}")
             continue
         _print(f"  Conflicts in {len(conflicting)} file(s): {', '.join(conflicting)}")
-        earlier = {f: await _runs_touching(f, merged_runs, start, wt) for f in conflicting}
+        earlier = {f: await _runs_touching(f, new_runs, tips, start, wt) for f in conflicting}
 
         run_description = f"Merging run {run.index}: {run.name}\n{run.description}"
         claude_ok = await resolve_conflicts_with_claude(
@@ -502,13 +595,14 @@ async def _integrate(
                     )
                 )
             merged_runs.append(run)
+            new_runs.append(run)
             continue
 
         # Last resort: -X theirs keeps this run's side of every conflicting
         # hunk and drops the integration branch's (the earlier runs') side.
         # Recorded as unresolved so the status and PR cannot claim a clean merge.
         await _abort_merge(wt)
-        rc, _, _ = await _run_git([*_MERGE, "-X", "theirs", branch], wt)
+        rc, _, _ = await _run_git([*_MERGE, "-X", "theirs", tip], wt)
         if rc == 0:
             _print(f"  ! Claude could not resolve; -X theirs overwrote: {', '.join(conflicting)}")
             for f in conflicting:
@@ -527,6 +621,7 @@ async def _integrate(
                 )
             has_partial = True
             merged_runs.append(run)
+            new_runs.append(run)
             continue
 
         # -X theirs failed too (modify/delete, rename): leave the run out
@@ -546,14 +641,100 @@ async def _integrate(
         skip(run, f"unresolved conflicts in {', '.join(conflicting)}")
 
     has_partial = has_partial or bool(not_merged)
-    _print(f"Merged {len(merged_runs)} of {len(eligible_runs)} runs")
+    already = len(merged_runs) - len(new_runs)
+    _print(
+        f"Merged {len(merged_runs)} of {len(eligible_runs)} runs"
+        + (f" ({already} already in {start_label})" if already else "")
+    )
     if not merged_runs:
         return IntegrationState(
             status=IntegrationStatus.FAILED,
             branch=branch_name,
             conflicts_unresolved=conflicts_unresolved,
+            failure=IntegrationFailure.NOTHING_MERGEABLE,
+            failure_detail="no run could be merged: "
+            + "; ".join(f"{run.name}: {reason}" for run, reason in not_merged),
         )
 
+    # Runs an earlier attempt merged keep its conflict records: the branch
+    # still has what Claude or -X theirs made of them.
+    if on_branch and previous is not None:
+        kept = {run.name for run in merged_runs if run not in new_runs}
+        conflicts_resolved[:0] = [c for c in previous.conflicts_resolved if c.feature_b in kept]
+        carried = [c for c in previous.conflicts_unresolved if c.feature_b in kept]
+        conflicts_unresolved[:0] = carried
+        has_partial = has_partial or bool(carried)
+
+    if new_runs:
+        tip, validation_passed, e2e_result = await _finish_new_merges(
+            state, repo_root, wt, merged_runs, conflicts_resolved, preset
+        )
+        # Move the branch only now, and only from the tip this attempt saw.
+        rc, _, err = await _run_git(
+            ["update-ref", f"refs/heads/{branch_name}", tip, local or ""], repo_root
+        )
+        if rc != 0:
+            return IntegrationState(
+                status=IntegrationStatus.FAILED,
+                branch=branch_name,
+                failure=IntegrationFailure.SETUP,
+                failure_detail=f"{branch_name} moved during the integration, so it was "
+                f"left alone: {err.strip()}",
+            )
+        publish = True
+    else:
+        # The branch is unchanged: nothing to validate or commit. A state
+        # from before validation_passed existed passed unless it is NEEDS_FIX.
+        tip = start
+        if previous is None:
+            validation_passed = True
+        elif previous.validation_passed is not None:
+            validation_passed = previous.validation_passed
+        else:
+            validation_passed = previous.status != IntegrationStatus.NEEDS_FIX
+        e2e_result = previous.e2e if previous is not None else None
+        publish = (
+            previous is None
+            or previous.published is False
+            or previous.status == IntegrationStatus.FAILED
+            or (local is not None and start == local and local != remote)
+        )
+
+    if publish:
+        body = _build_pr_body(merged_runs, conflicts_resolved, conflicts_unresolved, not_merged)
+        pushed, pr_url, publish_error = await _push_and_open_pr(
+            state, wt, branch_name, tip, body, draft=has_partial
+        )
+        published: bool | None = pushed and pr_url is not None
+    else:
+        pr_url, published, publish_error = previous.pr_url, previous.published, ""
+
+    return IntegrationState(
+        status=_final_status(has_partial, validation_passed, published is not False),
+        branch=branch_name,
+        merged_runs=[r.index for r in merged_runs],
+        conflicts_resolved=conflicts_resolved,
+        conflicts_unresolved=conflicts_unresolved,
+        e2e=e2e_result,
+        pr_url=pr_url,
+        published=published,
+        validation_passed=validation_passed,
+        failure=IntegrationFailure.PUBLISH if published is False else None,
+        failure_detail=publish_error or None,
+    )
+
+
+async def _finish_new_merges(
+    state: ConductorState,
+    repo_root: Path,
+    wt: Path,
+    merged_runs: list[RunState],
+    conflicts_resolved: list[ConflictRecord],
+    preset: Preset | None,
+) -> tuple[str, bool, E2ETestState | None]:
+    """Integration specs, validation and their commits on top of the new
+    merges; returns the new tip, whether validation passed and the
+    integration specs' results."""
     # Generation and the Playwright checks below need the project's packages.
     await _link_node_modules(repo_root, wt)
 
@@ -581,9 +762,8 @@ async def _integrate(
         # The merged runs are still worth publishing: push and PR go ahead.
         logger.exception("Post-merge validation crashed")
         vresult = ValidationResult(passed=False, summary=f"validation crashed: {exc}")
-    validation_passed = vresult.passed
     validation_msg = vresult.summary
-    if validation_passed:
+    if vresult.passed:
         logger.info("Post-merge validation passed: %s", validation_msg)
     else:
         logger.error("Post-merge validation FAILED: %s", validation_msg)
@@ -602,15 +782,23 @@ async def _integrate(
     await _run_git(
         ["commit", "-m", "Add conductor integration & smoke tests", "--no-verify"], wt
     )
+    _, tip, _ = await _run_git(["rev-parse", "HEAD"], wt)
+    return tip.strip(), vresult.passed, e2e_result
 
-    # --- Push (once, after every commit above) ---
+
+async def _push_and_open_pr(
+    state: ConductorState, wt: Path, branch_name: str, tip: str, body: str, *, draft: bool
+) -> tuple[bool, str | None, str]:
+    """Push *tip* to origin's *branch_name* (fast-forward only) and find or
+    open its PR; returns (pushed, PR URL, what failed)."""
     _print(f"Pushing {branch_name}")
-    rc, _, err = await _run_git(["push", "origin", branch_name], wt)
+    rc, _, err = await _run_git(["push", "origin", f"{tip}:refs/heads/{branch_name}"], wt)
     pushed = rc == 0
+    error = ""
     if not pushed:
-        logger.error("Pushing %s failed: %s", branch_name, err.strip())
+        error = f"git push origin {branch_name} failed: {err.strip()[-500:]}"
+        logger.error("%s", error)
 
-    # --- PR ---
     pr_url: str | None = None
     try:
         # Check for existing PR
@@ -637,12 +825,9 @@ async def _integrate(
         if existing_prs:
             pr_url = existing_prs[0].get("url")
         else:
-            body = _build_pr_body(
-                merged_runs, conflicts_resolved, conflicts_unresolved, not_merged
-            )
             title = f"Integration: {state.project_name}"
             # Unresolved conflicts or missing runs need a human before this can be merged.
-            draft = ["--draft"] if has_partial else []
+            draft_flag = ["--draft"] if draft else []
             for attempt in range(3):
                 rc, stdout, stderr = await _run_git_gh(
                     [
@@ -651,12 +836,12 @@ async def _integrate(
                         "--body", body,
                         "--head", branch_name,
                         "--base", state.base_branch,
-                        *draft,
+                        *draft_flag,
                     ],
                     wt,
                 )
                 if rc == 0:
-                    pr_url = stdout.strip()
+                    pr_url = stdout.strip() or None
                     break
                 logger.warning(
                     "gh pr create attempt %d/3 failed (rc=%d): %s",
@@ -666,26 +851,13 @@ async def _integrate(
                     await asyncio.sleep(_GH_RETRY_DELAY_S)
             else:
                 logger.error("PR creation failed after 3 attempts for branch %s", branch_name)
+                error = error or f"gh pr create failed: {stderr.strip()[-500:]}"
     except Exception as e:
         logger.error("PR creation failed: %s", e)
-
-    if has_partial:
-        final_status = IntegrationStatus.PARTIAL
-    elif not validation_passed or not pushed:
-        # Unpublished, the branch has no PR; DONE would hide that.
-        final_status = IntegrationStatus.NEEDS_FIX
-    else:
-        final_status = IntegrationStatus.DONE
-
-    return IntegrationState(
-        status=final_status,
-        branch=branch_name,
-        merged_runs=[r.index for r in merged_runs],
-        conflicts_resolved=conflicts_resolved,
-        conflicts_unresolved=conflicts_unresolved,
-        e2e=e2e_result,
-        pr_url=pr_url,
-    )
+        error = error or f"PR creation failed: {e}"
+    if pushed and pr_url is None and not error:
+        error = "no PR was found or created"
+    return pushed, pr_url, error
 
 
 async def _run_git_gh(args: list[str], cwd: Path) -> tuple[int, str, str]:

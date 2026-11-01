@@ -61,6 +61,11 @@ def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
     )
 
 
+async def _gh_opens_pr(args, cwd):
+    """gh against a GitHub remote: no open PR yet, `gh pr create` prints its URL."""
+    return (0, "[]", "") if "list" in args else (0, "https://github.com/o/r/pull/1", "")
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Full clean merge — 3 branches, DAG ordering
 # ---------------------------------------------------------------------------
@@ -84,8 +89,7 @@ async def test_full_merge_pipeline(real_merge_repo, tmp_path):
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, storage)
 
@@ -175,8 +179,7 @@ async def test_merge_with_conflicts(real_merge_repo, tmp_path):
         ):
             with patch(
                 "conductor.integration.merge._run_git_gh",
-                new_callable=AsyncMock,
-                return_value=(1, "", "no remote"),
+                side_effect=_gh_opens_pr,
             ):
                 result = await run_integration_merge(state, storage)
 
@@ -293,8 +296,7 @@ async def test_merge_skips_failed_runs(real_merge_repo, tmp_path):
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, storage)
 

@@ -77,6 +77,11 @@ def _make_state(tmp_path: Path, *runs: RunState) -> ConductorState:
     )
 
 
+async def _gh_opens_pr(args, cwd):
+    """gh against a GitHub remote: no open PR yet, `gh pr create` prints its URL."""
+    return (0, "[]", "") if "list" in args else (0, "https://github.com/o/r/pull/1", "")
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Full clean merge with real git
 # ---------------------------------------------------------------------------
@@ -98,8 +103,7 @@ async def test_full_merge_real_git(real_merge_repo, tmp_path, hermetic_merge):
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, storage)
 
@@ -174,8 +178,7 @@ async def test_content_conflict_goes_to_claude(real_merge_repo, tmp_path):
     ):
         with patch(
             "conductor.integration.merge._run_git_gh",
-            new_callable=AsyncMock,
-            return_value=(1, "", "no remote"),
+            side_effect=_gh_opens_pr,
         ):
             result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
@@ -326,8 +329,7 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, storage)
 
@@ -364,13 +366,20 @@ async def test_worktree_used_real_git(real_merge_repo, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Rerun cleans previous branch and worktree
+# Test 5: A rerun builds on the previous integration branch
 # ---------------------------------------------------------------------------
 
 
+def _rev(repo: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", ref], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
 @pytest.mark.asyncio
-async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
-    """Second run deletes old integration branch/worktree and creates a fresh one."""
+async def test_rerun_builds_on_the_previous_branch(real_merge_repo, tmp_path, hermetic_merge):
+    """A second attempt over the same runs finds them on the branch: nothing
+    is merged, validated or rewritten again, and the PR is kept."""
     real_merge_repo.create_branch("rerun-a", {"rerun_a.txt": "content a\n"})
     real_merge_repo.create_branch("rerun-b", {"rerun_b.txt": "content b\n"})
 
@@ -381,39 +390,23 @@ async def test_rerun_cleans_previous_branch(real_merge_repo, tmp_path):
         _done_run_with_branch(1, "feat-b", "rerun-b"),
     )
     storage = FakeStorage(real_merge_repo.path)
-
-    mock_gh = AsyncMock(return_value=(1, "", "no remote"))
-
-    # First run
-    with patch("conductor.integration.merge._run_git_gh", mock_gh):
-        result1 = await run_integration_merge(state, storage)
-
-    assert result1.status == IntegrationStatus.DONE
-
-    # Verify integration branch exists after first run
     branch_name = f"integration/{project_name}"
-    branches = subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert branch_name in branches
+    mock_gh = AsyncMock(side_effect=_gh_opens_pr)
 
-    # Second run with same state — should clean up and recreate
     with patch("conductor.integration.merge._run_git_gh", mock_gh):
-        result2 = await run_integration_merge(state, storage)
+        state.integration = await run_integration_merge(state, storage)
+    assert state.integration.status == IntegrationStatus.DONE
+    tip = _rev(real_merge_repo.path, branch_name)
 
-    assert result2.status == IntegrationStatus.DONE
-    assert 0 in result2.merged_runs
-    assert 1 in result2.merged_runs
+    with patch("conductor.integration.merge._run_git_gh", mock_gh):
+        result = await run_integration_merge(state, storage)
 
-    # Integration branch still exists (freshly created)
-    branches_after = subprocess.run(
-        ["git", "-C", str(real_merge_repo.path), "branch"],
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert branch_name in branches_after
+    assert result.status == IntegrationStatus.DONE
+    assert result.merged_runs == [0, 1]
+    assert result.pr_url == state.integration.pr_url
+    assert _rev(real_merge_repo.path, branch_name) == tip
+    assert _rev(real_merge_repo.origin, branch_name) == tip
+    hermetic_merge.validate.assert_awaited_once()
     assert not (tmp_path / "worktrees" / f"integration-{project_name}").exists()
 
 
@@ -484,8 +477,7 @@ async def test_validation_fixes_are_committed(real_merge_repo, tmp_path, hermeti
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
@@ -544,8 +536,7 @@ async def test_default_worktree_next_to_repo_is_removed_when_dirty(
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
@@ -730,8 +721,7 @@ async def test_failing_hooks_do_not_drop_a_resolved_run(real_merge_repo, tmp_pat
     with patch("conductor.integration.merge.run_claude", side_effect=claude_resolves):
         with patch(
             "conductor.integration.merge._run_git_gh",
-            new_callable=AsyncMock,
-            return_value=(1, "", "no remote"),
+            side_effect=_gh_opens_pr,
         ):
             result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
@@ -1042,8 +1032,7 @@ async def test_worktree_at_the_old_default_location_is_removed(
 
     with patch(
         "conductor.integration.merge._run_git_gh",
-        new_callable=AsyncMock,
-        return_value=(1, "", "no remote"),
+        side_effect=_gh_opens_pr,
     ):
         result = await run_integration_merge(state, FakeStorage(real_merge_repo.path))
 
