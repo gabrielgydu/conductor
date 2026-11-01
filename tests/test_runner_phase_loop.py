@@ -453,3 +453,27 @@ async def test_failure_record_of_a_previous_run_is_removed_and_never_committed(p
     assert not (feature_dir / phase_loop.FAILURE_FILE).exists()
     owned = phase_loop._runner_owned_paths(repo, feature_dir, FEATURE)
     assert f"docs/{FEATURE}/{phase_loop.FAILURE_FILE}" in owned
+
+
+
+# ─── STATS.json (plain, non-steerable sessions) ─────────────────────────────
+
+
+async def test_plain_session_records_the_reported_cost_of_the_whole_session(project, monkeypatch):
+    """The last result's usage covers one trailing turn; its price was ~6% of the cost."""
+    from conductor.core.claude import ClaudeResult
+
+    repo, feature_dir = project
+    transcript = (Path(__file__).parent / "fixtures" / "stream_json" / "background_task.jsonl").read_text()
+
+    async def run_claude(prompt, **_kw):
+        return ClaudeResult(exit_code=0, output=transcript, tokens_used=None, cost=None, duration=1.0)
+
+    monkeypatch.setattr("conductor.core.claude.run_claude", run_claude)
+    cfg = _config(repo, feature_dir, phases=1, steerable=False, max_iterations=1, model="claude-haiku-5-5")
+
+    assert await phase_loop.run_phase_loop(cfg, feature_dir) == 1  # the transcript has no P1_DONE
+
+    (entry,) = json.loads((feature_dir / "STATS.json").read_text())
+    assert entry["cost_usd"] == round(0.007896185, 6)
+    assert entry["tokens"] == {"input": 10, "output": 501, "cache_read": 74516, "cache_write": 42514}

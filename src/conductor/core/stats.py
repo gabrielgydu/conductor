@@ -59,9 +59,39 @@ def find_result_event(stream_json_output: str) -> dict | None:
     return None
 
 
-def result_token_stats(result_event: dict | None) -> TokenStats:
-    """Token counts from a result event's top-level `usage` (zeros if absent)."""
-    usage = result_event.get("usage") if result_event else None
+def result_events(stream_json_output: str) -> list[dict]:
+    """Every `result` event in Claude CLI stream-json output, in order.
+
+    A session emits one per turn: one for the prompt, and one more for each
+    turn a background task's notification starts. Each event's `usage` and
+    `num_turns` cover only its own turn, while `total_cost_usd` and
+    `modelUsage` are running totals for the session (see
+    tests/fixtures/stream_json/background_task.jsonl).
+    """
+    events = []
+    for line in stream_json_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            events.append(event)
+    return events
+
+
+def _add(totals: TokenStats, tokens: TokenStats) -> None:
+    totals.input += tokens.input
+    totals.output += tokens.output
+    totals.cache_read += tokens.cache_read
+    totals.cache_write += tokens.cache_write
+
+
+def _usage_tokens(result_event: dict) -> TokenStats:
+    """One result's own top-level `usage`: its turn only (zeros if absent)."""
+    usage = result_event.get("usage")
     if not isinstance(usage, dict):
         return TokenStats()
     return TokenStats(
@@ -70,6 +100,55 @@ def result_token_stats(result_event: dict | None) -> TokenStats:
         cache_read=usage.get("cache_read_input_tokens") or 0,
         cache_write=usage.get("cache_creation_input_tokens") or 0,
     )
+
+
+def _model_usage_tokens(result_event: dict) -> TokenStats | None:
+    """A result's cumulative `modelUsage` summed over models; None if it has none."""
+    models = result_event.get("modelUsage")
+    if not isinstance(models, dict) or not models:
+        return None
+    totals = TokenStats()
+    for usage in models.values():
+        if isinstance(usage, dict):
+            _add(totals, TokenStats(
+                input=usage.get("inputTokens") or 0,
+                output=usage.get("outputTokens") or 0,
+                cache_read=usage.get("cacheReadInputTokens") or 0,
+                cache_write=usage.get("cacheCreationInputTokens") or 0,
+            ))
+    return totals
+
+
+def session_token_stats(results: list[dict]) -> TokenStats:
+    """Token totals of a whole session from its result events (zeros if none).
+
+    The last result's `modelUsage` is cumulative and includes subagents, the
+    same tokens total_cost_usd prices. Without it, each result's own `usage`
+    is summed.
+    """
+    if not results:
+        return TokenStats()
+    cumulative = _model_usage_tokens(results[-1])
+    if cumulative is not None:
+        return cumulative
+    totals = TokenStats()
+    for event in results:
+        _add(totals, _usage_tokens(event))
+    return totals
+
+
+def session_num_turns(results: list[dict]) -> int | None:
+    """Turns of a whole session: each result's own `num_turns`, summed; None if none has one."""
+    turns = [
+        e["num_turns"] for e in results
+        if isinstance(e.get("num_turns"), int) and not isinstance(e["num_turns"], bool)
+    ]
+    return sum(turns) if turns else None
+
+
+def result_token_stats(result_event: dict | None) -> TokenStats:
+    """Session token totals as of *result_event* (zeros if absent); see session_token_stats."""
+    return session_token_stats([result_event] if result_event else [])
 
 
 def result_cost_usd(result_event: dict | None) -> float | None:
@@ -81,8 +160,8 @@ def result_cost_usd(result_event: dict | None) -> float | None:
 
 
 def extract_stats(stream_json_output: str) -> TokenStats:
-    """Token usage from the result event in stream-json output (zeros if there is none)."""
-    return result_token_stats(find_result_event(stream_json_output))
+    """Session token totals from stream-json output (zeros without a result event)."""
+    return session_token_stats(result_events(stream_json_output))
 
 
 def extract_reported_cost(stream_json_output: str) -> float | None:

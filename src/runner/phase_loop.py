@@ -25,7 +25,9 @@ from conductor.core.stats import (
     StatsEntry,
     TokenStats,
     extract_stats,
+    extract_reported_cost,
     find_result_event,
+    result_token_stats,
     calculate_cost,
     get_pricing,
     record_stats,
@@ -442,18 +444,14 @@ async def _run_phase(
 
         # ── Record stats ───────────────────────────────────────────────────
         if cfg.steerable and result_event:
-            usage = result_event.get("usage", {})
-            tokens = TokenStats(
-                input=usage.get("input_tokens", 0),
-                output=usage.get("output_tokens", 0),
-                cache_read=usage.get("cache_read_input_tokens", 0),
-                cache_write=usage.get("cache_creation_input_tokens", 0),
-            )
+            tokens = result_token_stats(result_event)
             cost = result_event.get("total_cost_usd", 0.0)
         else:
             tokens = extract_stats(raw_output) if not cfg.steerable else TokenStats()
-            pricing = get_pricing(model or "")
-            cost = calculate_cost(tokens, pricing)
+            # The CLI's own figure; list prices only when it reported none.
+            cost = extract_reported_cost(raw_output) if not cfg.steerable else None
+            if cost is None:
+                cost = calculate_cost(tokens, get_pricing(model or ""))
 
         entry = StatsEntry(
             type="phase",
