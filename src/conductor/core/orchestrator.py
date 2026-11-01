@@ -1129,6 +1129,17 @@ def _count_spec_failure(
     return failed
 
 
+def _needs_human_text(spec_dir: Path) -> str:
+    """What a person does when speccer refuses to start another spec session."""
+    return (
+        f"speccer rejected SPEC_COMPLETE {speccer_cli.read_rejected_completions(spec_dir)} "
+        f"times in a row and starts no spec session until a person steps in. Resolve "
+        f"the [NEEDS CLARIFICATION: ...] markers listed in {spec_dir}/HANDOFF.md in "
+        f"{spec_dir}/domains/, set REJECTED_COMPLETIONS: 0 in {spec_dir}/PROGRESS.md "
+        "and re-run conductor."
+    )
+
+
 def speccer_exit_code_handler(
     state: ConductorState,
     run_idx: int,
@@ -1156,6 +1167,29 @@ def speccer_exit_code_handler(
         # Non-zero exit — check PROGRESS.md for recoverable state
         if progress_file is not None and progress_file.exists():
             pstatus = _read_progress_status(progress_file)
+            spec_dir = progress_file.parent
+            if pstatus == "NEEDS_INPUT" and (
+                exit_code == speccer_cli.EXIT_NEEDS_HUMAN or speccer_cli.needs_human(spec_dir)
+            ):
+                # speccer starts no session until a person resolves the markers
+                # that blocked SPEC_COMPLETE: the stage waits for them
+                # (_awaits_human), and nothing failed that a retry could fix.
+                run = state.runs[run_idx]
+                stage.spec_failures = 0
+                _log(
+                    "BLOCKED",
+                    f"Run {run.name} stage {stage.name}: {_needs_human_text(spec_dir)}",
+                    log_path,
+                    audit_path,
+                    run=run_idx,
+                    stage=stage_idx,
+                    reason="spec_needs_human",
+                    exit_code=exit_code,
+                )
+                sync_speccer_status(
+                    state, run_idx, stage_idx, storage, log_path, audit_path
+                )
+                return
             if pstatus == "NEEDS_INPUT" and _count_spec_failure(
                 state, run_idx, stage_idx,
                 f"speccer exited {exit_code} with the spec still waiting for input",
@@ -1348,11 +1382,16 @@ def _answers_missing(questions_file: Path | None) -> bool:
 def _awaits_human(run: RunState, stage: StageState, overnight: bool) -> bool:
     """Whether a SPEC_NEEDS_INPUT stage can only be moved on by a person.
 
-    Overnight, questions are answered automatically up to
-    MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise, and after that, the stage
-    waits until someone has answered every question in QUESTIONS.md.
+    Always while speccer refuses to start a session after rejected
+    SPEC_COMPLETE claims (speccer_cli.needs_human); that clears once someone
+    sets REJECTED_COMPLETIONS back. Overnight, questions are answered
+    automatically up to MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise, and
+    after that, the stage waits until someone has answered every question
+    in QUESTIONS.md.
     """
     questions = _questions_file(run, stage)
+    if questions is not None and speccer_cli.needs_human(questions.parent):
+        return True
     if overnight:
         return (
             stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS
@@ -2765,7 +2804,8 @@ def _waiting_reason(
 
     "executing": a runner is working in its tmux window; only monitoring is due.
     "backoff":   the stage waits out a transient-failure backoff.
-    "human":     speccer asked questions and nobody auto-answers them.
+    "human":     speccer asked questions and nobody auto-answers them, or it
+                 stopped for a person after rejected SPEC_COMPLETE claims.
     """
     if run.current_stage >= len(run.stages):
         return None
@@ -2782,12 +2822,14 @@ def _waiting_reason(
 def _questions_waiting_message(
     state: ConductorState, run: RunState, overnight: bool
 ) -> str:
-    """How a human answers a stage's speccer questions and lets conductor go on."""
+    """How a person lets a stage waiting for them go on (see _awaits_human)."""
     stage = run.stages[run.current_stage]
     fname = run.name + stage.feature_suffix
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
     continue_cmd = f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue`"
+    if speccer_cli.needs_human(questions.parent):
+        return f"Run {run.name} stage {stage.name}: {_needs_human_text(questions.parent)}"
     try:
         still_open = _open_questions(questions.read_text(encoding="utf-8"))
     except OSError:

@@ -354,6 +354,29 @@ def test_clean_speccer_exit_resets_the_failure_count(tmp_path):
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT
 
 
+@pytest.mark.parametrize("overnight", [True, False])
+def test_speccer_stopped_for_a_human_waits_without_counting(tmp_path, overnight):
+    """EXIT_NEEDS_HUMAN after rejected SPEC_COMPLETEs: no failure, a person's turn."""
+    from speccer.cli import EXIT_NEEDS_HUMAN, MAX_REJECTED_COMPLETIONS
+
+    state, storage, spec = _env(tmp_path, questions="")
+    with (spec / "PROGRESS.md").open("a") as f:
+        f.write(f"REJECTED_COMPLETIONS: {MAX_REJECTED_COMPLETIONS}\n")
+    stage = state.runs[0].stages[0]
+    stage.spec_failures = orch.MAX_SPEC_FAILURES - 1  # the two rejections before
+
+    _speccer_exits(state, storage, EXIT_NEEDS_HUMAN)
+
+    assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+    assert stage.spec_failures == 0
+    run = state.runs[0]
+    assert orch._awaits_human(run, stage, overnight)
+
+    # A person resolved the markers and reset the count: conductor goes on.
+    (spec / "PROGRESS.md").write_text("STATUS: NEEDS_INPUT\nREJECTED_COMPLETIONS: 0\n")
+    assert not orch._awaits_human(run, stage, overnight)
+
+
 # ---------------------------------------------------------------------------
 # rounds speccer continues without answers
 # ---------------------------------------------------------------------------
