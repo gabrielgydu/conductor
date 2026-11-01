@@ -122,6 +122,35 @@ async def _run(cfg: RunConfig, feature_dir: Path, fake: FakeClaude, monkeypatch,
     return await phase_loop.run_phase_loop(cfg, feature_dir, **kwargs)
 
 
+# ─── Commit subjects ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, subject",
+    [
+        ("Add login", "Phase 2: Add login"),
+        ("Phase 2", "Phase 2"),  # the default name when run.sh has no PHASE_NAMES
+        ("phase 2: Add login", "phase 2: Add login"),
+        ("Phase 20", "Phase 2: Phase 20"),
+        ("  ", "Phase 2"),
+    ],
+)
+def test_commit_subject_does_not_repeat_the_phase_label(name, subject):
+    assert phase_loop._commit_subject(2, name) == subject
+
+
+async def test_unnamed_phase_commits_once_labelled(project, monkeypatch):
+    """A live run committed "Phase 1: Phase 1"."""
+    repo, feature_dir = project
+    cfg = _config(repo, feature_dir, phases=1)
+    cfg.phases[0].name = "Phase 1"
+    fake = FakeClaude(repo, [write_code_and_finish])
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+
+    assert _commits(repo) == ["Phase 1", "init"]
+
+
 # ─── Bookkeeping stays out of commits (F53) ─────────────────────────────────
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import re
 import time
 import traceback
 from pathlib import Path
@@ -227,6 +228,20 @@ def _write_failure(feature_dir: Path, reason: str, phase: int | None, detail: st
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps({"reason": reason, "phase": phase, "detail": detail[-2000:]}), "utf-8")
     tmp.replace(feature_dir / FAILURE_FILE)
+
+
+def _commit_subject(phase_num: int, phase_name: str) -> str:
+    """The subject of a phase's commit: "Phase 2: Add login".
+
+    A name that already starts with its label ("Phase 2", the default when
+    run.sh names no phases, or "Phase 2: Add login") is used as it is.
+    """
+    name = phase_name.strip()
+    if not name:
+        return f"Phase {phase_num}"
+    if re.match(rf"phase\s*{phase_num}\b", name, re.IGNORECASE):
+        return name
+    return f"Phase {phase_num}: {name}"
 
 
 def _session_error(result_event: dict | None) -> str:
@@ -515,7 +530,7 @@ async def _run_phase(
         success("Quality gate passed")
 
         # ── Commit ─────────────────────────────────────────────────────
-        commit_msg = f"Phase {phase_num}: {phase_name}"
+        commit_msg = _commit_subject(phase_num, phase_name)
         commit_ok, commit_output = git_commit(project_dir, commit_msg)
 
         if not commit_ok:
