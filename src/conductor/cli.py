@@ -53,9 +53,9 @@ def _isatty() -> bool:
 
 def _ts() -> str:
     """HH:MM:SS timestamp, dimmed when outputting to a terminal."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    t = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    t = datetime.now().astimezone().strftime("%H:%M:%S")  # local: no zone is shown
     return f"{_DIM}{t}{_RESET}" if _isatty() else t
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 # ANSI codes
 _DIM = "\033[2m"
@@ -26,7 +26,7 @@ _ctx_max = 200_000
 
 
 def _ts() -> str:
-    t = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    t = datetime.now().astimezone().strftime("%H:%M:%S")  # local: no zone is shown
     return f"{_DIM}{t}{_RESET} "
 
 

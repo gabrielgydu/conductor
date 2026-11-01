@@ -7,7 +7,7 @@ import sys
 import time
 from asyncio.subprocess import PIPE
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import AsyncIterator, Callable
 
 # Re-exported: callers resolve aliases through conductor.core.claude.
@@ -39,7 +39,7 @@ def _isatty() -> bool:
 
 def _ts() -> str:
     """Return a dim HH:MM:SS timestamp prefix."""
-    t = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    t = datetime.now().astimezone().strftime("%H:%M:%S")  # local: no zone is shown
     if _isatty():
         return f"{_DIM}{t}{_RESET} "
     return f"{t} "
