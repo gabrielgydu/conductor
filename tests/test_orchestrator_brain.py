@@ -13,6 +13,7 @@ import pytest
 import conductor.core.brain as brain
 import conductor.core.orchestrator as orch
 from conductor.core.claude import ClaudeResult
+from conductor.core.stats import find_result_event
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState, RunState, StageState
 from conductor.core.orchestrator import ConductorConfig
@@ -137,6 +138,31 @@ def test_read_reply_without_result_uses_text_after_last_tool_call():
 )
 def test_read_reply_flags_failed_calls(out, exit_code):
     assert not brain.read_reply(_claude(out, exit_code)).ok
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "stream_json"
+
+
+@pytest.mark.parametrize(
+    ("fixture", "stderr", "detail"),
+    [
+        # The CLI reports an unknown model as subtype "success" with is_error set.
+        ("model_not_found", "model not available\n",
+         "claude exited 1 (error): There's an issue with the selected model"),
+        ("error_max_turns", "",
+         "claude exited 1 (error_max_turns): Reached maximum number of turns (1)"),
+        (None, "warming up\nError: invalid API key\n", "claude exited 1: Error: invalid API key"),
+    ],
+)
+def test_failed_reply_detail_carries_the_cli_reason(fixture, stderr, detail):
+    out = (FIXTURES / f"{fixture}.jsonl").read_text() if fixture else ""
+    result = ClaudeResult(
+        exit_code=1, output=out, tokens_used=None, cost=None, duration=0.1,
+        result_event=find_result_event(out), stderr=stderr,
+    )
+    reply = brain.read_reply(result)
+    assert not reply.ok
+    assert reply.detail.startswith(detail)
 
 
 @pytest.mark.asyncio
