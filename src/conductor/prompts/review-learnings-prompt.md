@@ -19,6 +19,7 @@ Analyze the LEARNINGS.md content from the completed run(s). Compare against the 
 2. **Non-obvious** — not something a competent developer would already know
 3. **Actionable** — can be expressed as a concrete rule or tip
 4. **Not already covered** — not redundant with existing CLAUDE.md content
+5. **About the repository, not the machine** — true for anyone who clones it. The run happened on one developer's machine, inside an automation harness, and the learnings often describe that environment instead of the code: shell hooks or wrappers that rewrite command output, the developer's personal tools and global instructions, paths outside the repository, or workarounds for the harness. Leave all of those out; they would mislead every other reader of the file.
 
 For each addition, pick the most appropriate existing CLAUDE.md file based on scope (root for project-wide, subdirectory for component-specific). Do NOT create new CLAUDE.md files.
 
