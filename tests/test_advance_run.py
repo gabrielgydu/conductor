@@ -173,6 +173,10 @@ async def test_advance_run_spec_running_also_calls_run(tmp_path):
 @pytest.mark.asyncio
 async def test_advance_run_spec_needs_input_overnight_answers_and_continues(tmp_path):
     state = _make_state(StageStatus.SPEC_NEEDS_INPUT, overnight=True)
+    questions = tmp_path / "wt" / "docs" / "run-0" / "spec" / "QUESTIONS.md"
+    questions.parent.mkdir(parents=True)
+    questions.write_text("### Q1: Scope\n**Answer:**\n")
+    state.runs[0].stages[0].worktree = str(tmp_path / "wt")
     tmux = _make_tmux()
     storage = _make_storage(tmp_path)
     config = _make_config(overnight=True)

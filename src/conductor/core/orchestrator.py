@@ -25,6 +25,7 @@ from conductor.core.logging import live_log
 from conductor.core.models import ConductorState, RunState, StageState, atomic_save
 from conductor.core.presets import Preset, PresetConfig, load_preset
 from conductor.core.storage import StorageResolver
+from speccer import cli as speccer_cli
 
 # Resolve paths to our own speccer/runner wrappers (sibling to the conductor package root)
 # so we never accidentally invoke the old bash versions via PATH.
@@ -1325,12 +1326,15 @@ def _open_questions(text: str) -> list[str] | None:
 def _answers_missing(questions_file: Path | None) -> bool:
     """Whether speccer's questions still need answers before it can continue.
 
-    True while any '### Qn' question is open, or, without such headings,
-    while the file has no answer at all. A missing or unreadable file has
-    nothing answered.
+    Never when speccer goes on without answers (a blank QUESTIONS.md, or a
+    rejected SPEC_COMPLETE to fix first). Otherwise True while any '### Qn'
+    question is open, or, without such headings, while the file has no
+    answer at all. An unreadable file has nothing answered.
     """
     if questions_file is None:
         return True
+    if not speccer_cli.continue_needs_answers(questions_file.parent):
+        return False
     try:
         text = questions_file.read_text(encoding="utf-8")
     except OSError:
@@ -1391,11 +1395,9 @@ async def answer_questions(
     wt = stage.worktree
 
     questions_file = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
-    if not questions_file.exists():
-        return True
+    if not speccer_cli.continue_needs_answers(questions_file.parent):
+        return True  # speccer goes on without answers
     questions = questions_file.read_text(encoding="utf-8").strip()
-    if not questions:
-        return True
     still_open = _open_questions(questions)
     if still_open == []:
         return True  # all answered already (by a person or by speccer itself)

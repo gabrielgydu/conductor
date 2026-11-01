@@ -352,3 +352,42 @@ def test_clean_speccer_exit_resets_the_failure_count(tmp_path):
 
     assert stage.spec_failures == 1
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+
+
+# ---------------------------------------------------------------------------
+# rounds speccer continues without answers
+# ---------------------------------------------------------------------------
+
+# What spec agents leave in QUESTIONS.md when they have no questions.
+NO_OPEN_QUESTIONS = "# Questions\n\nNo open questions. Spec is complete.\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overnight", [True, False])
+@pytest.mark.parametrize(
+    ("questions", "rejected"),
+    [("", 0), (NO_OPEN_QUESTIONS, 1), (QUESTIONS, 1)],
+    ids=["blank", "no-open-questions-after-rejection", "open-questions-after-rejection"],
+)
+async def test_no_answers_asked_when_speccer_needs_none(
+    tmp_path, monkeypatch, overnight, questions, rejected
+):
+    """A rejected SPEC_COMPLETE or a blank QUESTIONS.md: speccer goes on without answers."""
+    state, storage, spec = _env(tmp_path, questions=questions)
+    state.overnight = overnight
+    if rejected:
+        with (spec / "PROGRESS.md").open("a") as f:
+            f.write(f"REJECTED_COMPLETIONS: {rejected}\n")
+    fake = _answer("unused")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    run = state.runs[0]
+    assert not orch._awaits_human(run, run.stages[0], overnight)
+    assert await orch.answer_questions(state, 0, 0, storage)
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert fake.calls == []
+    assert (spec / "QUESTIONS.md").read_text() == questions
+    assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]

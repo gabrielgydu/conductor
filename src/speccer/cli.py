@@ -532,6 +532,33 @@ def _record_rejection(spec_dir: Path, iteration: int, markers: list[str], reject
     handoff.write_text(existing + "\n" + "\n".join(note), encoding="utf-8")
 
 
+def needs_human(spec_dir: Path) -> bool:
+    """Whether every run refuses with EXIT_NEEDS_HUMAN until a person steps in.
+
+    That is the case once SPEC_COMPLETE was rejected MAX_REJECTED_COMPLETIONS
+    times in a row, until someone sets REJECTED_COMPLETIONS back below it.
+    """
+    return (
+        read_rejected_completions(spec_dir) >= MAX_REJECTED_COMPLETIONS
+        and read_status(spec_dir) not in ("COMPLETE", "GENERATED")
+    )
+
+
+def continue_needs_answers(spec_dir: Path) -> bool:
+    """Whether `run --continue` on a NEEDS_INPUT spec wants answers in QUESTIONS.md.
+
+    Only when QUESTIONS.md asks something. After a rejected SPEC_COMPLETE
+    none are needed either: the next session's job is to resolve the markers
+    listed in HANDOFF.md. That rejection may have come from a first
+    iteration that wrote no questions at all, and once a human has fixed the
+    markers and reset the rejection count, an empty QUESTIONS.md is all that
+    is left.
+    """
+    if read_rejected_completions(spec_dir) > 0:
+        return False
+    return bool(_read_file(spec_dir / "QUESTIONS.md").strip())
+
+
 def _stop_for_human(spec_dir: Path, rejected: int) -> None:
     _die(
         f"SPEC_COMPLETE was rejected {rejected} times in a row; {spec_dir}/HANDOFF.md lists "
@@ -685,15 +712,10 @@ Immutable principles that ALL specs and implementations must respect. The spec a
     print("")
 
 
-def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejection: bool) -> None:
+def _prepare_continue(spec_dir: Path, iteration: int, cont: bool) -> None:
     """Check that a NEEDS_INPUT spec may continue, and archive its questions round.
 
-    Answers are required only when QUESTIONS.md asks something. After a
-    rejected SPEC_COMPLETE none are needed either: the next session's job is
-    to resolve the markers listed in HANDOFF.md. That rejection may have
-    come from a first iteration that wrote no questions at all, and once a
-    human has fixed the markers and reset the rejection count, an empty
-    QUESTIONS.md is all that is left.
+    Answers are required only when continue_needs_answers says so.
     """
     if not cont:
         _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
@@ -705,7 +727,8 @@ def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejectio
     questions = _read_file(questions_file)
     has_questions = bool(questions.strip())
     has_answers = any(line.startswith("> ") for line in questions.splitlines())
-    if has_questions and not has_answers and not after_rejection:
+    after_rejection = read_rejected_completions(spec_dir) > 0
+    if continue_needs_answers(spec_dir) and not has_answers:
         _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
     if has_questions:
         archive_dir = spec_dir / "questions-archive"
@@ -740,7 +763,7 @@ async def _cmd_run_async(
     rejected  = read_rejected_completions(spec_dir)
 
     # ── Validate state ──────────────────────────────────────────────────────
-    if rejected >= MAX_REJECTED_COMPLETIONS and status not in ("COMPLETE", "GENERATED"):
+    if needs_human(spec_dir):
         _stop_for_human(spec_dir, rejected)
 
     if status == "INIT":
@@ -750,7 +773,7 @@ async def _cmd_run_async(
         _log(f"First spec iteration for {_CYAN}{feature_name}{_RESET}")
 
     elif status == "NEEDS_INPUT":
-        _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
+        _prepare_continue(spec_dir, iteration, cont)
 
     elif status == "COMPLETE":
         _log(f"{_GREEN}Spec is already complete.{_RESET} Run generate to produce artifacts:")
@@ -771,7 +794,7 @@ async def _cmd_run_async(
             if not desc_file.exists() or desc_file.stat().st_size == 0:
                 _die("FEATURE-DESCRIPTION.md is empty. Write your feature description first.")
         elif status == "NEEDS_INPUT":
-            _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
+            _prepare_continue(spec_dir, iteration, cont)
 
     else:
         _die(f"Unknown status: {status}")
