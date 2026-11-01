@@ -8,9 +8,11 @@ the wrappers do, without network access or a real install.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,7 @@ if [[ "$1" == -c ]]; then
     exit
 fi
 
+[[ "$1" == -P ]] && shift
 [[ "$1" == -m ]] || exit 2
 module="$2"
 shift 2
@@ -213,3 +216,32 @@ def test_wrapper_works_through_a_symlink_on_path(checkout, tmp_path):
 
     assert r.returncode == 0, r.stderr
     assert r.stdout == "ran conductor --version\n"
+
+
+def test_project_modules_do_not_shadow_ours(tmp_path):
+    """The orchestrator used to run ./runner with the target worktree as cwd,
+    and `python -m runner` put that directory first on sys.path."""
+    root = tmp_path / "checkout"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy2(ROOT / "runner", root / "runner")
+    shutil.copy2(ROOT / "scripts" / "venv-run", root / "scripts" / "venv-run")
+    shutil.copy2(ROOT / "pyproject.toml", root / "pyproject.toml")
+    # A ready venv whose python is the interpreter running these tests.
+    venv_python = root / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n')
+    venv_python.chmod(0o755)
+    pyproject_sha = hashlib.sha256((root / "pyproject.toml").read_bytes()).hexdigest()
+    (root / ".venv" / ".bootstrap-stamp").write_text(f"pyproject {pyproject_sha}\npython {venv_python.resolve()}\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "runner.py").write_text("print('SHADOWED: the project runner.py ran')\n")
+
+    r = subprocess.run(
+        [str(root / "runner"), "--help"], cwd=project, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, check=False,
+    )
+
+    assert "SHADOWED" not in r.stdout
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("usage: runner")

@@ -1,7 +1,11 @@
 #!/bin/bash
-# Run `python -m <module>` from this checkout's .venv, creating or repairing
+# Run `python -P -m <module>` from this checkout's .venv, creating or repairing
 # the venv first when needed. Used by the ./conductor, ./speccer and ./runner
 # wrappers:  scripts/venv-run <module> [args...]
+#
+# -P keeps the current directory off sys.path: the wrappers run from the
+# user's project, whose own modules (a `runner.py`, an `email/` package)
+# must not shadow conductor's packages or the standard library.
 #
 # The venv counts as ready when .venv/.bootstrap-stamp matches the current
 # pyproject.toml and interpreter. Otherwise, under a lock (the orchestrator
@@ -73,4 +77,4 @@ if ! ready; then
     exec 9>&-
 fi
 
-exec "$VENV/bin/python" -m "$MODULE" "$@"
+exec "$VENV/bin/python" -P -m "$MODULE" "$@"
