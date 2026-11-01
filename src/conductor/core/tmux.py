@@ -7,7 +7,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-# Minimum number of PIDs expected in a healthy runner process tree
+# Minimum number of processes expected in a healthy runner process tree
 # (shell → python → claude = 3 processes)
 MIN_HEALTHY_TREE_DEPTH = 3
 
@@ -16,13 +16,17 @@ _WAIT_POLL_SECS = 2.0
 
 
 def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
-    """Check if a process tree has at least `depth` PIDs (sync).
+    """Check if a process tree has at least `depth` processes (sync).
+
+    Threads are not counted (-T): after its first quality gate the runner
+    keeps an idle worker thread, which would make a runner with no Claude
+    under it look healthy for the rest of its life.
 
     Returns True if pstree is not available (safe fallback).
     """
     try:
         r = subprocess.run(
-            ["pstree", "-p", str(pid)],
+            ["pstree", "-p", "-T", str(pid)],
             capture_output=True, text=True,
         )
     except FileNotFoundError:  # psmisc not installed
@@ -201,19 +205,22 @@ class TmuxManager:
         cmd: str,
         *,
         exit_file: Path,
+        fail_log: Path | None = None,
         cwd: str | None = None,
         log_file: Path | None = None,
     ) -> None:
-        """Spawn runner bash script in tmux window (non-blocking). Writes exit code to file when done."""
-        # Wrap command to capture pane output on failure and write exit code
-        fail_log = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
-        wrapped = (
-            f'{cmd}\n_rc=$?; '
+        """Spawn runner bash script in tmux window (non-blocking).
+
+        Writes the exit code to *exit_file* when done and, on a non-zero
+        exit, the last 50 pane lines to *fail_log* if one is given.
+        """
+        capture = (
             f'if [ "$_rc" -ne 0 ]; then '
-            f'tmux capture-pane -t "$TMUX_PANE" -p -S -50 > {shlex.quote(fail_log)} 2>/dev/null; '
+            f'tmux capture-pane -t "$TMUX_PANE" -p -S -50 > {shlex.quote(str(fail_log))} 2>/dev/null; '
             f'fi; '
-            f'echo $_rc > {shlex.quote(str(exit_file))}'
+            if fail_log else ""
         )
+        wrapped = f'{cmd}\n_rc=$?; {capture}echo $_rc > {shlex.quote(str(exit_file))}'
 
         self._new_window(name, wrapped, cwd=cwd, detached=False, log_file=log_file)
 

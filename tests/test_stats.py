@@ -14,6 +14,8 @@ from conductor.core.stats import (
     extract_stats,
     extract_reported_cost,
     find_result_event,
+    result_events,
+    session_num_turns,
     calculate_cost,
     estimate_cost,
     record_stats,
@@ -150,6 +152,31 @@ def test_find_result_event_returns_last_result():
         json.dumps({"type": "result", "subtype": "success", "num_turns": 2}),
     ])
     assert find_result_event(output)["num_turns"] == 2
+
+
+# A background task's notification starts a second turn: two result events,
+# each with its own turn's `usage` and `num_turns`, both with the session's
+# running total_cost_usd and modelUsage (which also counts the subagent).
+BACKGROUND_TASK_TOTALS = TokenStats(input=10, output=501, cache_read=74516, cache_write=42514)
+
+
+def test_session_totals_come_from_the_last_results_model_usage():
+    output = load_stream_json("background_task")
+    assert [e["usage"]["output_tokens"] for e in result_events(output)] == [445, 29]
+
+    assert extract_stats(output) == BACKGROUND_TASK_TOTALS
+    assert session_num_turns(result_events(output)) == 3
+    assert extract_reported_cost(output) == 0.007896185
+
+
+def test_session_totals_without_model_usage_sum_each_turns_usage():
+    output = "\n".join([
+        json.dumps({"type": "result", "num_turns": 4, "usage": {"input_tokens": 3, "output_tokens": 300}}),
+        json.dumps({"type": "result", "num_turns": 1, "usage": {"input_tokens": 1, "output_tokens": 20}}),
+    ])
+
+    assert extract_stats(output) == TokenStats(input=4, output=320)
+    assert session_num_turns(result_events(output)) == 5
 
 
 def test_extract_stats_no_result_event():

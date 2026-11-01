@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import runner.phase_loop as phase_loop
+from conductor.core.models import StageState
+from conductor.core.orchestrator import classify_failure
 from runner.config import PhaseConfig, RunConfig
 
 FEATURE = "feat"
@@ -118,6 +122,35 @@ async def _run(cfg: RunConfig, feature_dir: Path, fake: FakeClaude, monkeypatch,
     return await phase_loop.run_phase_loop(cfg, feature_dir, **kwargs)
 
 
+# ─── Commit subjects ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, subject",
+    [
+        ("Add login", "Phase 2: Add login"),
+        ("Phase 2", "Phase 2"),  # the default name when run.sh has no PHASE_NAMES
+        ("phase 2: Add login", "phase 2: Add login"),
+        ("Phase 20", "Phase 2: Phase 20"),
+        ("  ", "Phase 2"),
+    ],
+)
+def test_commit_subject_does_not_repeat_the_phase_label(name, subject):
+    assert phase_loop._commit_subject(2, name) == subject
+
+
+async def test_unnamed_phase_commits_once_labelled(project, monkeypatch):
+    """A live run committed "Phase 1: Phase 1"."""
+    repo, feature_dir = project
+    cfg = _config(repo, feature_dir, phases=1)
+    cfg.phases[0].name = "Phase 1"
+    fake = FakeClaude(repo, [write_code_and_finish])
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+
+    assert _commits(repo) == ["Phase 1", "init"]
+
+
 # ─── Bookkeeping stays out of commits (F53) ─────────────────────────────────
 
 
@@ -169,6 +202,27 @@ def write_fix(repo: Path, phase: int) -> str:
     (repo / "app.py").write_text("BROKEN = False\n")
     (repo / "fixed.txt").write_text("ok\n")
     return f"fixed <promise>P{phase}_DONE</promise>"
+
+
+async def test_runner_gates_with_the_preset_file_the_orchestrator_resolved(project, tmp_path, monkeypatch):
+    """By name the worktree resolves its committed copy of the project preset,
+    not the edited one in the main checkout that RUN-CONFIG's settings came from."""
+    repo, feature_dir = project
+    (repo / ".conductor").mkdir()
+    (repo / ".conductor" / "preset.toml").write_text(
+        'name = "proj"\n\n[[quality_gate.checks]]\nname = "removed-check"\ncommand = "false"\n'
+    )
+    _git(repo, "add", ".conductor")
+    _git(repo, "commit", "-q", "-m", "committed preset")
+    edited = tmp_path / "main-checkout" / ".conductor" / "preset.toml"
+    edited.parent.mkdir(parents=True)
+    edited.write_text('name = "proj"\n\n[[quality_gate.checks]]\nname = "unit"\ncommand = "true"\n')
+    fake = FakeClaude(repo, [write_code_and_finish])
+
+    cfg = _config(repo, feature_dir, phases=1, preset="proj", preset_path=str(edited))
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+
+    assert _commits(repo)[0] == "Phase 1: Step 1"
 
 
 async def test_failing_gate_blocks_commit_and_fails_phase(project, tmp_path, monkeypatch):
@@ -347,3 +401,108 @@ async def test_unloadable_preset_writes_exit_code(project, monkeypatch):
 
     assert fake.calls == []
     assert (feature_dir / "exit_code").read_text() == "1"
+
+
+
+# ─── Why the run failed, for the orchestrator (FAILURE.json) ────────────────
+
+# Typical deterministic test output: a test's own timeout and an HTTP 500.
+GATE_TEST_OUTPUT = (
+    "FAIL src/api.test.ts > GET /users\n"
+    "Error: Test timed out in 5000ms.\n"
+    "If this is a long-running test, pass a timeout value as the last argument\n"
+    'AssertionError: expected 200, got 500 "Internal Server Error" (HTTP 500)\n'
+)
+
+
+def _failure(feature_dir: Path) -> dict:
+    return json.loads((feature_dir / phase_loop.FAILURE_FILE).read_text())
+
+
+def _classify(repo: Path, started_at: datetime, pane: str, tmp_path: Path) -> str:
+    """classify_failure on this runner exit, with *pane* as the wrapper's fail log."""
+    fail_log = tmp_path / "conductor-fail-feat.log"
+    fail_log.write_text("\n".join(pane.splitlines()[-50:]))  # the wrapper keeps 50 lines
+    stage = StageState(name="s", spec_mode="full", worktree=str(repo), started_at=started_at)
+    return classify_failure(FEATURE, 1, stage, [fail_log])
+
+
+async def test_gate_failure_mentioning_timeouts_and_http_500_is_diagnosed(
+    project, tmp_path, monkeypatch, capsys
+):
+    """The gate output in the pane read as an API outage: 8 hours of backoff, no diagnosis."""
+    repo, feature_dir = project
+    output = tmp_path / "vitest.txt"
+    output.write_text(GATE_TEST_OUTPUT)
+    cfg = _config(repo, feature_dir, phases=1, preset=_gate_preset(tmp_path, f"sh -c 'cat {output}; exit 1'"))
+    fake = FakeClaude(repo, [write_code_and_finish, write_code_and_finish])
+    started_at = datetime.now(UTC)
+
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 1
+
+    assert _failure(feature_dir) == {"reason": "quality_gate", "phase": 1, "detail": "unit: exit 1"}
+    pane = capsys.readouterr().err
+    assert "Test timed out in 5000ms" in pane
+    assert _classify(repo, started_at, pane, tmp_path) == "logic"
+    # Without the runner's record the pane text alone is no API error either.
+    (feature_dir / phase_loop.FAILURE_FILE).unlink()
+    assert _classify(repo, started_at, pane, tmp_path) == "logic"
+
+
+@pytest.mark.parametrize(
+    "error_text, kind",
+    [
+        ('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', "transient"),
+        ("There's an issue with the selected model (claude-nope). It may not exist.", "logic"),
+    ],
+)
+async def test_claude_errors_are_reported_as_such(project, tmp_path, monkeypatch, error_text, kind):
+    repo, feature_dir = project
+
+    async def failing_claude(prompt, model, max_turns, cwd, activity_log, **_kw):
+        return "", "", {"type": "result", "subtype": "success", "is_error": True, "result": error_text}
+
+    monkeypatch.setattr(phase_loop, "_run_steerable_iteration", failing_claude)
+    started_at = datetime.now(UTC)
+
+    assert await phase_loop.run_phase_loop(_config(repo, feature_dir, phases=1), feature_dir) == 1
+
+    failure = _failure(feature_dir)
+    assert (failure["reason"], failure["detail"]) == ("claude_error", error_text)
+    assert _classify(repo, started_at, "", tmp_path) == kind
+
+
+async def test_failure_record_of_a_previous_run_is_removed_and_never_committed(project, monkeypatch):
+    repo, feature_dir = project
+    (feature_dir / phase_loop.FAILURE_FILE).write_text('{"reason": "quality_gate"}')
+    fake = FakeClaude(repo, [write_code_and_finish])
+
+    assert await _run(_config(repo, feature_dir, phases=1), feature_dir, fake, monkeypatch) == 0
+
+    assert not (feature_dir / phase_loop.FAILURE_FILE).exists()
+    owned = phase_loop._runner_owned_paths(repo, feature_dir, FEATURE)
+    assert f"docs/{FEATURE}/{phase_loop.FAILURE_FILE}" in owned
+
+
+
+# ─── STATS.json (plain, non-steerable sessions) ─────────────────────────────
+
+
+async def test_plain_session_records_the_reported_cost_of_the_whole_session(project, monkeypatch):
+    """The last result's usage covers one trailing turn; its price was ~6% of the cost."""
+    from conductor.core.claude import ClaudeResult
+
+    repo, feature_dir = project
+    transcript = (Path(__file__).parent / "fixtures" / "stream_json" / "background_task.jsonl").read_text()
+
+    async def run_claude(prompt, **_kw):
+        return ClaudeResult(exit_code=0, output=transcript, tokens_used=None, cost=None, duration=1.0)
+
+    monkeypatch.setattr("conductor.core.claude.run_claude", run_claude)
+    cfg = _config(repo, feature_dir, phases=1, steerable=False, max_iterations=1, model="claude-haiku-5-5")
+
+    assert await phase_loop.run_phase_loop(cfg, feature_dir) == 1  # the transcript has no P1_DONE
+
+    (entry,) = json.loads((feature_dir / "STATS.json").read_text())
+    assert entry["cost_usd"] == round(0.007896185, 6)
+    assert entry["tokens"] == {"input": 10, "output": 501, "cache_read": 74516, "cache_write": 42514}

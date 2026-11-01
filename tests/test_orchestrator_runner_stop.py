@@ -110,6 +110,19 @@ async def test_runner_exit_code_file_counts_only_when_written_by_this_attempt(tm
     assert orch._runner_outcome(state, 0, 0, storage) == 0
 
 
+def test_exit_file_counts_only_when_written_by_this_attempt(tmp_path):
+    state, storage, _ = _env(tmp_path)
+    exit_file = _exit_file(storage)
+    exit_file.write_text("0")
+    stale = state.runs[0].stages[0].started_at.timestamp() - 60
+    os.utime(exit_file, (stale, stale))
+
+    assert orch._runner_outcome(state, 0, 0, storage) is None
+
+    exit_file.write_text("0")
+    assert orch._runner_outcome(state, 0, 0, storage) == 0
+
+
 # ---------------------------------------------------------------------------
 # BLOCKED stages
 # ---------------------------------------------------------------------------
@@ -182,6 +195,32 @@ async def test_auto_resume_keeps_a_successful_exit_after_the_block(tmp_path):
     assert state.runs[0].stages[0].status == StageStatus.DONE
     assert state.runs[0].status == RunStatus.PENDING  # activated within max_parallel
     assert exit_file.read_text() == "0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via", ["advance_run", "auto_resume"])
+async def test_exit_file_of_an_earlier_plan_does_not_finish_a_blocked_stage(tmp_path, via):
+    """cleanup + plan --force reused the run name; this plan's stage was blocked
+    before any runner started, and the old runner's '0' marked it DONE."""
+    state, storage, _ = _env(tmp_path, StageStatus.BLOCKED)
+    state.runs[0].status = RunStatus.BLOCKED
+    state.runs[0].stages[0].started_at = None
+    _exit_file(storage).write_text("0")
+
+    with (
+        patch.object(orch, "atomic_save"),
+        patch.object(orch, "restart_stage", new_callable=AsyncMock) as restart,
+    ):
+        if via == "advance_run":
+            await orch.advance_run(state, 0, _tmux(idle=True), storage, ConductorConfig())
+        else:
+            await orch._auto_resume_blocked_runs(state, storage, None, None, tmux=_tmux(idle=True))
+
+    assert state.runs[0].stages[0].status != StageStatus.DONE
+    if via == "advance_run":
+        assert state.runs[0].status == RunStatus.BLOCKED
+    else:
+        restart.assert_awaited_once()  # what a block without a runner result gets
 
 
 @pytest.mark.asyncio

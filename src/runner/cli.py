@@ -60,6 +60,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.steerable = True
     if args.preset:
         cfg.preset = args.preset
+        cfg.preset_path = None
     if args.model:
         cfg.model = args.model
     if args.no_fixer:

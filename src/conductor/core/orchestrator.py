@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,13 +27,19 @@ from conductor.core.models import ConductorState, RunState, StageState, atomic_s
 from conductor.core.presets import Preset, PresetConfig, load_preset
 from conductor.core.storage import StorageResolver
 
-# Resolve paths to our own speccer/runner wrappers (sibling to the conductor package root)
-# so we never accidentally invoke the old bash versions via PATH.
-_PACKAGE_ROOT = (
-    Path(__file__).resolve().parents[3]
-)  # src/conductor/core/orchestrator.py -> repo root
-_SPECCER_BIN = str(_PACKAGE_ROOT / "speccer")
-_RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
+
+def _module_cmd(module: str, *args: str) -> str:
+    """Bash command that runs ``python -m <module> <args>`` on conductor's own interpreter.
+
+    speccer and runner get the interpreter and installed package of this
+    conductor (a wheel, or the checkout's .venv behind the ./conductor
+    wrapper), not a path into the repo checkout, which a wheel install does
+    not have. -P keeps the cwd (the target project's worktree) off sys.path,
+    so a project's own `runner` or `speccer` module can't shadow ours. Every
+    argument is quoted: worktree paths may contain spaces.
+    """
+    return shlex.join([sys.executable, "-P", "-m", module, *args])
+
 
 # A runner pane whose process tree stays shallow (the runner is alive but
 # no Claude or gate process under it) is a zombie. When each window was first
@@ -286,8 +293,7 @@ def _runner_exit_file(storage: StorageResolver, project_name: str, fname: str) -
 
 
 def _runner_fail_log(storage: StorageResolver, project_name: str, fname: str) -> Path:
-    # TmuxManager.spawn_runner_in_window derives this name from the exit file
-    # (conductor-exit-<x> -> conductor-fail-<x>.log in the same directory).
+    """Where the runner window's wrapper saves the pane's last lines on a failure."""
     return _ipc_dir(storage, project_name) / f"conductor-fail-{fname}.log"
 
 
@@ -735,7 +741,6 @@ async def run_speccer_init(
     exit_file.unlink(missing_ok=True)
 
     args = [
-        _SPECCER_BIN,
         "init",
         "--feature",
         fname,
@@ -794,7 +799,7 @@ async def run_speccer_init(
                 else:
                     args += ["--spec-context", full_ctx]
 
-    cmd = f"cd {wt} && {' '.join(args)}"
+    cmd = _module_cmd("speccer", *args)
     _log(
         "SPECCER_INVOKE",
         f"speccer init {fname} (mode={mode}) [window: {window_name}]",
@@ -856,7 +861,7 @@ async def run_speccer_run(
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
-    cmd = f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt}"
+    cmd = _module_cmd("speccer", "run", "--feature", fname, "--project-dir", wt)
     _log(
         "SPECCER_INVOKE",
         f"speccer run {fname} [window: {window_name}]",
@@ -902,9 +907,7 @@ async def run_speccer_continue(
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
-    cmd = (
-        f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue"
-    )
+    cmd = _module_cmd("speccer", "run", "--feature", fname, "--project-dir", wt, "--continue")
     _log(
         "SPECCER_INVOKE",
         f"speccer run --continue {fname} [window: {window_name}]",
@@ -950,7 +953,7 @@ async def run_speccer_generate(
     exit_file = _speccer_exit_file(storage, state.project_name, f"{fname}-gen")
     exit_file.unlink(missing_ok=True)
 
-    cmd = f"cd {wt} && {_SPECCER_BIN} generate --feature {fname} --project-dir {wt}"
+    cmd = _module_cmd("speccer", "generate", "--feature", fname, "--project-dir", wt)
     _log(
         "SPECCER_INVOKE",
         f"speccer generate {fname} [window: {window_name}]",
@@ -1671,7 +1674,8 @@ async def start_runner(
 
     exit_file = _runner_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
-    _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
+    fail_log = _runner_fail_log(storage, state.project_name, fname)
+    fail_log.unlink(missing_ok=True)
     # A shallow streak of the previous runner in this window is not this one's.
     _shallow_since.pop(f"conductor-{state.project_name}:{window_name}", None)
 
@@ -1688,10 +1692,15 @@ async def start_runner(
             run_sh, fname, Path(wt), preset.config, quick=quick,
             is_final_stage=is_final_stage,
         )
-        # Also set the preset name so phase_loop can load it for quality gates
+        # Also set the preset so phase_loop can load it for quality gates:
+        # the very file the settings above came from. Resolving the name
+        # again in the worktree would find its committed copy of the
+        # project preset (or nothing, for a relative .toml path).
         import json  # noqa: PLC0415
         data = json.loads(config_path.read_text("utf-8"))
         data["preset"] = state.preset
+        source = getattr(preset, "source", None)
+        data["preset_path"] = str(Path(source).resolve()) if source else None
         config_path.write_text(json.dumps(data, indent=2), "utf-8")
     except Exception as exc:
         _log(
@@ -1704,11 +1713,13 @@ async def start_runner(
         return
 
     storage_dir = str(docs_dir)
-    cmd = f"cd {wt} && {_RUNNER_BIN} run --feature {fname} --storage-dir {storage_dir}"
+    cmd = _module_cmd("runner", "run", "--feature", fname, "--storage-dir", storage_dir)
     log_file = storage.tmux_log(state.project_name, f"runner_{fname}")
-    await tmux.spawn_runner_in_window(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
-
+    # Before the spawn: an exit file only counts when written after this.
     stage.started_at = datetime.now(timezone.utc)
+    await tmux.spawn_runner_in_window(
+        window_name, cmd, exit_file=exit_file, fail_log=fail_log, cwd=wt, log_file=log_file
+    )
 
     _log(
         "RUNNER_START",
@@ -1966,6 +1977,16 @@ def _runner_window(run_idx: int, stage: StageState) -> str:
     return f"run{run_idx}:{stage.name}-exec"
 
 
+def _written_since_start(path: Path, stage: StageState) -> bool:
+    """Whether *path* exists and was written after the stage's runner last started."""
+    if stage.started_at is None:
+        return False
+    try:
+        return path.stat().st_mtime > stage.started_at.timestamp()
+    except OSError:
+        return False
+
+
 def _runner_outcome(
     state: ConductorState, run_idx: int, stage_idx: int, storage: StorageResolver
 ) -> int | None:
@@ -1973,22 +1994,21 @@ def _runner_outcome(
 
     The wrapper's exit file is the primary record. The runner also writes
     docs/<feature>/exit_code itself, which survives the exit file being
-    removed; it is never cleared between attempts, so it only counts when
-    written after this attempt started.
+    removed. Either counts only when written after this attempt started:
+    the durable file is never cleared between attempts, and the exit file
+    is keyed by run and stage name only, so one left by an earlier plan
+    that reused the name must not finish a stage whose runner never ran.
     """
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
     exit_file = _runner_exit_file(storage, state.project_name, fname)
-    if exit_file.exists():
+    if _written_since_start(exit_file, stage):
         return _read_exit_code(exit_file)
-    if not stage.worktree or stage.started_at is None:
+    if not stage.worktree:
         return None
     durable = Path(stage.worktree) / "docs" / fname / "exit_code"
-    try:
-        if durable.stat().st_mtime <= stage.started_at.timestamp():
-            return None
-    except OSError:
+    if not _written_since_start(durable, stage):
         return None
     return _read_exit_code(durable)
 
@@ -2232,24 +2252,52 @@ async def monitor_runner(
 # ---------------------------------------------------------------------------
 
 
+# What the Claude CLI says when the API call itself failed or the account hit
+# its usage limit ("API Error: 529 {...overloaded_error...}"). Nothing a test,
+# build or lint run prints on its own: no bare "timeout", "500" or "internal
+# server error", which gate output is full of.
 _TRANSIENT_PATTERNS = re.compile(
-    r"api_error|overloaded_error|internal server error|server_error|rate_limit"
-    r"|529|500\s*error|capacity|connection error|timeout|econnreset"
-    r"|APIStatusError|APIConnectionError|APITimeoutError",
+    r"\bAPI Error: (?:5\d\d|429)\b|\bAPI Error: (?:Connection error|Request timed out)"
+    r"|\b(?:overloaded_error|rate_limit_error)\b"
+    r"|\busage limit reached|\b(?:5-hour|session|weekly) limit reached|\bhit your limit",
     re.IGNORECASE,
 )
+# The runner prints raw gate output after this line when it gives up on a
+# phase (runner.phase_loop); none of what follows is Claude's.
+_GATE_OUTPUT_MARKER = "Last failures:"
+# Why the runner failed, in its own words (runner.phase_loop.FAILURE_FILE).
+_RUNNER_FAILURE_FILE = "FAILURE.json"
 
 
 def _is_transient_api_error(paths_to_check: list[Path]) -> bool:
-    """Check fail logs for transient API error patterns."""
+    """Check fail logs for a Claude API error, ignoring the runner's gate output."""
     for p in paths_to_check:
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if _TRANSIENT_PATTERNS.search(text):
+        if _TRANSIENT_PATTERNS.search(text.partition(_GATE_OUTPUT_MARKER)[0]):
             return True
     return False
+
+
+def _runner_failure_reason(stage: StageState, fname: str) -> dict | None:
+    """Why the stage's current runner failed, as it recorded it; None if it did not.
+
+    Only a record written during this attempt counts (like the exit files).
+    """
+    import json as _json
+
+    if not stage.worktree:
+        return None
+    path = Path(stage.worktree) / "docs" / fname / _RUNNER_FAILURE_FILE
+    if not _written_since_start(path, stage):
+        return None
+    try:
+        reason = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return reason if isinstance(reason, dict) else None
 
 
 def classify_failure(
@@ -2261,7 +2309,10 @@ def classify_failure(
     """Classify failure as 'infra', 'transient', or 'logic'.
 
     - Exit 137/143 (signal kills) → infra
-    - Exit 1 + transient API error patterns in fail log → transient
+    - Exit 1 the runner explains in FAILURE.json: a failure of the work (gate,
+      commit hook, local checks, iteration limit, ...) → logic; a Claude error
+      → transient if it is an API error or usage limit (_TRANSIENT_PATTERNS)
+    - Exit 1 otherwise → transient if the fail log shows such an error
     - Everything else → logic, which gets a diagnosis
 
     A recently written activity.log says nothing about the cause: the runner
@@ -2270,7 +2321,15 @@ def classify_failure(
     """
     if exit_code in (137, 143):
         return "infra"
-    if exit_code == 1 and _is_transient_api_error(fail_logs or []):
+    if exit_code != 1:
+        return "logic"
+    reason = _runner_failure_reason(stage, fname)
+    if reason is not None:
+        if reason.get("reason") != "claude_error":
+            return "logic"
+        if _TRANSIENT_PATTERNS.search(str(reason.get("detail", ""))):
+            return "transient"
+    if _is_transient_api_error(fail_logs or []):
         return "transient"
     return "logic"
 
@@ -2785,7 +2844,8 @@ def _questions_waiting_message(
     fname = run.name + stage.feature_suffix
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
-    continue_cmd = f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue`"
+    continue_cmd = shlex.join(["speccer", "run", "--feature", fname, "--project-dir", wt, "--continue"])
+    continue_cmd = f"`{continue_cmd}`"
     try:
         still_open = _open_questions(questions.read_text(encoding="utf-8"))
     except OSError:

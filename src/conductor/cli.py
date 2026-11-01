@@ -352,6 +352,11 @@ def _resolve_preset(name: str | None, repo_path: Path) -> str:
             name = detect_preset(repo_path)
             if name != "base":
                 print(f"Auto-detected preset: {name}", file=sys.stderr)
+        explicit = Path(name).expanduser()
+        if explicit.suffix == ".toml" and explicit.is_file():
+            # Saved in the state and loaded later from other directories
+            # (the tmux re-exec, stage worktrees): relative to here only.
+            name = str(explicit.resolve())
         load_preset(name, repo_path)
     except ValueError as exc:
         print(f"Error: {exc}")

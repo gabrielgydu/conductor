@@ -155,6 +155,24 @@ async def test_run_claude_reports_cli_cost_and_result():
 
 
 @pytest.mark.asyncio
+async def test_run_claude_counts_every_turn_of_a_session():
+    """A background task's notification adds a result event; the last one's
+    usage and num_turns cover only that trailing turn."""
+    proc = make_mock_proc(stdout_bytes=load_stream_json("background_task"))
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+        result = await run_claude("hi", on_event=None)
+    assert result.cost == 0.007896185
+    assert result.tokens_used == {
+        "input_tokens": 10,
+        "output_tokens": 501,
+        "cache_read_input_tokens": 74516,
+        "cache_creation_input_tokens": 42514,
+    }
+    assert result.num_turns == 3
+    assert result.result_text == "FINAL <promise>SPEC_NEEDS_INPUT</promise>"
+
+
+@pytest.mark.asyncio
 async def test_run_claude_max_turns_is_an_error_result():
     proc = make_mock_proc(stdout_bytes=load_stream_json("error_max_turns"), returncode=1)
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):

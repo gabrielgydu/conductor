@@ -8,12 +8,14 @@ For each phase:
   5. Gate or commit hook fails: feed the errors back, retry (capped at
      max_gate_retries)
   6. After all phases: write LEARNINGS.md summary, STATS.json, exit_code
+     (and FAILURE.json, why the run failed, when it did)
 """
 from __future__ import annotations
 
 import asyncio
 import datetime
 import json
+import re
 import time
 import traceback
 from pathlib import Path
@@ -24,6 +26,9 @@ from conductor.core.stats import (
     StatsEntry,
     TokenStats,
     extract_stats,
+    extract_reported_cost,
+    find_result_event,
+    result_token_stats,
     calculate_cost,
     get_pricing,
     record_stats,
@@ -31,6 +36,7 @@ from conductor.core.stats import (
     format_duration,
     format_tokens,
 )
+from conductor.core.stream_filter import describe_result
 
 from runner.activity import parse_stream_json_text, append_event_to_activity_log
 from runner.config import RunConfig, PhaseConfig
@@ -61,6 +67,10 @@ _PHASE_PAUSE_S = 3.0
 # A restart without --start-phase resumes after them (see _completed_phases).
 PHASES_DONE_FILE = "PHASES-DONE.jsonl"
 
+# Why the run failed, for the orchestrator (see _write_failure). Removed when
+# a run starts; written before exit_code when the runner gives up.
+FAILURE_FILE = "FAILURE.json"
+
 # Run state the runner writes into its feature dir. The orchestrator places
 # that dir inside the worktree (docs/<feature>/), so these are unstaged before
 # every commit: they describe the run, they are not part of the feature.
@@ -68,6 +78,7 @@ _RUNNER_FILES = (
     "activity.log",
     "STATS.json",
     "exit_code",
+    FAILURE_FILE,
     "RUN-CONFIG.json",
     PHASES_DONE_FILE,
     "logs",  # also holds the .pre-untracked-phase-N snapshots
@@ -201,6 +212,48 @@ def _resolve_model(cfg: RunConfig, phase: PhaseConfig) -> str | None:
 def _write_exit_code(feature_dir: Path, code: int) -> None:
     feature_dir.mkdir(parents=True, exist_ok=True)
     (feature_dir / "exit_code").write_text(str(code), "utf-8")
+
+
+def _write_failure(feature_dir: Path, reason: str, phase: int | None, detail: str = "") -> None:
+    """Record why the run is failing in FAILURE_FILE, so the orchestrator need not guess.
+
+    "claude_error" means Claude itself failed (API error, usage limit,
+    login, launch); the orchestrator checks *detail* for a transient cause.
+    Every other reason ("quality_gate", "commit_hook", "local_checks",
+    "max_iterations", "crash", "preset", "preflight") is a failure of the
+    work, which it diagnoses. Gate output can mention timeouts and HTTP 500s,
+    so the pane text alone cannot tell the two apart.
+    """
+    tmp = feature_dir / "logs" / f"{FAILURE_FILE}.tmp"  # logs/ is never committed
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps({"reason": reason, "phase": phase, "detail": detail[-2000:]}), "utf-8")
+    tmp.replace(feature_dir / FAILURE_FILE)
+
+
+def _commit_subject(phase_num: int, phase_name: str) -> str:
+    """The subject of a phase's commit: "Phase 2: Add login".
+
+    A name that already starts with its label ("Phase 2", the default when
+    run.sh names no phases, or "Phase 2: Add login") is used as it is.
+    """
+    name = phase_name.strip()
+    if not name:
+        return f"Phase {phase_num}"
+    if re.match(rf"phase\s*{phase_num}\b", name, re.IGNORECASE):
+        return name
+    return f"Phase {phase_num}: {name}"
+
+
+def _session_error(result_event: dict | None) -> str:
+    """The error a Claude session ended on, or "" if it did not fail.
+
+    error_max_turns is not one: that session did real work and ran out of turns.
+    """
+    if not result_event or not result_event.get("is_error"):
+        return ""
+    if result_event.get("subtype") == "error_max_turns":
+        return ""
+    return describe_result(result_event)[2] or "Claude reported an error"
 
 
 def _write_learnings_summary(
@@ -351,6 +404,7 @@ async def _run_phase(
     commit_retries = 0
     fix_context = ""
     fix_label = ""
+    claude_error = ""  # how the last Claude session failed, if it did
 
     # Snapshot pre-existing untracked files so we don't commit them
     pre_untracked = git_snapshot_untracked(project_dir, untracked_snapshot)
@@ -392,28 +446,27 @@ async def _run_phase(
                 raw_output, assistant_text = await _run_plain_iteration(
                     prompt, model, max_turns, cwd_str, activity_log
                 )
+                result_event = find_result_event(raw_output)
         except Exception as exc:
             error(f"Claude invocation failed: {exc}")
+            claude_error = f"Claude invocation failed: {exc}"
             # Don't give up — log and retry on next iteration
             fix_context = ""
             continue
+        claude_error = _session_error(result_event)
 
         iter_duration = time.monotonic() - iter_start
 
         # ── Record stats ───────────────────────────────────────────────────
         if cfg.steerable and result_event:
-            usage = result_event.get("usage", {})
-            tokens = TokenStats(
-                input=usage.get("input_tokens", 0),
-                output=usage.get("output_tokens", 0),
-                cache_read=usage.get("cache_read_input_tokens", 0),
-                cache_write=usage.get("cache_creation_input_tokens", 0),
-            )
+            tokens = result_token_stats(result_event)
             cost = result_event.get("total_cost_usd", 0.0)
         else:
             tokens = extract_stats(raw_output) if not cfg.steerable else TokenStats()
-            pricing = get_pricing(model or "")
-            cost = calculate_cost(tokens, pricing)
+            # The CLI's own figure; list prices only when it reported none.
+            cost = extract_reported_cost(raw_output) if not cfg.steerable else None
+            if cost is None:
+                cost = calculate_cost(tokens, get_pricing(model or ""))
 
         entry = StatsEntry(
             type="phase",
@@ -468,6 +521,7 @@ async def _run_phase(
                 error(f"PHASE {phase_num} — quality gate failed {cfg.max_gate_retries} times, giving up")
                 error("Last failures:")
                 error("\n".join(gate.failures or [gate.message])[-2000:])
+                _write_failure(feature_dir, "quality_gate", phase_num, summary)
                 return False, False
             fix_context = _gate_fix_context(gate)
             fix_label = f"quality gate fix {gate_retries}/{cfg.max_gate_retries}"
@@ -476,7 +530,7 @@ async def _run_phase(
         success("Quality gate passed")
 
         # ── Commit ─────────────────────────────────────────────────────
-        commit_msg = f"Phase {phase_num}: {phase_name}"
+        commit_msg = _commit_subject(phase_num, phase_name)
         commit_ok, commit_output = git_commit(project_dir, commit_msg)
 
         if not commit_ok:
@@ -485,6 +539,7 @@ async def _run_phase(
             error(f"Commit rejected (pre-commit hook): {commit_output.strip()}")
             if commit_retries >= cfg.max_gate_retries:
                 error(f"PHASE {phase_num} — commit failed {cfg.max_gate_retries} times, giving up")
+                _write_failure(feature_dir, "commit_hook", phase_num, commit_output.strip())
                 return False, False
             fix_context = (
                 f"=== COMMIT REJECTED ===\n{commit_output}\n\n"
@@ -519,6 +574,7 @@ async def _run_phase(
             )
             if not checks_ok:
                 error(f"PHASE {phase_num} FAILED — local checks failed")
+                _write_failure(feature_dir, "local_checks", phase_num)
                 return False, phase_committed
 
         phase_complete = True
@@ -526,6 +582,10 @@ async def _run_phase(
 
     if not phase_complete:
         error(f"PHASE {phase_num} FAILED — max iterations ({cfg.max_iterations}) reached")
+        if claude_error:
+            _write_failure(feature_dir, "claude_error", phase_num, claude_error)
+        else:
+            _write_failure(feature_dir, "max_iterations", phase_num)
         return False, False
 
     phase_duration = time.monotonic() - phase_start
@@ -554,6 +614,7 @@ async def run_phase_loop(
     project_dir = Path(cfg.project_dir)
     log_dir = feature_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    (feature_dir / FAILURE_FILE).unlink(missing_ok=True)  # a previous run's
 
     # Stats file lives in the feature dir
     stats_path = feature_dir / "STATS.json"
@@ -564,20 +625,23 @@ async def run_phase_loop(
     header(f"{cfg.feature_name.upper()} — Runner")
     log(f"Working directory: {project_dir}")
     log(f"Phases: {len(cfg.phases)}")
-    log(f"Preset: {cfg.preset or 'base'}")
+    log(f"Preset: {cfg.preset or 'base'}" + (f" ({cfg.preset_path})" if cfg.preset_path else ""))
     log(f"Steerable: {'yes' if cfg.steerable else 'no'}")
     if cfg.model:
         log(f"Model: {cfg.model}")
 
     # Preflight check
+    preset_ref = cfg.preset_path or cfg.preset
     try:
-        preset = load_preset(cfg.preset, project_dir)
+        preset = load_preset(preset_ref, project_dir)
     except (ValueError, OSError) as exc:
-        error(f"Cannot load preset {cfg.preset or 'base'!r}: {exc}")
+        error(f"Cannot load preset {preset_ref or 'base'!r}: {exc}")
+        _write_failure(feature_dir, "preset", None, str(exc))
         _write_exit_code(feature_dir, 1)
         return 1
     if not preset.preflight(project_dir):
         error("Preflight check failed — aborting")
+        _write_failure(feature_dir, "preflight", None)
         _write_exit_code(feature_dir, 1)
         return 1
 
@@ -629,6 +693,7 @@ async def run_phase_loop(
             # dying here, so teardown, the summary and exit_code still happen.
             error(f"PHASE {phase.number} CRASHED — {type(exc).__name__}: {exc}")
             log(dim(traceback.format_exc().rstrip()))
+            _write_failure(feature_dir, "crash", phase.number, f"{type(exc).__name__}: {exc}")
             phase_ok, phase_committed = False, False
         phase_duration = time.monotonic() - phase_start
         if phase_committed:
@@ -683,6 +748,7 @@ async def run_phase_loop(
             log(dim(traceback.format_exc().rstrip()))
             checks_ok = False
         if not checks_ok:
+            _write_failure(feature_dir, "local_checks", None)
             exit_code = 1
 
     # ── Teardown ───────────────────────────────────────────────────────────

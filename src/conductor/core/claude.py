@@ -12,7 +12,12 @@ from typing import AsyncIterator, Callable
 
 # Re-exported: callers resolve aliases through conductor.core.claude.
 from conductor.core.model_catalog import resolve_model as resolve_model  # noqa: PLC0414
-from conductor.core.stats import find_result_event, result_cost_usd, result_token_stats
+from conductor.core.stats import (
+    result_cost_usd,
+    result_events,
+    session_num_turns,
+    session_token_stats,
+)
 
 # Sentinel: when on_event is _USE_DEFAULT, use the built-in progress printer.
 _USE_DEFAULT = object()
@@ -183,6 +188,9 @@ class ClaudeResult:
     stderr: str = ""
     # True when run_claude's timeout_s expired and the CLI was stopped.
     timed_out: bool = False
+    # Turns over the whole session (each result event counts only its own);
+    # None if no result event reported any.
+    num_turns: int | None = None
 
     @property
     def is_error(self) -> bool:
@@ -204,10 +212,6 @@ class ClaudeResult:
         return self.result_event.get("subtype") if self.result_event else None
 
     @property
-    def num_turns(self) -> int | None:
-        return self.result_event.get("num_turns") if self.result_event else None
-
-    @property
     def result_text(self) -> str | None:
         """The session's final text; for an error result, the CLI's error message."""
         text = self.result_event.get("result") if self.result_event else None
@@ -220,11 +224,11 @@ class ClaudeResult:
         return usage if isinstance(usage, dict) else {}
 
 
-def _tokens_used(result_event: dict | None) -> dict[str, int] | None:
-    """ClaudeResult.tokens_used from a result event; None if it carries no usage."""
-    if not result_event or not isinstance(result_event.get("usage"), dict):
+def _tokens_used(results: list[dict]) -> dict[str, int] | None:
+    """ClaudeResult.tokens_used: the session's totals; None if no result reports usage."""
+    if not any(isinstance(e.get("usage"), dict) or e.get("modelUsage") for e in results):
         return None
-    tokens = result_token_stats(result_event)
+    tokens = session_token_stats(results)
     return {
         "input_tokens": tokens.input,
         "output_tokens": tokens.output,
@@ -398,17 +402,19 @@ async def run_claude(
     duration = time.monotonic() - start
 
     stdout_text = "".join(lines)
-    result_event = find_result_event(stdout_text)
+    results = result_events(stdout_text)
+    result_event = results[-1] if results else None
 
     return ClaudeResult(
         exit_code=proc.returncode or 0,
         output=stdout_text,
-        tokens_used=_tokens_used(result_event),
-        cost=result_cost_usd(result_event),
+        tokens_used=_tokens_used(results),
+        cost=result_cost_usd(result_event),  # cumulative: the last result's is the session's
         duration=duration,
         result_event=result_event,
         stderr=stderr_tail.decode("utf-8", errors="replace"),
         timed_out=timed_out,
+        num_turns=session_num_turns(results),
     )
 
 

@@ -45,6 +45,12 @@ class RunConfig:
     # Preset name (base, or a preset file name — see conductor.core.presets)
     preset: Optional[str] = None
 
+    # Absolute path of the file the orchestrator resolved `preset` to. Loaded
+    # instead of resolving the name again from the worktree, where it can
+    # find a different file (the committed copy of the project preset) or
+    # none (a relative .toml path).
+    preset_path: str | None = None
+
     # Fixer enabled?
     fixer_enabled: bool = False
 
@@ -94,6 +100,7 @@ class RunConfig:
             phases=phases,
             model=data.get("model"),
             preset=data.get("preset"),
+            preset_path=data.get("preset_path"),
             fixer_enabled=data.get("fixer_enabled", False),
             max_iterations=data.get("max_iterations", 10),
             max_gate_retries=data.get("max_gate_retries", 3),
@@ -116,6 +123,7 @@ class RunConfig:
             "project_dir": self.project_dir,
             "model": self.model,
             "preset": self.preset,
+            "preset_path": self.preset_path,
             "fixer_enabled": self.fixer_enabled,
             "max_iterations": self.max_iterations,
             "max_gate_retries": self.max_gate_retries,
