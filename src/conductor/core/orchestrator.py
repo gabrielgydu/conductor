@@ -676,11 +676,22 @@ def _release_stale_worktrees(
 
 
 class DependencyMergeError(RuntimeError):
-    """A run's dependency branches could not be merged into its first worktree."""
+    """A run's dependency branches could not be merged into its first worktree.
+
+    The message says what to do about it.
+    """
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
+def _stage_ref(project_dir: Path, stage: StageState) -> str | None:
+    """A ref with *stage*'s work (StageState.work_refs); None if it is gone."""
+    for ref, name in stage.work_refs():
+        if _git(project_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode == 0:
+            return name
+    return None
 
 
 def _merge_dependencies(wt: Path, branch: str, dep_branches: list[str]) -> list[str]:
@@ -713,10 +724,13 @@ def _merge_dependencies(wt: Path, branch: str, dep_branches: list[str]) -> list[
                 _git(wt, "merge", "--abort")
             if conflicts:
                 raise DependencyMergeError(
-                    f"dependency {dep} conflicts with {branch} in: {', '.join(conflicts)}"
+                    f"dependency {dep} conflicts with {branch} in: {', '.join(conflicts)}. "
+                    f"Commit the merge in {wt} by hand; the stage resumes from there "
+                    "on restart."
                 )
             raise DependencyMergeError(
-                f"git merge {dep} failed in {wt}: {(r.stderr or r.stdout).strip()[-500:]}"
+                f"git merge {dep} failed in {wt}: {(r.stderr or r.stdout).strip()[-500:]}. "
+                "Fix that and re-run conductor; the merge is redone on restart."
             )
         merged.append(dep)
     return merged
@@ -774,16 +788,27 @@ def create_worktree(
 
     # Determine base ref. The first stage of a run with dependencies starts
     # from the last one and merges the others in (below), so it sees the
-    # work of every dependency, not just one.
+    # work of every dependency, not just one. A dependency whose work is
+    # nowhere blocks the stage rather than letting it start without it.
     dep_branches: list[str] = []
     if stage_idx == 0 and run.depends_on:
         run_by_index = {r.index: r for r in state.runs}
-        dep_branches = [
-            b for d in run.depends_on
-            if (b := run_by_index[d].stages[-1].branch if run_by_index[d].stages else None)
-        ]
+        for d in run.depends_on:
+            dep = run_by_index[d]
+            if not dep.stages:
+                continue
+            ref = _stage_ref(project_dir, dep.stages[-1])
+            if ref is None:
+                recorded = dep.stages[-1].branch or "(none recorded)"
+                raise DependencyMergeError(
+                    f"dependency {dep.name}'s work is gone: branch {recorded} exists "
+                    "neither locally nor on origin, and no finished commit is recorded. "
+                    "Restore the branch, then re-run conductor."
+                )
+            dep_branches.append(ref)
     if stage_idx > 0:
-        base_ref = run.stages[stage_idx - 1].branch
+        previous = run.stages[stage_idx - 1]
+        base_ref = _stage_ref(project_dir, previous) or previous.branch
     elif dep_branches:
         base_ref = dep_branches[-1]
     else:
@@ -815,10 +840,18 @@ def create_worktree(
                 cwd=str(project_dir),
                 capture_output=True,
             ).returncode == 0
+            # Deleted locally by cleanup because it was pushed: go on from there.
+            pushed = not branch_exists and _git(
+                project_dir, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"
+            ).returncode == 0
 
             wt_candidate.parent.mkdir(parents=True, exist_ok=True)
             if branch_exists:
                 add_args = ["git", "worktree", "add", str(wt_candidate), branch]
+            elif pushed:
+                add_args = [
+                    "git", "worktree", "add", "-b", branch, str(wt_candidate), f"origin/{branch}",
+                ]
             else:
                 add_args = [
                     "git", "worktree", "add", "-b", branch, str(wt_candidate), base_ref,
@@ -3103,14 +3136,13 @@ async def advance_run(
                 state, run_idx, stage_idx, storage, log_path=log_path, audit_path=audit_path
             )
         except DependencyMergeError as exc:
-            # Retrying cannot resolve a conflict between dependencies; block
-            # until someone commits the merge in the worktree.
+            # Retrying cannot resolve a conflict between dependencies or bring
+            # back a lost dependency branch; block until someone acts.
             stage.last_error = str(exc)
             stage.status = StageStatus.BLOCKED
             _log(
                 "FAILURE",
-                f"Run {run.name} stage {stage.name}: {exc}. Commit the merge in "
-                f"{stage.worktree} by hand; the stage resumes from there on restart.",
+                f"Run {run.name} stage {stage.name}: {exc}",
                 log_path,
                 audit_path,
                 run=run_idx,

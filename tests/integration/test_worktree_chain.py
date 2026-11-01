@@ -450,3 +450,17 @@ def test_dependency_merge_skips_hooks_like_the_integration_merge(
 
     wt = Path(state.runs[2].stages[0].worktree)
     assert (wt / "a.txt").read_text() == "a" and (wt / "b.txt").read_text() == "b"
+
+
+def test_dependency_whose_branch_is_gone_is_found_by_its_recorded_tip(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    state = _diamond(tmp_git_repo, {"a.txt": "a"}, {"b.txt": "b"})
+    a = state.runs[0].stages[0]
+    a.head_sha = get_branch_tip_sha(tmp_git_repo, a.branch)
+    subprocess.run(["git", "branch", "-q", "-D", a.branch], cwd=tmp_git_repo, check=True)
+
+    create_worktree(state, 2, 0, tmp_git_repo, tmp_path / "worktrees")
+
+    wt = Path(state.runs[2].stages[0].worktree)
+    assert (wt / "a.txt").read_text() == "a" and (wt / "b.txt").read_text() == "b"

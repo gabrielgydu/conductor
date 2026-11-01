@@ -1162,6 +1162,7 @@ def _cmd_cleanup(args):
     stage_branches = {s.branch for r in state.runs for s in r.stages if s.branch}
     # Commits reachable from a remote, the base branch or the integration
     # branch survive deleting a stage branch; anything else would be lost.
+    # Conductor never deletes or rewrites the integration branch.
     safe_refs = [
         f"refs/heads/{b}"
         for b in (state.base_branch, state.integration.branch if state.integration else None)
@@ -1187,9 +1188,10 @@ def _cmd_cleanup(args):
                     failed.append(f"worktree {wt}: not a registered git worktree; left in place")
                 else:
                     stage.worktree = None  # already gone
+            # Branch names stay in state: integration and dependent runs find
+            # a deleted branch's commits on origin, or by stage.head_sha.
             if stage.branch:
                 if not branch_exists(stage.branch):
-                    stage.branch = None
                     continue
                 if not force:
                     r = git("rev-list", "--count", stage.branch, "--not", "--remotes", *safe_refs, "--")
@@ -1203,9 +1205,8 @@ def _cmd_cleanup(args):
                     failed.append(f"branch {stage.branch}: {r.stderr.strip()}")
                     continue
                 deleted.append(stage.branch)
-                stage.branch = None
 
-    # Forget what is gone, so status/run/go don't trust stale paths.
+    # Forget removed worktrees, so status/run/go don't trust stale paths.
     atomic_save(state, state_path)
 
     print(f"Removed {len(removed)} worktree(s), deleted {len(deleted)} branch(es).")
