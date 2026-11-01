@@ -138,7 +138,7 @@ Phase execution engine. Drives Claude through implementation phases with quality
 | Command | Description |
 |---------|-------------|
 | `runner run --feature <name> [--steerable] [--preset <name>]` | Execute phase loop |
-| `runner fixer --feature <name> --branch <branch> --pr <num>` | Fix PR review comments |
+| `runner fixer --feature <name> --branch <branch> --pr <num> --phase <n> [--project-dir <path>] [--base-branch <branch>]` | Fix PR review comments |
 
 **Phase Loop:**
 1. Build prompt from phase file
@@ -169,31 +169,24 @@ Post-run features for merging and testing across runs.
 
 ## Storage
 
-All metadata lives outside the target repo at `~/.conductor/projects/<project-key>/`:
+Project state lives outside the target repo at `~/.conductor/projects/<project-key>/conductor/<project-name>/`:
 
 ```
-~/.conductor/projects/<project-key>/
-├── conductor/
-│   └── <project-name>/
-│       ├── CONDUCTOR-STATE.json      # DAG state, run/stage status
-│       ├── conductor.lock            # Single-instance lock (run/go/plan/loop/manual-test/cleanup)
-│       ├── CONDUCTOR-LOG.md          # Human-readable event log
-│       ├── CONDUCTOR-AUDIT.jsonl     # Machine-readable audit trail
-│       ├── STATS.json                # Token usage and cost tracking
-│       ├── FEATURE-BRIEF.md          # Project description (user-written)
-│       └── brain-calls/              # Preserved brain call responses
-├── features/
-│   └── <feature-name>/
-│       ├── spec/                     # Speccer output (domains, progress)
-│       ├── prompts/                  # Per-phase prompt files
-│       ├── run.sh                    # Phase manifest (parsed, not executed)
-│       ├── activity.log              # Runner activity log (read by orchestrator)
-│       ├── steer_inbox/              # Steering message queue (.msg files)
-│       ├── LEARNINGS.md              # Phase learnings
-│       └── STATS.json               # Per-feature cost tracking
-└── logs/
-    └── <feature>-build/              # Build logs per phase
+~/.conductor/projects/<project-key>/conductor/<project-name>/
+├── CONDUCTOR-STATE.json      # DAG state, run/stage status
+├── conductor.lock            # Single-instance lock (run/go/plan/learnings/loop/manual-test/cleanup)
+├── CONDUCTOR-LOG.md          # Human-readable event log
+├── CONDUCTOR-AUDIT.jsonl     # Machine-readable audit trail
+├── STATS.json                # Token usage and cost tracking
+├── FEATURE-BRIEF.md          # Project description (user-written)
+├── brain-calls/              # Preserved brain call responses
+├── ipc/                      # Exit and fail files written by the tmux window wrappers
+└── logs/                     # tmux pane logs (orchestrator and runner windows)
 ```
+
+The per-feature files are not stored there.
+
+Each stage works in its own git worktree, and the speccer and runner keep their files in `<worktree>/docs/<feature>/`: `spec/`, `prompts/`, `run.sh`, `RUN-CONFIG.json`, `activity.log`, `steer_inbox/`, `LEARNINGS.md` and `STATS.json`.
 
 The project key is derived from the repo root path: `/srv/dev/repo` → `-srv-dev-repo`. Worktrees resolve to the main repo's key via `git rev-parse --git-common-dir`.
 
@@ -265,9 +258,9 @@ This is a Python rewrite of the original bash implementation. Key improvements:
 ## Development
 
 ```bash
-# Set up dev environment
-python -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+# Set up dev environment: the first call creates .venv and installs
+# conductor with the dev extras (see scripts/venv-run)
+./conductor --help
 
 # Run tests
 .venv/bin/python -m pytest
