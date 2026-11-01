@@ -484,6 +484,31 @@ async def test_existing_pr_for_the_branch_counts_as_created(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_branch_cleanup_deleted_locally_gets_its_pr_from_origin(monkeypatch, tmp_path):
+    # cleanup removed the pushed run branch locally: nothing to push, origin has it.
+    import subprocess
+
+    def git(cwd, *args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=cwd, check=True, capture_output=True)
+
+    git(tmp_path, "init", "-q", "--bare", "origin.git")
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+    git(repo, "remote", "add", "origin", str(tmp_path / "origin.git"))
+    git(repo, "push", "-q", "origin", "main:main", "main:refs/heads/b")
+    git(repo, "fetch", "-q", "origin")
+    calls = _fake_exec(monkeypatch, {"gh": [_Proc(0, out="https://github.com/o/r/pull/8\n")]})
+    storage = SimpleNamespace(repo_root=repo)
+
+    url = await orch._push_and_pr_for_branch("b", "main", "proj", _single_run(), storage)
+
+    assert url == "https://github.com/o/r/pull/8"
+    assert [c[0] for c in calls] == ["gh"]
+
+
+@pytest.mark.asyncio
 async def test_restart_regenerates_an_unusable_manifest(tmp_path):
     """run.sh whose phase prompt is missing: regenerate, don't rerun the runner."""
     state, wt = _make_state_with_worktree(tmp_path)

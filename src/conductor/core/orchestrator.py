@@ -132,17 +132,24 @@ async def _push_and_pr_for_branch(
     """
     project_dir = Path(storage.repo_root)
 
-    proc = await asyncio.create_subprocess_exec(
-        "git", "push", "-u", "origin", branch,
-        cwd=str(project_dir),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, push_err = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"git push -u origin {branch} failed: {push_err.decode(errors='replace').strip()[-500:]}"
+    def has_ref(ref: str) -> bool:
+        return _git(project_dir, "rev-parse", "--verify", "--quiet", ref).returncode == 0
+
+    # `conductor cleanup` deletes a pushed branch locally; origin's copy is
+    # then the one the PR is opened for.
+    if has_ref(f"refs/heads/{branch}") or not has_ref(f"refs/remotes/origin/{branch}"):
+        proc = await asyncio.create_subprocess_exec(
+            "git", "push", "-u", "origin", branch,
+            cwd=str(project_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        _, push_err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git push -u origin {branch} failed: "
+                f"{push_err.decode(errors='replace').strip()[-500:]}"
+            )
 
     # Create PR with retry
     if title is None:
