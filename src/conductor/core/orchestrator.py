@@ -1339,8 +1339,10 @@ MAX_AUTO_QUESTION_ROUNDS = 8
 
 _QUESTION_HEADING = re.compile(r"^#{2,4}[ \t]*Q(\d+)\b", re.MULTILINE | re.IGNORECASE)
 # An answer line labelled with its question, as in the block answer_questions
-# appends ("> ### Q2") or a person's "> Q2: ...".
-_ANSWER_LABEL = re.compile(r"^> [\s#*>_-]*Q(\d+)\b", re.IGNORECASE)
+# appends ("> ### Q2"), a person's "> Q2: ..." or a numbered "> 1. **Q1 (Scope):**".
+_ANSWER_LABEL = re.compile(r"^> [\s#*>_-]*(?:\d+[.)][\s#*_-]*)?Q(\d+)\b", re.IGNORECASE)
+# An answer line that starts with a list number ("> 1. Postgres", "> **2)** JWT").
+_ANSWER_NUMBER = re.compile(r"^> [\s*_]*(\d+)[.)]")
 
 
 def _questions_file(run: RunState, stage: StageState) -> Path | None:
@@ -1361,18 +1363,29 @@ def _open_questions(text: str) -> list[str] | None:
 
     An answer line belongs to the question whose section it is in (a
     person's answer, or speccer's own "> Self-answered ...") unless it is
-    labelled with another question's number. A question asked again further
-    down is open again. None when the file has no '### Qn' headings.
+    labelled with another question's number. A line that starts with a list
+    number answers that question, as in a block "> 1. ...", "> 2. ..."
+    below the last question, only while it is still open and not after the
+    section's own: a numbered list inside one answer stays with its section.
+    A question asked again further down is open again. None when the file
+    has no '### Qn' headings.
     """
     answered: dict[str, bool] = {}
     current: str | None = None
+    section: str | None = None
     for line in text.splitlines():
         if heading := _QUESTION_HEADING.match(line):
-            current = heading.group(1)
+            current = section = heading.group(1)
             answered[current] = False
         elif _is_answer(line):
             if label := _ANSWER_LABEL.match(line):
                 current = label.group(1)
+            elif (number := _ANSWER_NUMBER.match(line)) and (
+                answered.get(number.group(1)) is False
+                and section is not None
+                and int(number.group(1)) <= int(section)
+            ):
+                current = number.group(1)
             if current in answered:
                 answered[current] = True
     if not answered:
@@ -2881,20 +2894,20 @@ def _questions_waiting_message(
         return (
             f"Run {run.name} stage {stage.name}: speccer asked for input again but "
             f"left {questions} as the last `--continue` had it. See what it needs in "
-            f"{questions.parent}/HANDOFF.md, answer in QUESTIONS.md (lines starting "
-            "with '> ') and re-run conductor."
+            f"{questions.parent}/HANDOFF.md, answer in QUESTIONS.md "
+            f"{speccer_cli.ANSWER_HOW} and re-run conductor."
         )
     which = f"questions {_q_list(still_open)}" if still_open else "the questions"
     if overnight:
         return (
             f"Run {run.name} stage {stage.name}: still asking questions after "
             f"{stage.question_rounds} automatic answer rounds. Answer {which} in "
-            f"{questions} (lines starting with '> ') and re-run conductor, or run "
+            f"{questions} {speccer_cli.ANSWER_HOW} and re-run conductor, or run "
             f"{continue_cmd} and then re-run conductor."
         )
     return (
         f"Run {run.name} stage {stage.name}: answer {which} in {questions} "
-        "(lines starting with '> ') and re-run conductor, or re-run it without "
+        f"{speccer_cli.ANSWER_HOW} and re-run conductor, or re-run it without "
         "--no-overnight to have them answered automatically."
     )
 

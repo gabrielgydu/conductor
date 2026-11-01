@@ -712,6 +712,14 @@ Immutable principles that ALL specs and implementations must respect. The spec a
     print("")
 
 
+# Where a person writes answers in QUESTIONS.md, as the question template
+# lays it out. Conductor credits answers to questions the same way.
+ANSWER_HOW = (
+    "under each question's **Answer:** line, in lines starting with '> ' "
+    "(start a line with '> Q2:' to answer another question)"
+)
+
+
 def _prepare_continue(spec_dir: Path, iteration: int, cont: bool) -> None:
     """Check that a NEEDS_INPUT spec may continue, and archive its questions round.
 
@@ -729,7 +737,7 @@ def _prepare_continue(spec_dir: Path, iteration: int, cont: bool) -> None:
     has_answers = any(line.startswith("> ") for line in questions.splitlines())
     after_rejection = read_rejected_completions(spec_dir) > 0
     if continue_needs_answers(spec_dir) and not has_answers:
-        _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
+        _die(f"No answers found in QUESTIONS.md. Answer {ANSWER_HOW}.")
     if has_questions:
         archive_dir = spec_dir / "questions-archive"
         archive_dir.mkdir(exist_ok=True)
@@ -885,7 +893,7 @@ async def _cmd_run_async(
         _log("  1. Review and answer questions in:")
         _log(f"     {_CYAN}{spec_dir}/QUESTIONS.md{_RESET}")
         _log("")
-        _log(f"  2. Add your answers as lines starting with {_CYAN}> {_RESET}")
+        _log(f"  2. Answer {ANSWER_HOW}")
         _log("")
         _log("  3. Continue the spec loop:")
         _log(f"     {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")

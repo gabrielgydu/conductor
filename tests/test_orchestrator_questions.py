@@ -16,11 +16,18 @@ from conductor.core.claude import ClaudeResult
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState, RunState, StageState
 from conductor.core.orchestrator import ConductorConfig, advance_run
+from speccer import cli as speccer_cli
 
 QUESTIONS = (
     "## Round 1 Questions\n\n"
     "### Q1: Scope\n**Question:** Which endpoints?\n**Answer:**\n\n---\n\n"
     "### Q2: Auth\n**Question:** Which auth method?\n**Answer:**\n"
+)
+# Q1 and Q2 answered in place; "(Qn)" marks where a test puts an answer.
+THREE_QUESTIONS = (
+    "### Q1: Scope\n**Answer:**\n(Q1)\n> All endpoints.\n\n"
+    "### Q2: Auth\n**Answer:**\n> JWT.\n\n"
+    "### Q3: Writes\n**Answer:**\n(Q3)\n"
 )
 # speccer answered Q2 itself and left Q1 and Q3 open, as real rounds have.
 PARTLY_SELF_ANSWERED = (
@@ -187,10 +194,20 @@ async def test_failed_answer_call_backs_off_and_skips_continue(tmp_path, monkeyp
         # asked again after an earlier answer: open again
         ("### Q1: a\n> ### Q1\n> yes\n## Round 2\n### Q1: c\n**Answer:**\n", ["1"]),
         ("Which auth method should we use?\n", None),
+        # a person's numbered block below the last question
+        (QUESTIONS + "\n> 1. All of them.\n> 2. JWT.\n", []),
+        (QUESTIONS + "\n> **1.** All of them.\n> **2)** JWT.\n", []),
+        (QUESTIONS + "\n> 1. **Q1 (Scope):** All.\n> 2. **Q2 (Auth):** JWT.\n", []),
+        (QUESTIONS + "\n> 1. All of them.\n", ["2"]),
+        # a numbered list inside one answer stays with its question
+        (THREE_QUESTIONS.replace("(Q3)", "> 1. Validate input\n> 2. Save"), []),
+        (THREE_QUESTIONS.replace("(Q1)", "> 1. Validate input\n> 2. Save"), ["3"]),
     ],
     ids=[
         "unanswered", "self-answered", "placeholders", "answered-inline",
         "auto-answered", "auto-answer-partial", "asked-again", "no-headings",
+        "numbered-block", "numbered-bold", "numbered-labelled", "numbered-partial",
+        "list-in-last-answer", "list-in-first-answer",
     ],
 )
 def test_open_questions(text, still_open):
@@ -232,7 +249,9 @@ async def test_partly_self_answered_questions_wait_for_a_human(tmp_path, monkeyp
     tmux.spawn_runner_in_window.assert_not_awaited()
     run = state.runs[0]
     assert orch._waiting_reason(state, run, False, datetime.now(timezone.utc)) == "human"
-    assert "answer questions Q1, Q3 in" in orch._questions_waiting_message(state, run, False)
+    message = orch._questions_waiting_message(state, run, False)
+    assert "answer questions Q1, Q3 in" in message
+    assert speccer_cli.ANSWER_HOW in message
 
 
 @pytest.mark.asyncio

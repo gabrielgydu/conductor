@@ -399,6 +399,22 @@ async def test_human_reset_after_cap_resumes_without_questions(spec_dir, fake_cl
 
 
 @pytest.mark.asyncio
+async def test_answer_instructions_follow_the_question_template(spec_dir, fake_claude, capsys):
+    template = (sc._PROMPTS_DIR / "spec-prompt.md").read_text()
+    assert "**Answer:**\n(user will add answer here starting with > )" in template
+    assert "**Answer:**" in sc.ANSWER_HOW and "'> '" in sc.ANSWER_HOW
+
+    fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]
+    (spec_dir / "domains" / "01-core.md").write_text("# Core\n", encoding="utf-8")
+    (spec_dir / "QUESTIONS.md").write_text("### Q1: Auth\n\n**Answer:**\n", encoding="utf-8")
+    assert await _run(spec_dir) == 0
+    assert await _run(spec_dir, cont=True) == 1  # nothing answered yet
+
+    printed = capsys.readouterr().err
+    assert printed.count(sc.ANSWER_HOW) == 2
+
+
+@pytest.mark.asyncio
 async def test_continue_still_needs_answers_to_open_questions(spec_dir, fake_claude):
     sc.update_status(spec_dir, "NEEDS_INPUT")
     (spec_dir / "QUESTIONS.md").write_text(
