@@ -271,7 +271,7 @@ def _write_learnings_summary(
     for pr in phase_results:
         status = "PASSED" if pr["success"] else "FAILED"
         lines.append(
-            f"- Phase {pr['phase_num']} ({pr['phase_name']}): {status}"
+            f"- {_commit_subject(pr['phase_num'], pr['phase_name'])} — {status}"
             f" — {pr['iterations']} iteration(s), {format_duration(pr['duration_s'])}"
         )
     lines.append("")
@@ -390,7 +390,7 @@ async def _run_phase(
     activity_log = feature_dir / "activity.log"
     untracked_snapshot = log_dir / f".pre-untracked-phase-{phase_num}"
 
-    header(f"PHASE {phase_num} — {phase_name}")
+    header(_commit_subject(phase_num, phase_name).replace(f"Phase {phase_num}", f"PHASE {phase_num}", 1))
     log(f"Prompt: {prompt_file}")
     log(f"Token:  {phase.token}")
     if model:

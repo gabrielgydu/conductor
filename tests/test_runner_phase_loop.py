@@ -139,6 +139,20 @@ def test_commit_subject_does_not_repeat_the_phase_label(name, subject):
     assert phase_loop._commit_subject(2, name) == subject
 
 
+def test_learnings_summary_names_each_phase_once(tmp_path):
+    """The live run's LEARNINGS.md read "Phase 1 (Phase 1): PASSED"."""
+    results = [
+        {"phase_num": 1, "phase_name": "Phase 1", "success": True, "iterations": 0, "duration_s": 237},
+        {"phase_num": 2, "phase_name": "Add login", "success": False, "iterations": 3, "duration_s": 61},
+    ]
+
+    phase_loop._write_learnings_summary(tmp_path, "feat", results)
+
+    text = (tmp_path / "docs" / "feat" / "LEARNINGS.md").read_text()
+    assert "- Phase 1 — PASSED — 0 iteration(s)" in text
+    assert "- Phase 2: Add login — FAILED — 3 iteration(s)" in text
+
+
 async def test_unnamed_phase_commits_once_labelled(project, monkeypatch):
     """A live run committed "Phase 1: Phase 1"."""
     repo, feature_dir = project
