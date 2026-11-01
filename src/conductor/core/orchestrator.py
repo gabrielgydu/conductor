@@ -286,8 +286,7 @@ def _runner_exit_file(storage: StorageResolver, project_name: str, fname: str) -
 
 
 def _runner_fail_log(storage: StorageResolver, project_name: str, fname: str) -> Path:
-    # TmuxManager.spawn_runner_in_window derives this name from the exit file
-    # (conductor-exit-<x> -> conductor-fail-<x>.log in the same directory).
+    """Where the runner window's wrapper saves the pane's last lines on a failure."""
     return _ipc_dir(storage, project_name) / f"conductor-fail-{fname}.log"
 
 
@@ -1671,7 +1670,8 @@ async def start_runner(
 
     exit_file = _runner_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
-    _runner_fail_log(storage, state.project_name, fname).unlink(missing_ok=True)
+    fail_log = _runner_fail_log(storage, state.project_name, fname)
+    fail_log.unlink(missing_ok=True)
     # A shallow streak of the previous runner in this window is not this one's.
     _shallow_since.pop(f"conductor-{state.project_name}:{window_name}", None)
 
@@ -1706,7 +1706,9 @@ async def start_runner(
     storage_dir = str(docs_dir)
     cmd = f"cd {wt} && {_RUNNER_BIN} run --feature {fname} --storage-dir {storage_dir}"
     log_file = storage.tmux_log(state.project_name, f"runner_{fname}")
-    await tmux.spawn_runner_in_window(window_name, cmd, exit_file=exit_file, cwd=wt, log_file=log_file)
+    await tmux.spawn_runner_in_window(
+        window_name, cmd, exit_file=exit_file, fail_log=fail_log, cwd=wt, log_file=log_file
+    )
 
     stage.started_at = datetime.now(timezone.utc)
 

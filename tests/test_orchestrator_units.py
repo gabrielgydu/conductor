@@ -285,14 +285,6 @@ def test_exit_files_of_two_projects_do_not_collide(tmp_path):
         assert path.is_relative_to(tmp_path / "repo-b"), path
 
 
-def test_runner_fail_log_matches_tmux_wrapper_naming(tmp_path):
-    """spawn_runner_in_window writes the fail log next to the exit file it is given."""
-    storage = _ipc_storage(tmp_path)
-    exit_file = orch._runner_exit_file(storage, "proj", "run-0")
-    derived = str(exit_file).replace("conductor-exit-", "conductor-fail-") + ".log"
-    assert Path(derived) == orch._runner_fail_log(storage, "proj", "run-0")
-
-
 # ---------------------------------------------------------------------------
 # Post-run learnings parsing — <<<FILE: path>>>...<<<END>>> format
 # ---------------------------------------------------------------------------

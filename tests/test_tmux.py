@@ -7,6 +7,7 @@ where they do not call back into tmux.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from typing import Callable
@@ -96,6 +97,26 @@ async def test_runner_wrapper_quotes_exit_file(recorder, tmp_path):
     script = _script(recorder.commands("new-window")[0])
     _run(["bash", "-c", script], cwd=tmp_path)
     assert exit_file.read_text().strip() == "0"
+
+
+async def test_runner_wrapper_writes_the_fail_log_it_is_given(recorder, tmp_path):
+    """The path used to be derived by replacing 'conductor-exit-' anywhere in the exit file's path."""
+    ipc = tmp_path / "-tmp-conductor-exit-test" / "ipc"  # project key of a repo named conductor-exit-test
+    ipc.mkdir(parents=True)
+    exit_file, fail_log = ipc / "conductor-exit-feat", ipc / "conductor-fail-feat.log"
+    await TmuxManager("conductor-x").spawn_runner_in_window(
+        "r", "(exit 3)", exit_file=exit_file, fail_log=fail_log,
+    )
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "tmux").write_text("#!/bin/sh\necho 'last pane lines'\n")  # answers capture-pane
+    (bindir / "tmux").chmod(0o755)
+
+    script = _script(recorder.commands("new-window")[0])
+    _run(["bash", "-c", script], env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"})
+
+    assert exit_file.read_text().strip() == "3"
+    assert fail_log.read_text() == "last pane lines\n"
 
 
 async def test_pipe_pane_quotes_log_file(recorder, tmp_path):
