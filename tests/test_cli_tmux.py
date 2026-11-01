@@ -223,3 +223,10 @@ def test_without_a_tty_the_session_is_left_detached(project, fake_tmux, execvp, 
     assert "started in tmux session conductor-foo; attach with: tmux attach -t =conductor-foo:" in out
     assert execvp == []
     assert "conductor-foo" in fake_tmux.sessions
+
+
+def test_run_reexec_forwards_reintegrate(project, fake_tmux, execvp):
+    _, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project), "--reintegrate"])
+
+    assert code == 0
+    assert "--reintegrate" in _reexec_argv(fake_tmux)

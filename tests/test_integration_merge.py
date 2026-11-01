@@ -37,6 +37,20 @@ def _stub_post_merge_checks(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_integration_branch_yet(monkeypatch):
+    """Every git call is mocked here: run branches resolve as named, there is
+    no integration branch yet, and no run is on the start branch already
+    (tests/integration covers ref resolution with real git)."""
+    from conductor.integration import merge
+
+    async def rev(ref, cwd):
+        return None if "integration/" in ref else ref
+
+    monkeypatch.setattr(merge, "_rev", rev)
+    monkeypatch.setattr(merge, "_is_ancestor", AsyncMock(return_value=False))
+
+
 # ---------------------------------------------------------------------------
 # Helper tests (Step 2)
 # ---------------------------------------------------------------------------
@@ -160,6 +174,14 @@ def _mock_proc(returncode=0, stdout=b"", stderr=b""):
     return proc
 
 
+_PR_URL = b"https://github.com/o/r/pull/1"
+
+
+def _stdout(args) -> bytes:
+    """What a mocked command prints: the PR URL for `gh pr create`, else nothing."""
+    return _PR_URL if "create" in args else b""
+
+
 class FakeStorageResolver:
     def __init__(self):
         self.repo_root = Path("/fake/repo")
@@ -218,7 +240,7 @@ async def test_clean_merge_two_runs(storage, tmp_path):
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
         proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.communicate = AsyncMock(return_value=(_stdout(args), b""))
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
@@ -244,7 +266,7 @@ async def test_clean_merge_dag_order(storage, tmp_path):
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
         proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.communicate = AsyncMock(return_value=(_stdout(args), b""))
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
@@ -332,7 +354,7 @@ async def test_claude_resolution_fallback(storage, tmp_path):
             proc.returncode = 1  # the resolution commit concluded the merge
         else:
             proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.communicate = AsyncMock(return_value=(_stdout(args), b""))
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
@@ -489,24 +511,26 @@ async def test_branch_creation_fallback_no_remote(storage):
 
 
 @pytest.mark.asyncio
-async def test_existing_branch_cleanup(storage):
+async def test_existing_integration_branch_is_never_deleted(storage):
+    """A rebuild used to start with `branch -D` and `push origin --delete`,
+    which closed the PR and dropped every commit only that branch had."""
     from conductor.integration.merge import run_integration_merge
 
     run0 = _make_run(0, "feat-a")
     run1 = _make_run(1, "feat-b")
     state = _make_state(run0, run1)
 
-    delete_calls = []
+    destructive = []
+    pushes = []
 
     async def fake_git(*args, **kwargs):
         proc = AsyncMock()
-        args_str = " ".join(str(a) for a in args)
-        if "branch" in args_str and "-D" in args_str:
-            delete_calls.append(list(args))
-        if "push" in args_str and "--delete" in args_str:
-            delete_calls.append(list(args))
+        if "branch" in args and ("-D" in args or "-f" in args):
+            destructive.append(list(args))
+        if "push" in args:
+            pushes.append(list(args))
         proc.returncode = 0
-        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.communicate = AsyncMock(return_value=(_stdout(args), b""))
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):
@@ -515,8 +539,11 @@ async def test_existing_branch_cleanup(storage):
         ):
             await run_integration_merge(state, storage)
 
-    # Cleanup calls should have happened
-    assert len(delete_calls) >= 1
+    assert destructive == []
+    assert pushes and not any(
+        "--delete" in p or "--force" in p or "-f" in p or any(a.startswith("+") for a in p)
+        for p in pushes
+    )
 
 
 @pytest.mark.asyncio
@@ -721,7 +748,7 @@ async def test_worktree_cleanup_failure_non_fatal(storage):
             proc.communicate = AsyncMock(return_value=(b"", b"error removing worktree"))
         else:
             proc.returncode = 0
-            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.communicate = AsyncMock(return_value=(_stdout(args), b""))
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=fake_git):

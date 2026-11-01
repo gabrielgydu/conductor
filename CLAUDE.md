@@ -90,8 +90,9 @@ With `--inside-tmux` you create the session and send the command yourself, as in
 - `--base-branch`: base branch (auto-detected if omitted)
 - `--quick` / `--no-quick`: quick mode is turned on when `go` plans the project; on resume the saved setting is kept unless one of these flags is given
 - `--max-parallel`: the saved setting, 1 (sequential runs) for a new project
-- `--worktrees-base`: base directory for worktrees (also used for integration merge worktree; defaults to `/tmp` if unset)
-- All `run` flags: `--no-overnight`, `--quick`/`--no-quick`, `--max-parallel`, `--worktrees-base`, `--inside-tmux`
+- `--worktrees-base`: base directory for worktrees, the integration worktree included (`<base>/integration-<name>`); defaults to the preset's `worktrees_base`, else `<project>/../worktrees`
+- `--reintegrate`: attempt the integration again when all runs are finished, even if it is not due (a failure that is not retried automatically)
+- All `run` flags: `--no-overnight`, `--quick`/`--no-quick`, `--max-parallel`, `--worktrees-base`, `--reintegrate`, `--inside-tmux`
 - Settings saved by an earlier run (quick, max parallel, worktrees base) are kept when the flag is left out; `--no-overnight` applies only to the invocation that passes it
 
 ## Loop Mode

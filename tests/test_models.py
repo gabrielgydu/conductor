@@ -171,6 +171,30 @@ def test_integration_state_split_conflicts():
     assert restored.conflicts_unresolved[0].file == "b.py"
 
 
+def test_legacy_integration_state_counts_its_merged_runs_as_considered():
+    """States written before considered_runs existed: their merged runs are
+    delivered, so only runs finished since trigger a new integration."""
+    legacy = IntegrationState.model_validate_json(
+        '{"status": "needs_fix", "branch": "integration/p", "merged_runs": [0, 1]}'
+    )
+    assert legacy.considered_runs == [0, 1]
+    assert legacy.published is None and legacy.failure is None
+
+    current = IntegrationState(branch="integration/p", merged_runs=[0], considered_runs=[0, 1])
+    assert current.considered_runs == [0, 1]
+
+
+def test_stage_work_refs_go_from_the_branch_to_origin_to_the_recorded_tip():
+    stage = StageState(name="s", spec_mode="full", branch="conductor/p/a/s", head_sha="abc123")
+
+    assert stage.work_refs() == [
+        ("refs/heads/conductor/p/a/s", "conductor/p/a/s"),
+        ("refs/remotes/origin/conductor/p/a/s", "origin/conductor/p/a/s"),
+        ("abc123", "abc123"),
+    ]
+    assert StageState(name="s", spec_mode="full").work_refs() == []
+
+
 def test_monitor_state_defaults():
     monitor = MonitorState()
     assert monitor.stall_count == 0

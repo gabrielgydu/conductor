@@ -340,17 +340,19 @@ async def test_run_finished_in_a_later_session_is_integrated(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_learnings_are_reviewed_before_the_runs_are_merged(tmp_path):
-    """Learnings committed on a run branch after the merge would miss the PR."""
+async def test_learnings_are_committed_on_the_integration_branch_before_the_push(tmp_path):
+    """Several runs: the review commits in the integration worktree (merge.py
+    awaits the hook after the merges, before the push), never on a run branch,
+    where each re-integration would hit a CLAUDE.md conflict."""
     import conductor.core.orchestrator as orch
 
-    order: list[str] = []
+    reviews: list[dict] = []
 
     async def review(*args, **kwargs):
-        order.append("review")
+        reviews.append(kwargs)
 
-    async def merge(*args, **kwargs):
-        order.append("merge")
+    async def merge(state, storage, *, before_publish):
+        await before_publish(tmp_path / "integration-wt")
         return IntegrationState(status="done", branch="integration/test-proj", merged_runs=[0, 1])
 
     state = _make_state(_done_run(0, "feat-a"), _done_run(1, "feat-b"))
@@ -364,7 +366,38 @@ async def test_learnings_are_reviewed_before_the_runs_are_merged(tmp_path):
     ):
         await conductor_run_loop(state, ConductorConfig(check_interval_s=0.0, max_iterations=5))
 
-    assert order == ["review", "merge"]
+    assert reviews == [
+        {"worktree": tmp_path / "integration-wt", "branch": "integration/test-proj"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_run_learnings_are_reviewed_before_its_push(tmp_path):
+    """Learnings committed on the run branch after the push would miss the PR."""
+    import conductor.core.orchestrator as orch
+
+    order: list[str] = []
+
+    async def review(*args, **kwargs):
+        order.append("review")
+
+    async def push(*args, **kwargs):
+        order.append("push")
+        return "https://x/pr/1"
+
+    state = _make_state(_with_branch(_done_run(0, "feat-a")), _blocked_run(1, "feat-b"))
+    with (
+        _patch_storage(tmp_path),
+        _patch_tmux(),
+        _patch_post_run(),
+        _patch_brain(),
+        _patch_create_worktree(tmp_path),
+        patch.object(orch, "_review_learnings", side_effect=review),
+        patch.object(orch, "_push_and_pr_for_branch", side_effect=push),
+    ):
+        await conductor_run_loop(state, ConductorConfig(check_interval_s=0.0, max_iterations=5))
+
+    assert order == ["review", "push"]
 
 
 @pytest.mark.asyncio
@@ -373,7 +406,10 @@ async def test_learnings_are_reviewed_before_the_runs_are_merged(tmp_path):
     [
         {"merge_error": RuntimeError("no network")},
         # merge.py reports a failed `git worktree add` this way, without raising
-        {"merge_result": IntegrationState(status="failed", branch="integration/test-proj")},
+        {"merge_result": IntegrationState(
+            status="failed", branch="integration/test-proj", failure="setup",
+            failure_detail="git worktree add failed",
+        )},
     ],
     ids=["raised", "returned"],
 )

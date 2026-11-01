@@ -182,6 +182,52 @@ async def test_blocked_stage_whose_runner_exited_0_is_done(tmp_path):
     assert state.runs[0].status == RunStatus.ACTIVE
 
 
+def _git(wt: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(wt), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_runner_exit_0_records_the_branch_tip(tmp_path):
+    """Integration and dependent runs fall back to it once the branch is gone."""
+    state, storage, wt = _env(tmp_path)
+    _git(wt, "init", "-q")
+    _git(wt, "commit", "-q", "--allow-empty", "-m", "work")
+    head = _git(wt, "rev-parse", "HEAD")
+
+    orch._finish_runner(state, 0, 0, 0, storage, None, None)
+
+    assert state.runs[0].stages[0].status == StageStatus.DONE
+    assert state.runs[0].stages[0].head_sha == head
+
+
+@pytest.mark.asyncio
+async def test_post_run_fix_commits_move_the_recorded_tip(tmp_path, monkeypatch):
+    from conductor.core import validation
+    from conductor.core.validation import ValidationResult
+
+    state, storage, wt = _env(tmp_path, StageStatus.DONE)
+    state.runs[0].current_stage = 1
+    _git(wt, "init", "-q")
+    _git(wt, "commit", "-q", "--allow-empty", "-m", "work")
+
+    async def fix_commit(*args, **kwargs):
+        _git(wt, "commit", "-q", "--allow-empty", "-m", "fix")
+        return True
+
+    monkeypatch.setattr(validation, "validate_and_fix", AsyncMock(
+        return_value=ValidationResult(passed=True, summary="ok", fix_attempts=1)
+    ))
+    monkeypatch.setattr(validation, "commit_validation_fixes", fix_commit)
+
+    await orch.advance_run(state, 0, _tmux(), storage, ConductorConfig())
+
+    head = _git(wt, "rev-parse", "HEAD")
+    assert state.runs[0].status == RunStatus.DONE
+    assert state.runs[0].stages[0].head_sha == head
+
+
 @pytest.mark.asyncio
 async def test_auto_resume_keeps_a_successful_exit_after_the_block(tmp_path):
     state, storage, _ = _env(tmp_path, StageStatus.BLOCKED)

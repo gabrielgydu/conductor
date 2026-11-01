@@ -43,6 +43,15 @@ class IntegrationStatus(StrEnum):
     NEEDS_FIX = "needs_fix"
 
 
+class IntegrationFailure(StrEnum):
+    """Why an integration attempt did not deliver."""
+
+    SETUP = "setup"  # no worktree, or the branch is checked out elsewhere
+    DIVERGED = "diverged"  # local and origin integration branches diverged
+    NOTHING_MERGEABLE = "nothing_mergeable"  # the merge loop merged no run
+    PUBLISH = "publish"  # merged, but the push or the PR failed
+
+
 class BrainAction(StrEnum):
     RETRY = "retry"
     BLOCK = "block"

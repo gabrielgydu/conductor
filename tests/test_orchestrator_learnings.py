@@ -154,6 +154,26 @@ async def test_learnings_message_says_whether_the_commit_still_goes_out(
 
 
 @pytest.mark.asyncio
+async def test_learnings_commit_skips_hooks(project, monkeypatch):
+    """A hook that fails in the fresh worktree must not leave the learnings
+    uncommitted, so that they never reach the PR."""
+    hooks = project.outside / "hooks"
+    hooks.mkdir()
+    for hook in ("pre-commit", "commit-msg"):
+        (hooks / hook).write_text("#!/bin/sh\nexit 1\n")
+        (hooks / hook).chmod(0o755)
+    _git(project.wt, "config", "core.hooksPath", str(hooks))
+    monkeypatch.setattr(
+        brain, "run_claude", _FakeClaude("<<<FILE: CLAUDE.md>>>\n- A rule.\n<<<END>>>")
+    )
+
+    await orch._review_learnings(project.state, project.storage)
+
+    assert "Record conductor learnings" in _git(project.wt, "log", "-1", "--format=%s")
+    assert "CLAUDE.md" not in _git(project.wt, "status", "--porcelain")
+
+
+@pytest.mark.asyncio
 async def test_symlinked_claude_md_is_edited_through_its_target(project, monkeypatch):
     wt = project.wt
     _git(wt, "mv", "CLAUDE.md", "AGENTS.md")
