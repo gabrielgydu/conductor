@@ -519,6 +519,15 @@ def test_codex_review_is_one_foreground_attempt(spec_dir):
         assert "single Codex attempt" in prompt
 
 
+def test_codex_request_travels_in_a_file(spec_dir):
+    # The companion re-splits a one-argument task and reads '-m pytest' in it
+    # as a model; '--prompt-file' keeps the request out of its option parser.
+    prompt = sc.build_spec_prompt(spec_dir, "feat", "backend", "INIT", 1)
+    section = prompt[prompt.index("## Second Opinion"):]
+    assert "`--prompt-file <path>`: no task text" in section
+    assert "-m " not in section and "o3" not in section
+
+
 @pytest.mark.parametrize("mode", ["fullstack", "backend", "frontend", "testing"])
 def test_generate_prompt_includes_the_constitution(spec_dir, mode):
     (spec_dir / "CONSTITUTION.md").write_text(

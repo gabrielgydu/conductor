@@ -19,21 +19,31 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "conductor" / "prompts" 
 # Codex second-opinion snippet (appended to planning prompts)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# The request goes to Codex in a file. The codex-rescue subagent passes its
+# task as one quoted argument, which the Codex companion splits again and
+# scans for flags: in live runs "python -m pytest" in the request became
+# `--model pytest`, and every call failed.
 _CODEX_SECOND_OPINION = """
 
 ## Second Opinion — Codex (non-blocking)
 
-Before finalizing your plans or answers, get a second opinion from Codex (OpenAI o3).
-Use the Agent tool with `subagent_type="codex:codex-rescue"` and ask it to review your
-draft output. Incorporate its feedback where it makes good points, then finalize.
+Before finalizing your plans or answers, get a second opinion from Codex.
+
+1. Write your review request (what to review, which files, what feedback you want) to a
+   new file outside the repository, made with `mktemp /tmp/codex-request-XXXXXX.md`.
+2. Use the Agent tool with `subagent_type="codex:codex-rescue"`, giving it this prompt
+   with the file's path filled in: "Read-only review. Run the companion `task` command
+   once with exactly the arguments `--prompt-file <path>`: no task text, no `--write`,
+   no `--model` and no other flags. Return its output, or its error verbatim."
+3. Incorporate Codex's feedback where it makes good points, then finalize.
 
 This is non-blocking: if the agent call fails, errors, or times out, proceed with your
 own judgment. Do not let Codex failures delay or block your output. So:
 
 - Make one Agent call, in the foreground (not `run_in_background`), and do not
   schedule wakeups or poll while it runs.
-- Tell the subagent to make a single Codex attempt and to report any error straight
-  back, without retrying or switching models.
+- That call is a single Codex attempt: do not retry it or switch models when it
+  reports an error.
 
 **Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.
 If Codex responded, summarize what it said and what you incorporated or disagreed with.
