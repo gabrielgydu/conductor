@@ -163,6 +163,9 @@ async def test_legacy_integration_with_branches_only_on_origin_gets_the_new_run_
     assert state.integration.status == IntegrationStatus.DONE
     for b in ("feat-a", "feat-b", "feat-c"):
         assert tip(env.origin, b)
+    # Built in a detached worktree, the merge still names the branch it is for.
+    subjects = git(env.origin, "log", "--merges", "--format=%s", "integration/etm").splitlines()
+    assert subjects[0] == "Merge feat-c into integration/etm"
 
 
 async def test_forced_reintegration_of_a_legacy_needs_fix_merges_nothing_and_stays_needs_fix(env):

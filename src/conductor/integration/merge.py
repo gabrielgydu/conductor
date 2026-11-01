@@ -560,10 +560,12 @@ async def _integrate(
             contained(run)
             continue
         tips[run.index] = tip
+        # The worktree is detached, so git's own message would say "into HEAD".
+        message = ["-m", f"Merge {stage.branch or tip} into {branch_name}"]
 
         _print(f"Merging run {run.index}: {run.name} ({tip})")
         # Try clean merge
-        rc, out, err = await _run_git([*_MERGE, tip], wt)
+        rc, out, err = await _run_git([*_MERGE, *message, tip], wt)
         if rc == 0:
             _print("  ✓ Clean merge")
             merged_runs.append(run)
@@ -608,7 +610,7 @@ async def _integrate(
         # hunk and drops the integration branch's (the earlier runs') side.
         # Recorded as unresolved so the status and PR cannot claim a clean merge.
         await _abort_merge(wt)
-        rc, _, _ = await _run_git([*_MERGE, "-X", "theirs", tip], wt)
+        rc, _, _ = await _run_git([*_MERGE, *message, "-X", "theirs", tip], wt)
         if rc == 0:
             _print(f"  ! Claude could not resolve; -X theirs overwrote: {', '.join(conflicting)}")
             for f in conflicting:
