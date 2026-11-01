@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -1239,6 +1240,23 @@ def _cmd_cleanup(args):
         if b and b not in stage_branches and branch_exists(b)
     ]
 
+    archive = storage.conductor_dir(state.project_name) / "runs"
+
+    def only_run_files(wt: str, fname: str) -> bool:
+        """Whether docs/<fname>/ holds all of *wt*'s uncommitted changes.
+
+        That is conductor's own feature dir (spec, logs, learnings), never
+        committed, so it alone must not keep a finished worktree around.
+        """
+        r = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=wt, capture_output=True, text=True, check=False,
+        )
+        prefix = f"docs/{fname}/"
+        return r.returncode == 0 and all(
+            line[3:].strip('"').startswith(prefix) for line in r.stdout.splitlines()
+        )
+
     removed: list[str] = []
     deleted: list[str] = []
     kept: list[str] = []  # unsaved work, left in place on purpose
@@ -1248,7 +1266,13 @@ def _cmd_cleanup(args):
             if stage.worktree:
                 wt = stage.worktree
                 if wt in registered or str(Path(wt).resolve()) in registered:
-                    r = git("worktree", "remove", *(["--force"] if force else []), wt)
+                    fname = run.name + stage.feature_suffix
+                    run_files = Path(wt) / "docs" / fname
+                    forced = force or only_run_files(wt, fname)
+                    if forced and run_files.is_dir():
+                        # Keep the spec, logs and learnings with the project's state.
+                        shutil.copytree(run_files, archive / fname, dirs_exist_ok=True)
+                    r = git("worktree", "remove", *(["--force"] if forced else []), wt)
                     if r.returncode != 0:
                         failed.append(f"worktree {wt}: {r.stderr.strip()}")
                         continue  # its branch is still checked out there

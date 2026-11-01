@@ -102,6 +102,25 @@ def test_cleanup_keeps_unsaved_work_and_reports_what_it_did(repo, project):
     ]
 
 
+def test_cleanup_archives_conductor_run_files_instead_of_keeping_the_worktree(repo, project):
+    # A finished worktree's only untracked files are conductor's own
+    # docs/<feature>/ (spec, logs, learnings): that alone used to need --force.
+    _, wts, _ = project
+    (wts / "unpushed" / "docs" / "unpushed" / "spec").mkdir(parents=True)
+    (wts / "unpushed" / "docs" / "unpushed" / "spec" / "SPEC.md").write_text("the spec")
+    (wts / "dirty" / "docs" / "dirty").mkdir(parents=True)
+    (wts / "dirty" / "docs" / "dirty" / "LEARNINGS.md").write_text("learned")
+
+    _, _, code = _cleanup(repo)
+
+    assert code == 1  # wip.txt still keeps the dirty worktree
+    assert not (wts / "unpushed").exists()
+    assert (wts / "dirty" / "wip.txt").exists()
+    archive = StorageResolver(repo).conductor_dir(NAME) / "runs"
+    assert (archive / "unpushed" / "spec" / "SPEC.md").read_text() == "the spec"
+    assert not (archive / "dirty").exists()
+
+
 def test_cleanup_force_deletes_unsaved_work_too(repo, project):
     branches, wts, _ = project
 
