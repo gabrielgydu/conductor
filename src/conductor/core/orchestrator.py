@@ -1710,11 +1710,11 @@ async def start_runner(
     storage_dir = str(docs_dir)
     cmd = _module_cmd("runner", "run", "--feature", fname, "--storage-dir", storage_dir)
     log_file = storage.tmux_log(state.project_name, f"runner_{fname}")
+    # Before the spawn: an exit file only counts when written after this.
+    stage.started_at = datetime.now(timezone.utc)
     await tmux.spawn_runner_in_window(
         window_name, cmd, exit_file=exit_file, fail_log=fail_log, cwd=wt, log_file=log_file
     )
-
-    stage.started_at = datetime.now(timezone.utc)
 
     _log(
         "RUNNER_START",
@@ -1972,6 +1972,16 @@ def _runner_window(run_idx: int, stage: StageState) -> str:
     return f"run{run_idx}:{stage.name}-exec"
 
 
+def _written_since_start(path: Path, stage: StageState) -> bool:
+    """Whether *path* exists and was written after the stage's runner last started."""
+    if stage.started_at is None:
+        return False
+    try:
+        return path.stat().st_mtime > stage.started_at.timestamp()
+    except OSError:
+        return False
+
+
 def _runner_outcome(
     state: ConductorState, run_idx: int, stage_idx: int, storage: StorageResolver
 ) -> int | None:
@@ -1979,22 +1989,21 @@ def _runner_outcome(
 
     The wrapper's exit file is the primary record. The runner also writes
     docs/<feature>/exit_code itself, which survives the exit file being
-    removed; it is never cleared between attempts, so it only counts when
-    written after this attempt started.
+    removed. Either counts only when written after this attempt started:
+    the durable file is never cleared between attempts, and the exit file
+    is keyed by run and stage name only, so one left by an earlier plan
+    that reused the name must not finish a stage whose runner never ran.
     """
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
     exit_file = _runner_exit_file(storage, state.project_name, fname)
-    if exit_file.exists():
+    if _written_since_start(exit_file, stage):
         return _read_exit_code(exit_file)
-    if not stage.worktree or stage.started_at is None:
+    if not stage.worktree:
         return None
     durable = Path(stage.worktree) / "docs" / fname / "exit_code"
-    try:
-        if durable.stat().st_mtime <= stage.started_at.timestamp():
-            return None
-    except OSError:
+    if not _written_since_start(durable, stage):
         return None
     return _read_exit_code(durable)
 

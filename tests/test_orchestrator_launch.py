@@ -53,6 +53,18 @@ async def test_runner_wrapper_gets_the_fail_log_the_orchestrator_reads(tmp_path)
     assert kwargs["fail_log"].parent == kwargs["exit_file"].parent
 
 
+async def test_runner_start_time_is_set_before_the_spawn(tmp_path):
+    """An exit file counts only when newer than started_at, which was set after the spawn."""
+    state, storage, tmux, _ = launch_env(tmp_path)
+    stage = state.runs[0].stages[0]
+    at_spawn = []
+    tmux.spawn_runner_in_window.side_effect = lambda *a, **kw: at_spawn.append(stage.started_at)
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    assert at_spawn == [stage.started_at] and stage.started_at is not None
+
+
 # -- paths with spaces --------------------------------------------------------
 
 _ARGV_RECORDER = '#!/bin/bash\nprintf "%s\\n" "$PWD" "$@" > "$ARGV_OUT"\n'

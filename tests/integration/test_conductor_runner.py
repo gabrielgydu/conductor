@@ -127,15 +127,8 @@ async def test_conductor_detects_runner_completion(
     tmp_path,
 ):
     """Runner exits 0, conductor transitions stage to DONE."""
-    run = make_run_state(0, "test-run")
-    run.stages[0].status = StageStatus.EXECUTING
-    run.stages[0].pid = 12345
-    # Set up worktree for the stage
-    wt_dir = tmp_path / "worktrees" / "wt-0"
-    wt_dir.mkdir(parents=True, exist_ok=True)
-    run.stages[0].worktree = str(wt_dir)
-    run.stages[0].branch = "conductor/test-project/test-run/stage-0"
-    state = make_conductor_state("test-project", [run])
+    # Started before its exit file was written: older exit files are not its result
+    state = _executing_state(tmp_path)
     config = ConductorConfig(check_interval_s=0.0, max_iterations=20)
 
     # Runner window is dead (already exited cleanly)
