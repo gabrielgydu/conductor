@@ -3614,12 +3614,7 @@ async def _auto_resume_blocked_runs(
             any_resumed = True
             continue
         window = _runner_window(run_idx, stage)
-        if (
-            tmux is not None
-            and stage.started_at is not None
-            and await tmux.is_window_alive(window)
-            and not await tmux.is_runner_idle(window)
-        ):
+        if await _runner_alive(tmux, run_idx, stage):
             stage.status = StageStatus.EXECUTING
             run.status = RunStatus.ACTIVE
             _log(
@@ -3654,6 +3649,55 @@ async def _auto_resume_blocked_runs(
         )
         any_resumed = True
     if any_resumed:
+        atomic_save(state, storage.conductor_state(state.project_name))
+
+
+async def _runner_alive(
+    tmux: _tmux_module.TmuxManager | None, run_idx: int, stage: StageState
+) -> bool:
+    """Whether *stage*'s runner from an earlier session is still working."""
+    window = _runner_window(run_idx, stage)
+    return (
+        tmux is not None
+        and stage.started_at is not None
+        and await tmux.is_window_alive(window)
+        and not await tmux.is_runner_idle(window)
+    )
+
+
+async def _requeue_dead_active_runs(
+    state: ConductorState,
+    storage: StorageResolver,
+    log_path: Path | None,
+    audit_path: Path | None,
+    tmux: _tmux_module.TmuxManager | None,
+) -> None:
+    """Put ACTIVE runs without a live runner back to PENDING on startup.
+
+    activate_ready_runs then hands them slots within max_parallel, in run
+    order; a dead runner is restarted once its run is ACTIVE again. A run
+    whose runner is still working stays ACTIVE (and holds a slot) even
+    above the cap: it is never stopped for that. Stage statuses are kept.
+    """
+    queued: list[str] = []
+    for run_idx, run in enumerate(state.runs):
+        if run.status != RunStatus.ACTIVE:
+            continue
+        if run.current_stage < len(run.stages) and await _runner_alive(
+            tmux, run_idx, run.stages[run.current_stage]
+        ):
+            continue
+        run.status = RunStatus.PENDING
+        queued.append(run.name)
+    if queued:
+        _log(
+            "AUTO_RESUME",
+            f"No live runner for {', '.join(queued)}: waiting for a slot again "
+            "(max_parallel applies)",
+            log_path,
+            audit_path,
+            runs=queued,
+        )
         atomic_save(state, storage.conductor_state(state.project_name))
 
 
@@ -3737,6 +3781,7 @@ async def _conductor_run_loop(
 
     # Auto-resume any BLOCKED runs from a previous session
     await _auto_resume_blocked_runs(state, storage, log_path, audit_path, tmux=tmux)
+    await _requeue_dead_active_runs(state, storage, log_path, audit_path, tmux)
 
     exit_reason = "unknown"
     advance_errors: dict[int, int] = {}  # run index -> consecutive exceptions

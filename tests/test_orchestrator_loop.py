@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -161,6 +162,40 @@ async def test_resumed_runs_respect_max_parallel(loop_env, tmp_path, blocked_in)
     await orch._auto_resume_blocked_runs(state, StorageResolver(tmp_path), None, None)
 
     assert orch.activate_ready_runs(state, max_parallel=1) == [0]
+    assert state.runs[1].status == RunStatus.PENDING
+
+
+def _executing(index: int, name: str) -> object:
+    run = _active(index, name, StageStatus.EXECUTING)
+    run.stages[0].started_at = datetime.now(UTC)
+    return run
+
+
+@pytest.mark.asyncio
+async def test_active_runs_without_a_live_runner_respect_max_parallel(loop_env):
+    """A state left with more ACTIVE runs than max_parallel (an older version,
+    or a lower --max-parallel) restarts only as many dead runners as fit."""
+    state = _state(*(_executing(i, f"feat-{i}") for i in range(3)))
+    config = ConductorConfig(check_interval_s=0.0, max_iterations=1, max_parallel=2)
+
+    with patch.object(orch, "monitor_runner", new_callable=AsyncMock) as monitor:
+        result = await conductor_run_loop(state, config)
+
+    assert [c.args[1] for c in monitor.await_args_list] == [0, 1]
+    assert [r.status for r in result.runs] == [RunStatus.ACTIVE, RunStatus.ACTIVE, RunStatus.PENDING]
+    assert result.runs[2].stages[0].status == StageStatus.EXECUTING
+
+
+@pytest.mark.asyncio
+async def test_a_live_runner_keeps_its_run_active_above_max_parallel(loop_env, tmp_path):
+    state = _state(*(_executing(i, f"feat-{i}") for i in range(3)))
+    live = orch._runner_window(2, state.runs[2].stages[0])
+    loop_env.is_window_alive.side_effect = lambda window: window == live
+    loop_env.is_runner_idle.side_effect = lambda window: window != live
+
+    await orch._requeue_dead_active_runs(state, StorageResolver(tmp_path), None, None, loop_env)
+
+    assert orch.activate_ready_runs(state, max_parallel=2) == [0, 2]
     assert state.runs[1].status == RunStatus.PENDING
 
 
