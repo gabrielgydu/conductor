@@ -499,6 +499,46 @@ async def test_restart_regenerates_an_unusable_manifest(tmp_path):
     assert not run_sh.exists()
 
 
+OVERLOADED = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+
+
+@pytest.mark.parametrize(
+    "pane, kind",
+    [
+        ("Exceeded timeout of 5000 ms for a test.", "logic"),
+        ('expected 200, got 500 "Internal Server Error"', "logic"),
+        ("src/app.ts:529:7 - error TS2345: setTimeout(cb, 'x')", "logic"),
+        ("Error: insufficient capacity", "logic"),
+        (OVERLOADED, "transient"),
+        ("Claude AI usage limit reached|1767225600", "transient"),
+        # The runner's gate output after its marker is never Claude's.
+        (f"PHASE 1 — quality gate failed 2 times, giving up\nLast failures:\n{OVERLOADED}", "logic"),
+    ],
+)
+def test_only_claude_api_errors_in_the_fail_log_are_transient(tmp_path, pane, kind):
+    fail_log = tmp_path / "conductor-fail-feat.log"
+    fail_log.write_text(pane)
+    stage = StageState(name="s", spec_mode="full")
+
+    assert orch.classify_failure("feat", 1, stage, [fail_log]) == kind
+
+
+def test_failure_record_of_an_earlier_attempt_is_ignored(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    record = tmp_path / "wt" / "docs" / "feat" / "FAILURE.json"
+    record.parent.mkdir(parents=True)
+    record.write_text('{"reason": "quality_gate", "phase": 1, "detail": "unit: exit 1"}')
+    fail_log = tmp_path / "conductor-fail-feat.log"
+    fail_log.write_text(OVERLOADED)
+    stage = StageState(name="s", spec_mode="full", worktree=str(tmp_path / "wt"))
+
+    stage.started_at = datetime.now(UTC) - timedelta(minutes=1)
+    assert orch.classify_failure("feat", 1, stage, [fail_log]) == "logic"
+    stage.started_at = datetime.now(UTC) + timedelta(minutes=1)  # a later attempt
+    assert orch.classify_failure("feat", 1, stage, [fail_log]) == "transient"
+
+
 def test_ordinary_runner_failure_is_diagnosed_not_blindly_restarted(tmp_path):
     """The runner writes activity.log until it exits 1 (max iterations, gates)."""
     docs = tmp_path / "wt" / "docs" / "feat"

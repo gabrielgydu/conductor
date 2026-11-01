@@ -2252,24 +2252,52 @@ async def monitor_runner(
 # ---------------------------------------------------------------------------
 
 
+# What the Claude CLI says when the API call itself failed or the account hit
+# its usage limit ("API Error: 529 {...overloaded_error...}"). Nothing a test,
+# build or lint run prints on its own: no bare "timeout", "500" or "internal
+# server error", which gate output is full of.
 _TRANSIENT_PATTERNS = re.compile(
-    r"api_error|overloaded_error|internal server error|server_error|rate_limit"
-    r"|529|500\s*error|capacity|connection error|timeout|econnreset"
-    r"|APIStatusError|APIConnectionError|APITimeoutError",
+    r"\bAPI Error: (?:5\d\d|429)\b|\bAPI Error: (?:Connection error|Request timed out)"
+    r"|\b(?:overloaded_error|rate_limit_error)\b"
+    r"|\busage limit reached|\b(?:5-hour|session|weekly) limit reached|\bhit your limit",
     re.IGNORECASE,
 )
+# The runner prints raw gate output after this line when it gives up on a
+# phase (runner.phase_loop); none of what follows is Claude's.
+_GATE_OUTPUT_MARKER = "Last failures:"
+# Why the runner failed, in its own words (runner.phase_loop.FAILURE_FILE).
+_RUNNER_FAILURE_FILE = "FAILURE.json"
 
 
 def _is_transient_api_error(paths_to_check: list[Path]) -> bool:
-    """Check fail logs for transient API error patterns."""
+    """Check fail logs for a Claude API error, ignoring the runner's gate output."""
     for p in paths_to_check:
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if _TRANSIENT_PATTERNS.search(text):
+        if _TRANSIENT_PATTERNS.search(text.partition(_GATE_OUTPUT_MARKER)[0]):
             return True
     return False
+
+
+def _runner_failure_reason(stage: StageState, fname: str) -> dict | None:
+    """Why the stage's current runner failed, as it recorded it; None if it did not.
+
+    Only a record written during this attempt counts (like the exit files).
+    """
+    import json as _json
+
+    if not stage.worktree:
+        return None
+    path = Path(stage.worktree) / "docs" / fname / _RUNNER_FAILURE_FILE
+    if not _written_since_start(path, stage):
+        return None
+    try:
+        reason = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return reason if isinstance(reason, dict) else None
 
 
 def classify_failure(
@@ -2281,7 +2309,10 @@ def classify_failure(
     """Classify failure as 'infra', 'transient', or 'logic'.
 
     - Exit 137/143 (signal kills) → infra
-    - Exit 1 + transient API error patterns in fail log → transient
+    - Exit 1 the runner explains in FAILURE.json: a failure of the work (gate,
+      commit hook, local checks, iteration limit, ...) → logic; a Claude error
+      → transient if it is an API error or usage limit (_TRANSIENT_PATTERNS)
+    - Exit 1 otherwise → transient if the fail log shows such an error
     - Everything else → logic, which gets a diagnosis
 
     A recently written activity.log says nothing about the cause: the runner
@@ -2290,7 +2321,15 @@ def classify_failure(
     """
     if exit_code in (137, 143):
         return "infra"
-    if exit_code == 1 and _is_transient_api_error(fail_logs or []):
+    if exit_code != 1:
+        return "logic"
+    reason = _runner_failure_reason(stage, fname)
+    if reason is not None:
+        if reason.get("reason") != "claude_error":
+            return "logic"
+        if _TRANSIENT_PATTERNS.search(str(reason.get("detail", ""))):
+            return "transient"
+    if _is_transient_api_error(fail_logs or []):
         return "transient"
     return "logic"
 
