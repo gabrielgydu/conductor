@@ -83,10 +83,10 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 |---------|-------------|
 | `conductor init --name <name>` | Create a project with feature brief template |
 | `conductor plan --name <name> [--force]` | Generate run plan via Claude Opus (`--force` re-plans a project whose runs have started) |
-| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N]` | Execute the orchestration loop |
-| `conductor status --name <name>` | Show run/stage status table |
+| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N] [--reintegrate]` | Execute the orchestration loop (`--reintegrate` attempts the integration again even when it is not due) |
+| `conductor status --name <name>` | Show run/stage status table, the integration PR and how a failed integration is retried |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |
-| `conductor cleanup --name <name> [--force]` | Remove worktrees and branches; keeps uncommitted, unpushed or unmerged work unless `--force` |
+| `conductor cleanup --name <name> [--force]` | Remove worktrees and branches; keeps uncommitted, unpushed or unmerged work unless `--force`; branch names stay in state, so later runs still find work saved on origin |
 
 **Stage State Machine:**
 
@@ -158,9 +158,16 @@ Phase execution engine. Drives Claude through implementation phases with quality
 Post-run features for merging and testing across runs.
 
 **Integration Merge:**
-- Merges all completed run branches in DAG topological order
-- On conflict: tries `git merge -X theirs`, then Claude-assisted resolution
-- Creates a non-draft PR on the integration branch
+- One finished run gets a PR from its own branch; several are merged into `integration/<name>` in DAG topological order
+- The integration worktree is `<base>/integration-<name>`, where `<base>` is `--worktrees-base`, else the preset's `worktrees_base`, else `<project>/../worktrees`
+- Incremental and never destructive: an attempt starts from the existing integration branch (the newer of the local one and origin's), merges only the runs it does not contain yet, and moves and pushes the branch only by fast-forward, so commits pushed to the PR branch and the PR itself stay
+- A run that finishes in a later session is merged on top of the branch
+- A run branch that is gone locally is taken from origin, else from the commit recorded when the run finished
+- On conflict: Claude resolves it first; `git merge -X theirs` is a last resort that is recorded as unresolved and makes the merge PARTIAL; a run neither can merge is left out
+- The learnings from all runs are committed to CLAUDE.md once, on the integration branch, before the push
+- DONE means validated, pushed and with a PR; the PR is a draft when the merge is partial
+- A failed push or PR is retried as push and PR only, and a failed setup (e.g. the integration branch checked out somewhere) is retried as a whole, each in up to 3 sessions
+- Anything else, such as diverged local and origin integration branches, waits for `--reintegrate`
 
 **Integration E2E Testing:**
 - Detects test framework (Playwright, Cypress)
