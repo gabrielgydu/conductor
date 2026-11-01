@@ -561,7 +561,8 @@ async def _integrate(
             continue
         tips[run.index] = tip
         # The worktree is detached, so git's own message would say "into HEAD".
-        message = ["-m", f"Merge {stage.branch or tip} into {branch_name}"]
+        label = stage.branch if stage and stage.branch else tip
+        message = ["-m", f"Merge {label} into {branch_name}"]
 
         _print(f"Merging run {run.index}: {run.name} ({tip})")
         # Try clean merge
