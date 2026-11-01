@@ -7,7 +7,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-# Minimum number of PIDs expected in a healthy runner process tree
+# Minimum number of processes expected in a healthy runner process tree
 # (shell → python → claude = 3 processes)
 MIN_HEALTHY_TREE_DEPTH = 3
 
@@ -16,13 +16,17 @@ _WAIT_POLL_SECS = 2.0
 
 
 def check_pstree_depth(pid: int, depth: int = MIN_HEALTHY_TREE_DEPTH) -> bool:
-    """Check if a process tree has at least `depth` PIDs (sync).
+    """Check if a process tree has at least `depth` processes (sync).
+
+    Threads are not counted (-T): after its first quality gate the runner
+    keeps an idle worker thread, which would make a runner with no Claude
+    under it look healthy for the rest of its life.
 
     Returns True if pstree is not available (safe fallback).
     """
     try:
         r = subprocess.run(
-            ["pstree", "-p", str(pid)],
+            ["pstree", "-p", "-T", str(pid)],
             capture_output=True, text=True,
         )
     except FileNotFoundError:  # psmisc not installed

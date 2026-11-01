@@ -8,6 +8,7 @@ where they do not call back into tmux.
 from __future__ import annotations
 
 import subprocess
+import sys
 from typing import Callable
 
 import pytest
@@ -186,3 +187,27 @@ def test_pstree_depth_without_pstree_is_the_documented_fallback(monkeypatch, tmp
     monkeypatch.setenv("PATH", str(tmp_path))
 
     assert tmux_module.check_pstree_depth(1) is True
+
+
+_IDLE_GATE_THREAD = """
+import asyncio
+
+async def main():
+    await asyncio.to_thread(lambda: None)  # the runner's quality gate call
+    print("ready", flush=True)
+    await asyncio.sleep(60)
+
+asyncio.run(main())
+"""
+
+
+def test_pstree_depth_counts_processes_not_threads():
+    """The runner's idle gate thread made a runner without Claude look healthy."""
+    proc = subprocess.Popen([sys.executable, "-c", _IDLE_GATE_THREAD], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline() == "ready\n"
+        assert tmux_module.check_pstree_depth(proc.pid, depth=1) is True
+        assert tmux_module.check_pstree_depth(proc.pid, depth=2) is False
+    finally:
+        proc.kill()
+        proc.wait()
