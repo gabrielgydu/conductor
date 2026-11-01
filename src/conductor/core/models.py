@@ -7,12 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from conductor.core.enums import (
     RunStatus,
     StageStatus,
     SpeccerStatus,
+    IntegrationFailure,
     IntegrationStatus,
     BrainAction,
     FixerStatus,
@@ -76,6 +77,18 @@ class StageState(BaseModel):
     # next failure means the runner committed in between (real progress).
     last_failure_head: str | None = None
 
+    def work_refs(self) -> list[tuple[str, str]]:
+        """Where this stage's work can be, best first, as (ref to verify, name
+        to use): its branch, origin's copy of it (cleanup deletes local
+        branches that are saved there), the commit recorded when it finished."""
+        refs = []
+        if self.branch:
+            refs.append((f"refs/heads/{self.branch}", self.branch))
+            refs.append((f"refs/remotes/origin/{self.branch}", f"origin/{self.branch}"))
+        if self.head_sha:
+            refs.append((self.head_sha, self.head_sha))
+        return refs
+
 
 class RunState(BaseModel):
     model_config = ConfigDict(use_enum_values=True, extra="ignore")
@@ -136,15 +149,34 @@ class IntegrationState(BaseModel):
 
     status: IntegrationStatus = IntegrationStatus.PENDING
     branch: str
+    # Runs on the delivered branch, merged now or by an earlier attempt.
     merged_runs: list[int] = []
     # DONE runs when this integration was attempted. A run DONE later is not
-    # in it and triggers a new integration; an attempt that failed before it
-    # could merge anything leaves it empty, so it is retried on the next start.
+    # in it and triggers a new integration. Seeded from merged_runs for states
+    # written before it existed.
     considered_runs: list[int] = []
     conflicts_resolved: list[ConflictRecord] = []
     conflicts_unresolved: list[ConflictRecord] = []
     e2e: Optional[E2ETestState] = None
     pr_url: str | None = None
+    # Pushed and with a PR; DONE needs it. None: written before this was
+    # tracked, so never re-published automatically.
+    published: bool | None = None
+    validation_passed: bool | None = None
+    # Why the last attempt failed. An attempt that changed nothing (SETUP,
+    # DIVERGED, NOTHING_MERGEABLE) keeps the fields above from the integration
+    # before it; a successful attempt clears these.
+    failure: IntegrationFailure | None = None
+    failure_detail: str | None = None
+    # Consecutive sessions whose attempt failed, and the DONE runs then.
+    failed_attempts: int = 0
+    attempted_runs: list[int] = []
+
+    @model_validator(mode="after")
+    def _seed_considered_runs(self) -> IntegrationState:
+        if not self.considered_runs and self.merged_runs:
+            self.considered_runs = list(self.merged_runs)
+        return self
 
 
 class ConductorState(BaseModel):
