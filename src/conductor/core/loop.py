@@ -304,6 +304,28 @@ class CommitRejected(Exception):
         self.output = output
 
 
+_SUBJECT_MAX = 72
+
+
+def _commit_subject(name: str) -> str:
+    """Shorten a task name to a commit subject, cutting at a word boundary.
+
+    Task names are the checklist line clipped to 80 characters, so a cut can
+    land inside a `code span`; an unbalanced backtick is dropped with the
+    words after it.
+    """
+    name = " ".join(name.split())
+    if len(name) <= _SUBJECT_MAX:
+        return name
+    cut = name[:_SUBJECT_MAX - 1]
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    if cut.count("`") % 2:
+        cut = cut[:cut.rindex("`")]
+    cut = cut.rstrip(" ,;:—–-")
+    return (cut or name[:_SUBJECT_MAX - 1]) + "…"
+
+
 def commit_task(cwd: Path, task: LoopTask) -> str | None:
     """Stage all changes and commit. Returns commit hash, or None if nothing changed.
 
@@ -316,7 +338,7 @@ def commit_task(cwd: Path, task: LoopTask) -> str | None:
     if not status.stdout.strip():
         return None
 
-    msg = f"{task.name}\n\nTask {task.index}: {task.description[:200]}"
+    msg = f"{_commit_subject(task.name)}\n\nTask {task.index}: {task.description[:200]}"
     for args in (["git", "add", "-A"], ["git", "commit", "-m", msg]):
         r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
         if r.returncode != 0:

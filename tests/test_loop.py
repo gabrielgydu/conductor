@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from conductor.core.loop import (
-    LoopState, _loop_main, check_output_for_signal, parse_checklist, run_loop_in_tmux,
+    LoopState, _commit_subject, _loop_main, check_output_for_signal, parse_checklist,
+    run_loop_in_tmux,
 )
 from conductor.core.storage import StorageResolver
 
@@ -400,3 +401,19 @@ def _output(*texts: str) -> str:
 ])
 def test_check_output_for_signal(texts, expected):
     assert check_output_for_signal(_output(*texts)) == expected
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Add a subtract function", "Add a subtract function"),
+    # The live toy run's subject: clipped to 80 characters inside `ValueError`.
+    ("Add a `divide(a, b)` function that raises `ValueError` on division by zero, with",
+     "Add a `divide(a, b)` function that raises `ValueError` on division by…"),
+    ("Make `the_whole_rest_of_this_very_long_line_one_identifier_without_any_spaces_at_all`",
+     "Make…"),
+    ("x" * 90, "x" * 71 + "…"),
+])
+def test_commit_subject(name, expected):
+    subject = _commit_subject(name)
+    assert subject == expected
+    assert len(subject) <= 72
+    assert subject.count("`") % 2 == 0
