@@ -713,6 +713,7 @@ async def _integrate(
         )
         published: bool | None = pushed and pr_url is not None
     else:
+        assert previous is not None  # without one, publish is always True
         pr_url, published, publish_error = previous.pr_url, previous.published, ""
 
     return IntegrationState(

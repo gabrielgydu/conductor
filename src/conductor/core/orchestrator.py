@@ -53,6 +53,13 @@ def _module_cmd(module: str, *args: str) -> str:
     return shlex.join([sys.executable, "-P", "-m", module, *args])
 
 
+def _stage_worktree(stage: StageState) -> str:
+    """The worktree a speccer or runner step runs in; create_worktree set it before."""
+    if not stage.worktree:
+        raise RuntimeError(f"stage {stage.name} has no worktree")
+    return stage.worktree
+
+
 # A runner pane whose process tree stays shallow (the runner is alive but
 # no Claude or gate process under it) is a zombie. When each window was first
 # seen shallow, keyed "session:window"; a runner is declared a zombie only
@@ -139,6 +146,8 @@ async def _push_and_pr_for_branch(
 
     # Create PR with retry
     if title is None:
+        if run is None:
+            raise ValueError("_push_and_pr_for_branch needs a title or a run")
         title = f"{run.name}: {run.description[:60]}" if run.description else run.name
     if body is None:
         body = f"Conductor single-run output for **{project_name}**."
@@ -252,7 +261,7 @@ def _record_attempt(
     update: dict = {
         "failure": result.failure,
         "failure_detail": result.failure_detail,
-        "failed_attempts": previous.failed_attempts + 1 if repeated else 1,
+        "failed_attempts": previous.failed_attempts + 1 if repeated and previous else 1,
         "attempted_runs": done,
     }
     if result.merged_runs:
@@ -917,7 +926,7 @@ async def run_speccer_init(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    wt = stage.worktree
+    wt = _stage_worktree(stage)
     mode = stage.spec_mode
     window_name = f"run{run_idx}:{stage.name}"
 
@@ -1054,7 +1063,7 @@ async def run_speccer_run(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    wt = stage.worktree
+    wt = _stage_worktree(stage)
     window_name = f"run{run_idx}:{stage.name}"
 
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
@@ -1100,7 +1109,7 @@ async def run_speccer_continue(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    wt = stage.worktree
+    wt = _stage_worktree(stage)
     window_name = f"run{run_idx}:{stage.name}"
 
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
@@ -1146,7 +1155,7 @@ async def run_speccer_generate(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    wt = stage.worktree
+    wt = _stage_worktree(stage)
     window_name = f"run{run_idx}:{stage.name}-gen"
 
     exit_file = _speccer_exit_file(storage, state.project_name, f"{fname}-gen")
@@ -1964,7 +1973,7 @@ async def start_runner(
     run = state.runs[run_idx]
     stage = run.stages[stage_idx]
     fname = run.name + stage.feature_suffix
-    wt = stage.worktree
+    wt = _stage_worktree(stage)
     window_name = f"run{run_idx}:{stage.name}-exec"
 
     exit_file = _runner_exit_file(storage, state.project_name, fname)
