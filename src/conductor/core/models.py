@@ -47,6 +47,9 @@ class StageState(BaseModel):
     status: StageStatus = StageStatus.PENDING
     worktree: str | None = None
     branch: str | None = None
+    # The branch's tip once the stage is DONE: integration and dependent runs
+    # fall back to it when the branch is gone locally and on origin.
+    head_sha: str | None = None
     context_wiring: ContextWiring | None = None
     pid: int | None = None
     started_at: datetime | None = None

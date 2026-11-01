@@ -2097,6 +2097,7 @@ def _finish_runner(
         # The runner's own quality gates passed; nothing to re-validate here.
         stage.status = StageStatus.DONE
         stage.completed_at = datetime.now(timezone.utc)
+        stage.head_sha = _worktree_head(stage.worktree)
         return
     # Read captured pane output if available
     fail_log = _runner_fail_log(storage, state.project_name, fname)
@@ -2901,6 +2902,8 @@ async def advance_run(
                     run=run_idx,
                     name=run.name,
                 )
+            # The fix commits above moved the tip that gets delivered.
+            run.stages[-1].head_sha = _worktree_head(last_wt) or run.stages[-1].head_sha
 
         run.status = RunStatus.DONE
         _log(
