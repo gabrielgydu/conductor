@@ -65,6 +65,48 @@ async def test_runner_start_time_is_set_before_the_spawn(tmp_path):
     assert at_spawn == [stage.started_at] and stage.started_at is not None
 
 
+def _run_config(wt: Path) -> dict:
+    return json.loads((wt / "docs" / FNAME / "RUN-CONFIG.json").read_text())
+
+
+async def test_run_config_pins_the_preset_file_its_settings_came_from(tmp_path):
+    """The runner resolved the name again in the worktree and gated with the
+    committed copy there, not the main checkout's edited preset."""
+    state, storage, tmux, wt = launch_env(tmp_path)
+    edited = tmp_path / "repo" / ".conductor" / "preset.toml"
+    edited.parent.mkdir()
+    edited.write_text('name = "proj"\n\n[config]\nmax_gate_retries = 5\n')
+    (wt / ".conductor").mkdir()
+    (wt / ".conductor" / "preset.toml").write_text('name = "proj"\n')
+    state.preset = "proj"
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    config = _run_config(wt)
+    assert config["max_gate_retries"] == 5
+    assert (config["preset"], config["preset_path"]) == ("proj", str(edited.resolve()))
+
+
+async def test_run_config_pins_a_relative_preset_path_absolutely(tmp_path, monkeypatch):
+    """`--preset my-preset.toml` resolved against the orchestrator's cwd, not the worktree."""
+    state, storage, tmux, wt = launch_env(tmp_path)
+    (tmp_path / "my-preset.toml").write_text('name = "mine"\n')
+    monkeypatch.chdir(tmp_path)
+    state.preset = "my-preset.toml"
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    assert _run_config(wt)["preset_path"] == str(tmp_path.resolve() / "my-preset.toml")
+
+
+async def test_base_preset_has_no_file_to_pin(tmp_path):
+    state, storage, tmux, wt = launch_env(tmp_path)
+
+    await orch.start_runner(state, 0, 0, tmux, storage)
+
+    assert _run_config(wt)["preset_path"] is None
+
+
 # -- paths with spaces --------------------------------------------------------
 
 _ARGV_RECORDER = '#!/bin/bash\nprintf "%s\\n" "$PWD" "$@" > "$ARGV_OUT"\n'

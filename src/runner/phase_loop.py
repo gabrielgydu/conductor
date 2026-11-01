@@ -564,16 +564,17 @@ async def run_phase_loop(
     header(f"{cfg.feature_name.upper()} — Runner")
     log(f"Working directory: {project_dir}")
     log(f"Phases: {len(cfg.phases)}")
-    log(f"Preset: {cfg.preset or 'base'}")
+    log(f"Preset: {cfg.preset or 'base'}" + (f" ({cfg.preset_path})" if cfg.preset_path else ""))
     log(f"Steerable: {'yes' if cfg.steerable else 'no'}")
     if cfg.model:
         log(f"Model: {cfg.model}")
 
     # Preflight check
+    preset_ref = cfg.preset_path or cfg.preset
     try:
-        preset = load_preset(cfg.preset, project_dir)
+        preset = load_preset(preset_ref, project_dir)
     except (ValueError, OSError) as exc:
-        error(f"Cannot load preset {cfg.preset or 'base'!r}: {exc}")
+        error(f"Cannot load preset {preset_ref or 'base'!r}: {exc}")
         _write_exit_code(feature_dir, 1)
         return 1
     if not preset.preflight(project_dir):

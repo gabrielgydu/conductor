@@ -171,6 +171,27 @@ def write_fix(repo: Path, phase: int) -> str:
     return f"fixed <promise>P{phase}_DONE</promise>"
 
 
+async def test_runner_gates_with_the_preset_file_the_orchestrator_resolved(project, tmp_path, monkeypatch):
+    """By name the worktree resolves its committed copy of the project preset,
+    not the edited one in the main checkout that RUN-CONFIG's settings came from."""
+    repo, feature_dir = project
+    (repo / ".conductor").mkdir()
+    (repo / ".conductor" / "preset.toml").write_text(
+        'name = "proj"\n\n[[quality_gate.checks]]\nname = "removed-check"\ncommand = "false"\n'
+    )
+    _git(repo, "add", ".conductor")
+    _git(repo, "commit", "-q", "-m", "committed preset")
+    edited = tmp_path / "main-checkout" / ".conductor" / "preset.toml"
+    edited.parent.mkdir(parents=True)
+    edited.write_text('name = "proj"\n\n[[quality_gate.checks]]\nname = "unit"\ncommand = "true"\n')
+    fake = FakeClaude(repo, [write_code_and_finish])
+
+    cfg = _config(repo, feature_dir, phases=1, preset="proj", preset_path=str(edited))
+    assert await _run(cfg, feature_dir, fake, monkeypatch) == 0
+
+    assert _commits(repo)[0] == "Phase 1: Step 1"
+
+
 async def test_failing_gate_blocks_commit_and_fails_phase(project, tmp_path, monkeypatch):
     repo, feature_dir = project
     cfg = _config(repo, feature_dir, phases=1, preset=_gate_preset(tmp_path, "sh -c 'echo boom >&2; exit 3'"))

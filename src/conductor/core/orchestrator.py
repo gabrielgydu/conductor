@@ -1692,10 +1692,15 @@ async def start_runner(
             run_sh, fname, Path(wt), preset.config, quick=quick,
             is_final_stage=is_final_stage,
         )
-        # Also set the preset name so phase_loop can load it for quality gates
+        # Also set the preset so phase_loop can load it for quality gates:
+        # the very file the settings above came from. Resolving the name
+        # again in the worktree would find its committed copy of the
+        # project preset (or nothing, for a relative .toml path).
         import json  # noqa: PLC0415
         data = json.loads(config_path.read_text("utf-8"))
         data["preset"] = state.preset
+        source = getattr(preset, "source", None)
+        data["preset_path"] = str(Path(source).resolve()) if source else None
         config_path.write_text(json.dumps(data, indent=2), "utf-8")
     except Exception as exc:
         _log(

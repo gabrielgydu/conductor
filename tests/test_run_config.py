@@ -111,3 +111,12 @@ def test_manifest_without_prompt_file_or_phases_is_rejected(tmp_path):
         parse_manifest(_write(tmp_path, 'PHASES[1]="03-missing.md"\n'))
     with pytest.raises(ManifestError, match="No PHASES"):
         parse_manifest(_write(tmp_path, 'CONDUCTOR_MODEL="opus"\n'))
+
+
+def test_preset_path_round_trips(tmp_path):
+    cfg = RunConfig(feature_name="f", project_dir=str(tmp_path), preset="proj", preset_path="/abs/preset.toml")
+    cfg.save(tmp_path / "RUN-CONFIG.json")
+
+    loaded = RunConfig.load(tmp_path / "RUN-CONFIG.json")
+
+    assert (loaded.preset, loaded.preset_path) == ("proj", "/abs/preset.toml")

@@ -132,6 +132,17 @@ def test_init_on_an_existing_project_reports_and_switches_the_saved_preset(repo,
     assert _saved_preset(repo) == "myapp"
 
 
+def test_init_saves_a_relative_preset_file_as_an_absolute_path(repo, tmp_path, monkeypatch):
+    """Later loads run from elsewhere (tmux re-exec, worktrees), where the relative path is gone."""
+    (tmp_path / "my-preset.toml").write_text('name = "mine"\n')
+    monkeypatch.chdir(tmp_path)
+
+    _, _, code = run_main(["init", "--name", NAME, "--project-dir", str(repo), "--preset", "my-preset.toml"])
+
+    assert code == 0
+    assert _saved_preset(repo) == str(tmp_path.resolve() / "my-preset.toml")
+
+
 def _saved_preset(repo) -> str | None:
     from conductor.core.models import ConductorState
 
