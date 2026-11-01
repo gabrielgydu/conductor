@@ -8,7 +8,7 @@ import logging
 import shutil
 import subprocess
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from conductor.core.claude import run_claude
@@ -402,6 +402,8 @@ async def resolve_conflicts_with_claude(
 async def run_integration_merge(
     state: ConductorState,
     storage,  # StorageResolver
+    *,
+    before_publish: Callable[[Path], Awaitable[None]] | None = None,
 ) -> IntegrationState:
     """Merge the DONE runs into integration/<project> and open (or reuse) its PR.
 
@@ -412,6 +414,9 @@ async def run_integration_merge(
     or while it is not published. A checkout that has the branch, or local
     and origin branches that diverged, stop the attempt before anything
     changes (failure SETUP or DIVERGED).
+
+    *before_publish* is awaited with the worktree after new merges, before
+    validation and the push (the learnings commit); it must not raise.
     """
     eligible_runs = get_activation_order(state)
 
@@ -493,7 +498,7 @@ async def run_integration_merge(
     try:
         return await _integrate(
             state, repo_root, worktree_path, branch_name, eligible_runs, preset,
-            local=local, remote=remote,
+            local=local, remote=remote, before_publish=before_publish,
         )
     finally:
         await _remove_worktree(worktree_path, repo_root)
@@ -509,6 +514,7 @@ async def _integrate(
     *,
     local: str | None,
     remote: str | None,
+    before_publish: Callable[[Path], Awaitable[None]] | None,
 ) -> IntegrationState:
     """Merge, validate, commit, push and open the PR inside worktree *wt*.
 
@@ -667,7 +673,7 @@ async def _integrate(
 
     if new_runs:
         tip, validation_passed, e2e_result = await _finish_new_merges(
-            state, repo_root, wt, merged_runs, conflicts_resolved, preset
+            state, repo_root, wt, merged_runs, conflicts_resolved, preset, before_publish
         )
         # Move the branch only now, and only from the tip this attempt saw.
         rc, _, err = await _run_git(
@@ -731,10 +737,14 @@ async def _finish_new_merges(
     merged_runs: list[RunState],
     conflicts_resolved: list[ConflictRecord],
     preset: Preset | None,
+    before_publish: Callable[[Path], Awaitable[None]] | None,
 ) -> tuple[str, bool, E2ETestState | None]:
-    """Integration specs, validation and their commits on top of the new
-    merges; returns the new tip, whether validation passed and the
+    """Learnings, integration specs, validation and their commits on top of
+    the new merges; returns the new tip, whether validation passed and the
     integration specs' results."""
+    if before_publish is not None:
+        await before_publish(wt)
+
     # Generation and the Playwright checks below need the project's packages.
     await _link_node_modules(repo_root, wt)
 

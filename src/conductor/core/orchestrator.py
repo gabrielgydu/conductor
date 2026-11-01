@@ -314,6 +314,9 @@ async def _integrate(
         branch = run.stages[-1].branch if run.stages else None
         if not branch:
             return False
+        # Commit learnings on the run branch before it is pushed, so they
+        # reach the PR; post-run then finds them reviewed.
+        await _review_learnings_nonfatal(state, storage, log_path, audit_path)
         try:
             pr_url = await _push_and_pr_for_branch(
                 branch, state.base_branch, state.project_name, run, storage
@@ -340,8 +343,17 @@ async def _integrate(
     else:
         from conductor.integration.merge import run_integration_merge
 
+        async def record_learnings(wt: Path) -> None:
+            # Once, on the integration branch: learnings committed on each run
+            # branch would conflict in CLAUDE.md at every re-integration.
+            await _review_learnings_nonfatal(
+                state, storage, log_path, audit_path,
+                worktree=wt, branch=f"integration/{state.project_name}",
+            )
+
+        reviewed = state.learnings_reviewed
         try:
-            result = await run_integration_merge(state, storage)
+            result = await run_integration_merge(state, storage, before_publish=record_learnings)
         except Exception as exc:
             result = IntegrationState(
                 status=IntegrationStatus.FAILED,
@@ -349,6 +361,10 @@ async def _integrate(
                 failure=IntegrationFailure.SETUP,
                 failure_detail=f"integration merge raised: {exc}",
             )
+        if not result.merged_runs:
+            # The branch did not move, so a learnings commit went with the
+            # worktree: review them again next time.
+            state.learnings_reviewed = reviewed
         state.integration = _record_attempt(previous, result, done)
         if result.failure is not None and not result.merged_runs:
             message = f"Integration attempt failed ({result.failure}): {result.failure_detail}"
@@ -3450,9 +3466,10 @@ async def _review_learnings_nonfatal(
     storage: StorageResolver,
     log_path: Path | None,
     audit_path: Path | None,
+    **target,
 ) -> None:
     try:
-        await _review_learnings(state, storage, log_path, audit_path)
+        await _review_learnings(state, storage, log_path, audit_path, **target)
     except Exception as exc:
         _log(
             "POST_RUN",
@@ -3469,14 +3486,21 @@ async def _review_learnings(
     audit_path: Path | None = None,
     *,
     force: bool = False,
+    worktree: Path | None = None,
+    branch: str | None = None,
 ) -> None:
     """Fold the runs' LEARNINGS.md into the project's CLAUDE.md files.
 
-    The edits are made in the worktree of the most recently finished run and
-    committed on its branch, never in the user's own checkout. Only existing
-    CLAUDE.md files inside that worktree can be edited (a symlinked one
-    through its target there), or a root CLAUDE.md created when there is
-    none. An unchanged set of learnings is reviewed once, unless *force*.
+    The edits are made in *worktree* and committed there (on *branch*: the
+    integration worktree, before the integration is pushed), else in the
+    worktree of the only finished run and committed on its branch, never in
+    the user's own checkout. With several finished runs and no *worktree*,
+    nothing is done: their learnings are committed once on the integration
+    branch, as a commit on a run branch would conflict with that one in
+    CLAUDE.md. Only existing CLAUDE.md files inside the worktree can be
+    edited (a symlinked one through its target there), or a root CLAUDE.md
+    created when there is none. An unchanged set of learnings is reviewed
+    once, unless *force*.
     """
     import hashlib as _hashlib
 
@@ -3502,12 +3526,21 @@ async def _review_learnings(
     if state.learnings_reviewed == digest and not force:
         _log("POST_RUN", "Learnings unchanged since the last review — skipping", log_path, audit_path)
         return
-    target = _learnings_target(state)
-    if target is None:
-        _log("POST_RUN", "No finished run worktree to record learnings in — skipping",
+    target_run: RunState | None = None
+    if worktree is not None:
+        root = worktree
+    elif sum(r.status == RunStatus.DONE for r in state.runs) > 1:
+        _log("POST_RUN", "Several runs are finished: their learnings are committed on the "
+             "integration branch when runs are next merged into it — skipping",
              log_path, audit_path)
         return
-    target_run, root = target
+    else:
+        target = _learnings_target(state)
+        if target is None:
+            _log("POST_RUN", "No finished run worktree to record learnings in — skipping",
+                 log_path, audit_path)
+            return
+        target_run, root = target
     root = root.resolve()
 
     existing = _claude_md_files(root)
@@ -3565,12 +3598,25 @@ async def _review_learnings(
         return
 
     rels = [str(p.relative_to(root)) for p in changed]
-    branch = target_run.stages[-1].branch or "(detached)"
+    if target_run is not None:
+        branch = target_run.stages[-1].branch or "(detached)"
+    branch = branch or str(root)
     committed = _commit_paths(root, rels, "Record conductor learnings in CLAUDE.md")
+    if committed and target_run is not None:
+        target_run.stages[-1].head_sha = _worktree_head(str(root)) or target_run.stages[-1].head_sha
     previous = state.integration
-    delivered = previous is not None and target_run.index in previous.considered_runs
+    delivered = (
+        target_run is not None
+        and previous is not None
+        and target_run.index in previous.considered_runs
+    )
     if not committed:
         message = f"Learnings written to {', '.join(rels)} in {root} but not committed"
+    elif target_run is None:
+        message = (
+            f"Learnings committed on {branch} ({', '.join(rels)}); they go out "
+            "with the integration"
+        )
     elif delivered:
         message = (
             f"Learnings committed on {branch} ({', '.join(rels)}) in {root} after "
@@ -3945,10 +3991,6 @@ async def _conductor_run_loop(
 
         if all_terminal:
             due = _integration_due(state, force=config.reintegrate)
-            if due is not None:
-                # Commit learnings on the run branch before it is pushed or
-                # merged, so they reach the PR; post-run finds them reviewed.
-                await _review_learnings_nonfatal(state, storage, log_path, audit_path)
             if due is None or not await _integrate(
                 state, due[0], due[1], storage, log_path, audit_path
             ):

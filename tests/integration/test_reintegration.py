@@ -20,6 +20,7 @@ import pytest
 
 from conductor import cli
 from conductor.core import orchestrator as orch
+from conductor.core.brain import BrainReply
 from conductor.core.claude import ClaudeResult
 from conductor.core.enums import IntegrationFailure, IntegrationStatus, RunStatus
 from conductor.core.models import ConductorState, IntegrationState, RunState, StageState
@@ -393,3 +394,45 @@ async def test_unmergeable_runs_are_not_retried_every_session(env, monkeypatch):
     assert state.integration.failure == IntegrationFailure.NOTHING_MERGEABLE
     assert orch._integration_due(state) is None
     assert not tip(env.origin, "integration/pu")
+
+
+# ---------------------------------------------------------------------------
+# Learnings (SEAM-IO-5)
+# ---------------------------------------------------------------------------
+
+
+async def test_learnings_are_committed_once_on_the_integration_branch(env, tmp_path, monkeypatch):
+    """Each session's review used to commit CLAUDE.md on a different run
+    branch, so every re-integration conflicted in CLAUDE.md."""
+    (env.repo / "CLAUDE.md").write_text("# Project\n")
+    git(env.repo, "add", "CLAUDE.md")
+    git(env.repo, "commit", "-q", "-m", "CLAUDE.md")
+    state = three_runs(env, "pl")
+    branches = {}
+    for r in state.runs:
+        stage = r.stages[0]
+        branches[r.name] = tip(env.repo, stage.branch)
+        stage.worktree = str(tmp_path / f"wt-{r.name}")
+        git(env.repo, "worktree", "add", "-q", stage.worktree, stage.branch)
+        learnings = Path(stage.worktree) / "docs" / f"{r.name}{stage.feature_suffix}" / "LEARNINGS.md"
+        learnings.parent.mkdir(parents=True)
+        learnings.write_text(f"- learned: rule from {r.name}\n")
+
+    async def ask(prompt, **kwargs):
+        # A reviewer that adds every learning it is shown.
+        lines = sorted({line for line in prompt.splitlines() if line.startswith("- learned:")})
+        return BrainReply(text="<<<FILE: CLAUDE.md>>>\n" + "\n".join(lines) + "\n<<<END>>>", ok=True)
+
+    monkeypatch.setattr(orch.brain, "ask", ask)
+
+    await session(state, env.storage)
+    state.runs[2].status = RunStatus.DONE
+    await session(state, env.storage)
+
+    assert state.integration.status == IntegrationStatus.DONE, state.integration
+    assert state.integration.conflicts_resolved == []
+    claude_md = git(env.repo, "show", "integration/pl:CLAUDE.md")
+    for name in ("a", "b", "c"):
+        assert claude_md.count(f"- learned: rule from {name}") == 1
+    # No run branch got a learnings commit.
+    assert {r.name: tip(env.repo, r.stages[0].branch) for r in state.runs} == branches
