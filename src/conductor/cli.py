@@ -316,7 +316,8 @@ def _launch_in_tmux(
         sys.exit(1)
 
     if not _has_tty():
-        print(f"started in tmux session {session}; attach with: tmux attach -t {_tmux_target(session)}")
+        # Quoted: zsh expands an unquoted leading "=" to a command's path.
+        print(f"started in tmux session {session}; attach with: tmux attach -t '{_tmux_target(session)}'")
         sys.exit(0)
     if not os.environ.get("TMUX"):
         os.execvp("tmux", ["tmux", "attach-session", "-t", _tmux_target(session)])

@@ -6,7 +6,7 @@ Orchestration tool that runs multi-feature builds via speccer (spec loop) → ru
 
 Claude Code's bash tool has no TTY.
 
-`conductor run`, `go` and `loop` notice that and start their tmux session detached instead of attaching to it: they print `started in tmux session <s>; attach with: tmux attach -t =<s>:` and exit 0.
+`conductor run`, `go` and `loop` notice that and start their tmux session detached instead of attaching to it: they print `started in tmux session <s>; attach with: tmux attach -t '=<s>:'` and exit 0.
 
 **Simplest recipe — run the plain command, then monitor:**
 
@@ -14,8 +14,8 @@ Claude Code's bash tool has no TTY.
 conductor run --name <project> --project-dir <path>
 
 # Monitor (`go` uses the same session; `loop` uses conductor-loop-<name>, window `loop`)
-tmux capture-pane -t =conductor-<project>:=conductor -p 2>&1 | tail -20
-tmux list-windows -t =conductor-<project>: 2>&1
+tmux capture-pane -t '=conductor-<project>:=conductor' -p 2>&1 | tail -20
+tmux list-windows -t '=conductor-<project>:' 2>&1
 conductor status --name <project> --project-dir <path>
 ```
 
@@ -70,7 +70,7 @@ conductor go \
 
 ### Running from Claude Code (no TTY)
 
-Plain `conductor go ...` starts the detached session `conductor-<name>` (see the recipe above); monitor it with `tmux capture-pane -t =conductor-<name>:=conductor -p | tail -20` and `conductor status --name <name> --project-dir <path>`.
+Plain `conductor go ...` starts the detached session `conductor-<name>` (see the recipe above); monitor it with `tmux capture-pane -t '=conductor-<name>:=conductor' -p | tail -20` and `conductor status --name <name> --project-dir <path>`.
 
 With `--inside-tmux` you create the session and send the command yourself, as in the alternative recipe above.
 
@@ -122,7 +122,7 @@ conductor loop \
 
 ### Running from Claude Code (no TTY)
 
-Plain `conductor loop ...` starts the detached session `conductor-loop-<name>` (window `loop`); monitor it with `tmux capture-pane -t =conductor-loop-<name>:=loop -p | tail -20` and `conductor loop-status --name <name> --project-dir <path>`.
+Plain `conductor loop ...` starts the detached session `conductor-loop-<name>` (window `loop`); monitor it with `tmux capture-pane -t '=conductor-loop-<name>:=loop' -p | tail -20` and `conductor loop-status --name <name> --project-dir <path>`.
 
 With `--inside-tmux` you create the session and send the command yourself, as in the alternative recipe at the top.
 

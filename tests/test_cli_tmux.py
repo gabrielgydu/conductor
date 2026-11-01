@@ -220,7 +220,7 @@ def test_without_a_tty_the_session_is_left_detached(project, fake_tmux, execvp, 
     out, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project)])
 
     assert code == 0
-    assert "started in tmux session conductor-foo; attach with: tmux attach -t =conductor-foo:" in out
+    assert "started in tmux session conductor-foo; attach with: tmux attach -t '=conductor-foo:'" in out
     assert execvp == []
     assert "conductor-foo" in fake_tmux.sessions
 
