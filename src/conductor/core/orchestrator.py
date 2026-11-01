@@ -530,7 +530,10 @@ def _merge_dependencies(wt: Path, branch: str, dep_branches: list[str]) -> list[
     Returns the branches merged by this call. Idempotent: a branch already
     in HEAD is skipped, and a merge a crash left half-done is aborted and
     redone. On a conflict the merge is aborted (the worktree stays clean)
-    and DependencyMergeError names the conflicting files.
+    and DependencyMergeError names the conflicting files. Like the
+    integration merge, the merge commit skips hooks: in the fresh worktree a
+    hook can fail for reasons unrelated to the code (husky without
+    node_modules), and the runner's own checks run afterwards.
     """
     def merging() -> bool:
         return _git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
@@ -541,7 +544,10 @@ def _merge_dependencies(wt: Path, branch: str, dep_branches: list[str]) -> list[
     for dep in dep_branches:
         if _git(wt, "merge-base", "--is-ancestor", dep, "HEAD").returncode == 0:
             continue
-        r = _git(wt, "merge", "--no-edit", "-m", f"Merge dependency {dep} into {branch}", dep)
+        r = _git(
+            wt, "merge", "--no-verify", "--no-edit",
+            "-m", f"Merge dependency {dep} into {branch}", dep,
+        )
         if r.returncode != 0:
             conflicts = _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
             if merging():
@@ -3268,8 +3274,12 @@ def _with_learnings(existing: str, addition: str) -> str:
 
 
 def _commit_paths(root: Path, rels: list[str], message: str) -> bool:
-    """Commit just *rels* in the git checkout at *root*; False if git refused."""
-    for cmd in (["git", "add", "--", *rels], ["git", "commit", "-q", "-m", message, "--", *rels]):
+    """Commit just *rels* in the git checkout at *root*; False if git refused.
+
+    Skips hooks, like every commit conductor makes outside the runner.
+    """
+    commit = ["git", "commit", "-q", "--no-verify", "-m", message, "--", *rels]
+    for cmd in (["git", "add", "--", *rels], commit):
         if subprocess.run(cmd, cwd=root, capture_output=True, text=True).returncode != 0:
             return False
     return True
