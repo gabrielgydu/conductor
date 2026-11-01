@@ -121,6 +121,19 @@ def test_plan_refuses_while_a_run_holds_the_project(repo, other_holder, monkeypa
     assert "already working on this project" in out
 
 
+def test_learnings_refuses_while_a_run_holds_the_project(repo, other_holder, monkeypatch):
+    seed_state(repo)
+    other_holder(StorageResolver(repo).conductor_dir(NAME))
+    monkeypatch.setattr(
+        "conductor.core.orchestrator._review_learnings", lambda *a, **k: pytest.fail("reviewed anyway")
+    )
+
+    out, _, code = run_main(["learnings", "--name", NAME, "--project-dir", str(repo)])
+
+    assert code == 1
+    assert "already working on this project" in out
+
+
 def test_go_hands_the_lock_to_the_tmux_process(repo, monkeypatch):
     seed_state(repo)
     write_brief(repo)

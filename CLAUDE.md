@@ -4,9 +4,30 @@ Orchestration tool that runs multi-feature builds via speccer (spec loop) → ru
 
 ## Running Conductor from Claude Code
 
-Claude Code's bash tool has no TTY, so `conductor run` will fail with "open terminal failed: not a terminal".
+Claude Code's bash tool has no TTY.
 
-**Workaround — use tmux send-keys:**
+`conductor run`, `go` and `loop` notice that and start their tmux session detached instead of attaching to it: they print `started in tmux session <s>; attach with: tmux attach -t =<s>:` and exit 0.
+
+**Simplest recipe — run the plain command, then monitor:**
+
+```bash
+conductor run --name <project> --project-dir <path>
+
+# Monitor (`go` uses the same session; `loop` uses conductor-loop-<name>, window `loop`)
+tmux capture-pane -t =conductor-<project>:=conductor -p 2>&1 | tail -20
+tmux list-windows -t =conductor-<project>: 2>&1
+conductor status --name <project> --project-dir <path>
+```
+
+Run it once: a second `conductor run` for the same project is refused while the first holds the project lock.
+
+Re-running the same command after the orchestrator died resumes the run and adopts runners that are still working in the session.
+
+**Alternative — drive the session yourself with `--inside-tmux`:**
+
+Use this when you want to choose the session name or window.
+
+Do not run the plain command first: it already created `conductor-<project>`, and `tmux new-session` would fail with "duplicate session".
 
 ```bash
 # 1. Create detached tmux session
@@ -21,6 +42,8 @@ tmux capture-pane -t conductor-<project>:conductor -p 2>&1 | tail -20
 tmux list-windows -t conductor-<project> 2>&1
 conductor status --name <project> --project-dir <path>
 ```
+
+For `go` and `loop` replace the command (and add `--plan`); `loop` uses session `conductor-loop-<name>` and window `loop`.
 
 Key flags:
 - `--inside-tmux`: run the loop directly without creating a new tmux session
@@ -47,16 +70,9 @@ conductor go \
 
 ### Running from Claude Code (no TTY)
 
-```bash
-tmux new-session -d -s conductor-go-<name> -n conductor
+Plain `conductor go ...` starts the detached session `conductor-<name>` (see the recipe above); monitor it with `tmux capture-pane -t =conductor-<name>:=conductor -p | tail -20` and `conductor status --name <name> --project-dir <path>`.
 
-tmux send-keys -t conductor-go-<name>:conductor \
-  "conductor go --inside-tmux --name <name> --project-dir <path> --plan <brief.md>" Enter
-
-# Monitor
-tmux capture-pane -t conductor-go-<name>:conductor -p 2>&1 | tail -20
-conductor status --name <name> --project-dir <path>
-```
+With `--inside-tmux` you create the session and send the command yourself, as in the alternative recipe above.
 
 ### Phase resume logic
 
@@ -105,16 +121,11 @@ conductor loop \
 
 ### Running from Claude Code (no TTY)
 
-```bash
-tmux new-session -d -s conductor-loop-<name> -n loop
+Plain `conductor loop ...` starts the detached session `conductor-loop-<name>` (window `loop`); monitor it with `tmux capture-pane -t =conductor-loop-<name>:=loop -p | tail -20` and `conductor loop-status --name <name> --project-dir <path>`.
 
-tmux send-keys -t conductor-loop-<name>:loop \
-  "conductor loop --inside-tmux --name <name> --project-dir <path> --plan <plan.md>" Enter
+With `--inside-tmux` you create the session and send the command yourself, as in the alternative recipe at the top.
 
-# Monitor
-tmux capture-pane -t conductor-loop-<name>:loop -p 2>&1 | tail -20
-conductor loop-status --name <name> --project-dir <path>
-```
+A relative `--plan` is resolved against the current directory, as for `go`; if nothing exists there, `--project-dir` is tried next, with a printed note.
 
 ### Plan file format
 

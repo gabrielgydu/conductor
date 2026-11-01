@@ -113,6 +113,27 @@ async def test_unchanged_learnings_are_reviewed_once(project, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_review_persists_only_its_own_field(project, monkeypatch):
+    # `conductor learnings` holds a snapshot for minutes; a live orchestrator
+    # saves progress meanwhile, and that progress must survive the review.
+    from conductor.core.models import atomic_save
+
+    path = project.storage.conductor_state("p")
+    newer = project.state.model_copy(deep=True)
+    newer.runs[0].status = RunStatus.ACTIVE
+    newer.runs[0].current_stage = 0
+    atomic_save(newer, path)
+    monkeypatch.setattr(brain, "run_claude", _FakeClaude("<<<FILE: CLAUDE.md>>>\n- A rule.\n<<<END>>>\n"))
+
+    await orch._review_learnings(project.state, project.storage)
+
+    saved = ConductorState.model_validate_json(path.read_text(encoding="utf-8"))
+    assert saved.runs[0].status == RunStatus.ACTIVE
+    assert saved.runs[0].current_stage == 0
+    assert saved.learnings_reviewed == project.state.learnings_reviewed is not None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("integrated", "expected"),
     [([], "they go out with the run's PR"), ([0], "push or merge it by hand")],

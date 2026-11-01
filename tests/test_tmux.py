@@ -148,6 +148,7 @@ async def test_every_tmux_target_is_exact(recorder, tmp_path):
     assert targets == {
         ("has-session", "=conductor-foo"),
         ("kill-session", "=conductor-foo"),
+        ("set-environment", "=conductor-foo"),  # a session that already exists
         ("list-windows", "=conductor-foo"),
         # without the colon tmux reads a new-window target as a window name
         ("new-window", "=conductor-foo:"),
@@ -232,3 +233,34 @@ def test_pstree_depth_counts_processes_not_threads():
     finally:
         proc.kill()
         proc.wait()
+
+
+async def test_ensure_session_new_session_carries_the_forwarded_env(recorder, monkeypatch):
+    # Windows of a session made here (--inside-tmux) must see the caller's
+    # CONDUCTOR_HOME/PRESETS_DIR, not the tmux server's environment.
+    monkeypatch.setenv("CONDUCTOR_HOME", "/x y")
+    monkeypatch.setenv("PATH", "/opt/bin:/usr/bin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+    monkeypatch.setattr(TmuxManager, "session_exists", lambda _self: False)
+
+    await TmuxManager("conductor-foo").ensure_session()
+
+    (new,) = recorder.commands("new-session")
+    forwarded = {new[i + 1] for i, o in enumerate(new) if o == "-e"}
+    assert "CONDUCTOR_HOME=/x y" in forwarded
+    assert "PATH=/opt/bin:/usr/bin" in forwarded
+    assert not any(v.startswith("ANTHROPIC_") for v in forwarded)
+    assert recorder.commands("set-environment") == []
+
+
+async def test_ensure_session_updates_the_environment_of_an_existing_session(recorder, monkeypatch):
+    monkeypatch.setenv("CONDUCTOR_HOME", "/x y")
+    monkeypatch.setenv("PATH", "/opt/bin:/usr/bin")
+
+    await TmuxManager("conductor-foo").ensure_session()
+
+    assert recorder.commands("new-session") == []
+    env = {c[3]: c[4] for c in recorder.commands("set-environment")}
+    assert env["CONDUCTOR_HOME"] == "/x y"
+    assert env["PATH"] == "/opt/bin:/usr/bin"
+    assert all(c[1:3] == ["-t", "=conductor-foo"] for c in recorder.commands("set-environment"))

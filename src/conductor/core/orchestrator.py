@@ -3463,7 +3463,15 @@ async def _review_learnings(
             changed.append(target_file)
 
     state.learnings_reviewed = digest
-    atomic_save(state, storage.conductor_state(state.project_name))
+    # Persist only this field: the caller's snapshot may be older than the file
+    # (`conductor learnings` runs for minutes next to a live orchestrator).
+    state_path = storage.conductor_state(state.project_name)
+    try:
+        on_disk = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        on_disk = state
+    on_disk.learnings_reviewed = digest
+    atomic_save(on_disk, state_path)
     if not changed:
         _log("POST_RUN", "Learnings review: no changes needed", log_path, audit_path)
         return

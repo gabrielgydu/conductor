@@ -162,3 +162,64 @@ def test_new_session_gets_the_callers_conductor_env_and_path(project, fake_tmux,
     assert "CONDUCTOR_PRESETS_DIR=/presets with space" in forwarded
     assert "PATH=/opt/claude/bin:/usr/bin" in forwarded
     assert not any(v.startswith("ANTHROPIC_") for v in forwarded)  # never put secrets in argv
+
+
+def test_run_reuses_a_session_whose_orchestrator_died_but_runner_works(project, fake_tmux, execvp):
+    # Ctrl-C in the orchestrator pane: it is dead, the runner window keeps working.
+    fake_tmux.sessions["conductor-foo"] = [
+        ("1", "4242", "conductor", "python3"),
+        ("0", "4243", "run0:backend-exec", "python3"),
+    ]
+
+    out, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project)])
+
+    assert code == 0, out
+    assert "still running" not in out
+    assert "new-session" not in fake_tmux.commands()
+    assert "kill-session" not in fake_tmux.commands()
+    assert ("kill-window", "-t", "=conductor-foo:=conductor") in fake_tmux.calls
+    new = next(c for c in fake_tmux.calls if c[0] == "new-window")
+    assert new[new.index("-t") + 1] == "=conductor-foo:"
+    assert new[new.index("-n") + 1] == "conductor"
+    assert list(new).count(";") == 2  # remain-on-exit and pipe-pane
+    assert "run0:backend-exec" in {p[2] for p in fake_tmux.sessions["conductor-foo"]}
+    assert execvp == [["tmux", "attach-session", "-t", "=conductor-foo:"]]
+
+
+def test_run_still_refuses_when_the_orchestrator_window_is_busy(project, fake_tmux, execvp):
+    fake_tmux.sessions["conductor-foo"] = [
+        ("0", "4242", "conductor", "python3"),
+        ("0", "4243", "run0:backend-exec", "python3"),
+    ]
+
+    out, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project)])
+
+    assert code == 1
+    assert "still running" in out
+    assert "new-window" not in fake_tmux.commands()
+
+
+def test_loop_refuses_when_a_runner_is_busy_even_if_its_window_is_dead(project, fake_tmux, execvp, tmp_path):
+    plan = tmp_path / "plan.md"
+    plan.write_text("- [ ] one\n")
+    fake_tmux.sessions["conductor-loop-l"] = [
+        ("1", "4242", "loop", "python3"),
+        ("0", "4243", "task", "claude"),
+    ]
+
+    out, _, code = run_main(["loop", "--name", "l", "--project-dir", str(project), "--plan", str(plan), "--no-worktree"])
+
+    assert code == 1
+    assert "still running" in out
+    assert "new-window" not in fake_tmux.commands()
+
+
+def test_without_a_tty_the_session_is_left_detached(project, fake_tmux, execvp, monkeypatch):
+    monkeypatch.setattr(cli, "_has_tty", lambda: False)
+
+    out, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project)])
+
+    assert code == 0
+    assert "started in tmux session conductor-foo; attach with: tmux attach -t =conductor-foo:" in out
+    assert execvp == []
+    assert "conductor-foo" in fake_tmux.sessions

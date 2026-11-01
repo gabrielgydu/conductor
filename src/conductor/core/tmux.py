@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 import subprocess
@@ -49,6 +50,26 @@ def session_target(session: str) -> str:
     return f"={session}"
 
 
+def forwarded_vars() -> dict[str, str]:
+    """The variables a window started by a running tmux server must still see.
+
+    A command started by an already running tmux server gets the server's
+    environment, not ours: without these, `CONDUCTOR_HOME=... conductor run`
+    would read the state in one place and run from another. Values end up in
+    tmux's argv, so only non-secret variables are forwarded.
+    """
+    names = sorted(k for k in os.environ if k.startswith("CONDUCTOR_")) + ["PATH", "PYTHONPATH"]
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def forwarded_env() -> list[str]:
+    """`-e NAME=VALUE` options for tmux new-session/new-window."""
+    opts: list[str] = []
+    for name, value in forwarded_vars().items():
+        opts += ["-e", f"{name}={value}"]
+    return opts
+
+
 def window_target(session: str, window: str) -> str:
     """Exact-match ``-t`` target for *window* in *session* (both names exact).
 
@@ -94,11 +115,21 @@ class TmuxManager:
         return r.returncode == 0
 
     async def ensure_session(self) -> None:
-        """Create tmux session if it doesn't exist."""
+        """Create tmux session if it doesn't exist.
+
+        Windows inherit the session environment, so a new session gets this
+        invocation's CONDUCTOR_*/PATH values and a reused one is updated to them.
+        """
         if not self.session_exists():
             self._run_tmux(
                 "new-session", "-d", "-s", self._session_name,
-                "-x", "200", "-y", "50",
+                "-x", "200", "-y", "50", *forwarded_env(),
+            )
+            return
+        for name, value in forwarded_vars().items():
+            self._run_tmux(
+                "set-environment", "-t", session_target(self._session_name), name, value,
+                check=False,
             )
 
     def _enable_logging(self, window_name: str, log_file: Path) -> None:
