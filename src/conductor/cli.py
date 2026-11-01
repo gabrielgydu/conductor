@@ -994,6 +994,8 @@ def _cmd_run(args):
         # Re-exec inside tmux session
         reexec = _self_argv("run", "--inside-tmux", "--name", args.name, "--project-dir", str(repo_path))
         reexec.extend(_run_override_flags(overrides))
+        if getattr(args, "reintegrate", False):
+            reexec.append("--reintegrate")
 
         _unlock_project(storage, args.name)
         _launch_in_tmux(
@@ -1011,6 +1013,7 @@ def _cmd_run(args):
             max_parallel=state.max_parallel,
             project_root=repo_path,
             overnight=state.overnight,
+            reintegrate=getattr(args, "reintegrate", False),
         )
 
         print(f"Starting conductor run: {state.project_name}")
@@ -1106,9 +1109,19 @@ def _cmd_status(args):
     )
 
     if state.integration:
-        status = state.integration.status
-        s = status.value if hasattr(status, "value") else str(status)
-        print(f"  Integration: {s} (branch: {state.integration.branch})")
+        from conductor.core.orchestrator import _integration_retry_note
+
+        integration = state.integration
+        if integration.pr_url:
+            pr = f"PR: {integration.pr_url}"
+        elif integration.published is False:
+            pr = "not published"
+        else:
+            pr = "no PR recorded"
+        print(f"  Integration: {integration.status} (branch: {integration.branch}, {pr})")
+        note = _integration_retry_note(integration)
+        if note:
+            print(f"  {yellow}Integration {note}{reset}")
 
 
 def _cmd_log(args):
@@ -1627,6 +1640,12 @@ def _cmd_validate(args):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
+_REINTEGRATE_HELP = (
+    "Attempt the integration once more when all runs are finished, even if "
+    "it is not due (e.g. after a failure that is not retried automatically)"
+)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="conductor", description="Conductor orchestration tool"
@@ -1665,6 +1684,7 @@ def main():
     )
     p_go.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project)")
     p_go.add_argument("--worktrees-base", default=None, help="Base directory for worktrees")
+    p_go.add_argument("--reintegrate", action="store_true", help=_REINTEGRATE_HELP)
     p_go.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
     p_run = subparsers.add_parser("run", help="Execute the orchestration loop")
@@ -1677,6 +1697,7 @@ def main():
     )
     p_run.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project; 0=unlimited)")
     p_run.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../worktrees)")
+    p_run.add_argument("--reintegrate", action="store_true", help=_REINTEGRATE_HELP)
     p_run.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
     p_status = subparsers.add_parser("status", help="Show run status")

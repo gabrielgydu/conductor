@@ -142,3 +142,24 @@ def test_no_overnight_wins_over_deprecated_overnight(repo, loop_calls):
     run_main(_inside(repo, "--overnight", "--no-overnight"))
 
     assert loop_calls[0][1].overnight is False
+
+
+# ── --reintegrate ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("command", [_inside, _go_inside])
+def test_reintegrate_reaches_orchestrator_config(repo, loop_calls, command):
+    seed_state(repo)
+
+    _, _, code = run_main(command(repo, "--reintegrate"))
+
+    assert code == 0
+    assert loop_calls[0][1].reintegrate is True
+
+
+def test_integration_is_not_forced_without_reintegrate(repo, loop_calls):
+    seed_state(repo)
+
+    run_main(_inside(repo))
+
+    assert loop_calls[0][1].reintegrate is False

@@ -162,3 +162,10 @@ def test_new_session_gets_the_callers_conductor_env_and_path(project, fake_tmux,
     assert "CONDUCTOR_PRESETS_DIR=/presets with space" in forwarded
     assert "PATH=/opt/claude/bin:/usr/bin" in forwarded
     assert not any(v.startswith("ANTHROPIC_") for v in forwarded)  # never put secrets in argv
+
+
+def test_run_reexec_forwards_reintegrate(project, fake_tmux, execvp):
+    _, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project), "--reintegrate"])
+
+    assert code == 0
+    assert "--reintegrate" in _reexec_argv(fake_tmux)
