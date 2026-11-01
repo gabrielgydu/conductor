@@ -13,11 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from conductor.core.claude import ClaudeResult, run_claude
+from conductor.core.stream_filter import describe_result
 
 PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
 # Diagnosis calls answer from the context they are given in one turn; a tool
-# call would only burn that turn.
+# call would only burn that turn. `--tools` limits the built-in tools only:
+# MCP tools (the owner's claude.ai connectors such as Gmail, user and project
+# servers) stay, auto-approved under --dangerously-skip-permissions, so ask()
+# also passes --strict-mcp-config, which loads no MCP server.
 NO_TOOLS = ""
 
 
@@ -44,10 +48,14 @@ def read_reply(result: ClaudeResult) -> BrainReply:
     top-level assistant text written after the last tool call is used: text
     before a tool call is a preamble ("Let me check the code first"), not the
     answer.
+
+    A failed call's detail carries the CLI's own reason (an expired login, an
+    unknown model, the turn limit), or the last line of its stderr.
     """
     final: str | None = None
     failed_result = False
     subtype = ""
+    result_event: dict | None = None
     blocks: list[str] = []
     for line in result.output.splitlines():
         line = line.strip()
@@ -75,14 +83,22 @@ def read_reply(result: ClaudeResult) -> BrainReply:
                 elif block.get("type") == "tool_use":
                     blocks = []
         elif etype == "result":
+            result_event = event
             subtype = str(event.get("subtype") or "")
             failed_result = bool(event.get("is_error")) or subtype.startswith("error")
             if isinstance(event.get("result"), str):
                 final = event["result"]
 
     text = (final if final and final.strip() else "\n\n".join(blocks)).strip()
-    if result.exit_code != 0 or failed_result:
-        detail = f"claude exited {result.exit_code}" + (f" ({subtype})" if subtype else "")
+    if result.failed or failed_result:
+        label, _, why = describe_result(result.result_event or result_event or {})
+        stderr = result.stderr.strip().splitlines()
+        why = why or (stderr[-1] if stderr else "")
+        detail = (
+            f"claude exited {result.exit_code}"
+            + (f" ({label})" if label else "")
+            + (f": {why[:300]}" if why else "")
+        )
         return BrainReply(text, False, detail, result.tokens_used, subtype)
     if not text:
         return BrainReply("", False, "empty reply", result.tokens_used, subtype)
@@ -101,9 +117,10 @@ async def ask(
     """Run one brain call; never raises for CLI or timeout failures.
 
     *tools* is passed as ``--tools`` (``""`` disables the built-in tools,
-    None keeps the CLI default set).
+    None keeps the CLI default set), with ``--strict-mcp-config`` so that a
+    restricted call gets no MCP tools either.
     """
-    append_args = ["--tools", tools] if tools is not None else None
+    append_args = ["--tools", tools, "--strict-mcp-config"] if tools is not None else None
     try:
         result = await asyncio.wait_for(
             run_claude(

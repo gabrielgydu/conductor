@@ -131,6 +131,20 @@ def test_final_message_skips_background_subagent_text():
     assert sc._detect_promise(sc._final_message_text(out)) == "NEEDS_INPUT"
 
 
+def test_verdict_survives_a_later_background_task_turn():
+    # Recorded shape (owner pane logs): the verdict ends one turn, then the
+    # CLI wakes the agent for a background task's notification and it answers
+    # without a token.
+    out = _stream(
+        _text(f"Questions written.\n{NEEDS_INPUT}"),
+        _result(f"Questions written.\n{NEEDS_INPUT}", index=0),
+        json.dumps({"type": "system", "subtype": "task_notification", "status": "completed"}),
+        _text("The background task completed; no action needed."),
+        _result("The background task completed; no action needed.", index=1),
+    )
+    assert sc._detect_promise(sc._final_message_text(out)) == "NEEDS_INPUT"
+
+
 def test_final_message_skips_earlier_turn_text():
     out = _stream(
         _text(f"Plan: I will only emit {COMPLETE} once every question is answered."),
@@ -177,6 +191,18 @@ async def test_token_only_in_tool_input_does_not_complete_spec(spec_dir, fake_cl
     assert code == 1
     assert sc.read_status(spec_dir) == "INIT"
     assert len(fake_claude.prompts) == 1, "generate must not run without a verdict"
+
+
+@pytest.mark.asyncio
+async def test_first_round_verdict_before_background_chatter_is_kept(spec_dir, fake_claude):
+    fake_claude.outputs = [_stream(
+        _result(f"Spec drafted, questions written.\n{NEEDS_INPUT}", index=0),
+        _result("Last background task done. All clear.", index=1),
+    )]
+
+    assert await _run(spec_dir) == 0
+
+    assert sc.read_status(spec_dir) == "NEEDS_INPUT"
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +399,22 @@ async def test_human_reset_after_cap_resumes_without_questions(spec_dir, fake_cl
 
 
 @pytest.mark.asyncio
+async def test_answer_instructions_follow_the_question_template(spec_dir, fake_claude, capsys):
+    template = (sc._PROMPTS_DIR / "spec-prompt.md").read_text()
+    assert "**Answer:**\n(user will add answer here starting with > )" in template
+    assert "**Answer:**" in sc.ANSWER_HOW and "'> '" in sc.ANSWER_HOW
+
+    fake_claude.outputs = [_stream(_result(f"Questions written.\n{NEEDS_INPUT}"))]
+    (spec_dir / "domains" / "01-core.md").write_text("# Core\n", encoding="utf-8")
+    (spec_dir / "QUESTIONS.md").write_text("### Q1: Auth\n\n**Answer:**\n", encoding="utf-8")
+    assert await _run(spec_dir) == 0
+    assert await _run(spec_dir, cont=True) == 1  # nothing answered yet
+
+    printed = capsys.readouterr().err
+    assert printed.count(sc.ANSWER_HOW) == 2
+
+
+@pytest.mark.asyncio
 async def test_continue_still_needs_answers_to_open_questions(spec_dir, fake_claude):
     sc.update_status(spec_dir, "NEEDS_INPUT")
     (spec_dir / "QUESTIONS.md").write_text(
@@ -475,6 +517,15 @@ def test_codex_review_is_one_foreground_attempt(spec_dir):
     for prompt in prompts:
         assert "in the foreground (not `run_in_background`)" in prompt
         assert "single Codex attempt" in prompt
+
+
+def test_codex_request_travels_in_a_file(spec_dir):
+    # The companion re-splits a one-argument task and reads '-m pytest' in it
+    # as a model; '--prompt-file' keeps the request out of its option parser.
+    prompt = sc.build_spec_prompt(spec_dir, "feat", "backend", "INIT", 1)
+    section = prompt[prompt.index("## Second Opinion"):]
+    assert "`--prompt-file <path>`: no task text" in section
+    assert "-m " not in section and "o3" not in section
 
 
 @pytest.mark.parametrize("mode", ["fullstack", "backend", "frontend", "testing"])

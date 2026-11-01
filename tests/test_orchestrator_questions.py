@@ -16,11 +16,18 @@ from conductor.core.claude import ClaudeResult
 from conductor.core.enums import RunStatus, StageStatus
 from conductor.core.models import ConductorState, RunState, StageState
 from conductor.core.orchestrator import ConductorConfig, advance_run
+from speccer import cli as speccer_cli
 
 QUESTIONS = (
     "## Round 1 Questions\n\n"
     "### Q1: Scope\n**Question:** Which endpoints?\n**Answer:**\n\n---\n\n"
     "### Q2: Auth\n**Question:** Which auth method?\n**Answer:**\n"
+)
+# Q1 and Q2 answered in place; "(Qn)" marks where a test puts an answer.
+THREE_QUESTIONS = (
+    "### Q1: Scope\n**Answer:**\n(Q1)\n> All endpoints.\n\n"
+    "### Q2: Auth\n**Answer:**\n> JWT.\n\n"
+    "### Q3: Writes\n**Answer:**\n(Q3)\n"
 )
 # speccer answered Q2 itself and left Q1 and Q3 open, as real rounds have.
 PARTLY_SELF_ANSWERED = (
@@ -136,7 +143,7 @@ async def test_answers_are_the_final_message_not_the_preamble(tmp_path, monkeypa
     assert "Let me check" not in text
     # Grounded in the project's code, read-only.
     assert fake.calls[0]["cwd"] == str(tmp_path / "wt")
-    assert fake.calls[0]["append_args"] == ["--tools", "Read,Grep,Glob"]
+    assert fake.calls[0]["append_args"] == ["--tools", "Read,Grep,Glob", "--strict-mcp-config"]
 
 
 @pytest.mark.asyncio
@@ -187,10 +194,20 @@ async def test_failed_answer_call_backs_off_and_skips_continue(tmp_path, monkeyp
         # asked again after an earlier answer: open again
         ("### Q1: a\n> ### Q1\n> yes\n## Round 2\n### Q1: c\n**Answer:**\n", ["1"]),
         ("Which auth method should we use?\n", None),
+        # a person's numbered block below the last question
+        (QUESTIONS + "\n> 1. All of them.\n> 2. JWT.\n", []),
+        (QUESTIONS + "\n> **1.** All of them.\n> **2)** JWT.\n", []),
+        (QUESTIONS + "\n> 1. **Q1 (Scope):** All.\n> 2. **Q2 (Auth):** JWT.\n", []),
+        (QUESTIONS + "\n> 1. All of them.\n", ["2"]),
+        # a numbered list inside one answer stays with its question
+        (THREE_QUESTIONS.replace("(Q3)", "> 1. Validate input\n> 2. Save"), []),
+        (THREE_QUESTIONS.replace("(Q1)", "> 1. Validate input\n> 2. Save"), ["3"]),
     ],
     ids=[
         "unanswered", "self-answered", "placeholders", "answered-inline",
         "auto-answered", "auto-answer-partial", "asked-again", "no-headings",
+        "numbered-block", "numbered-bold", "numbered-labelled", "numbered-partial",
+        "list-in-last-answer", "list-in-first-answer",
     ],
 )
 def test_open_questions(text, still_open):
@@ -232,7 +249,9 @@ async def test_partly_self_answered_questions_wait_for_a_human(tmp_path, monkeyp
     tmux.spawn_runner_in_window.assert_not_awaited()
     run = state.runs[0]
     assert orch._waiting_reason(state, run, False, datetime.now(timezone.utc)) == "human"
-    assert "answer questions Q1, Q3 in" in orch._questions_waiting_message(state, run, False)
+    message = orch._questions_waiting_message(state, run, False)
+    assert "answer questions Q1, Q3 in" in message
+    assert speccer_cli.ANSWER_HOW in message
 
 
 @pytest.mark.asyncio
@@ -316,6 +335,43 @@ async def test_human_answers_after_the_auto_answer_cap_continue(tmp_path, monkey
     assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]
 
 
+def test_answers_after_the_cap_must_be_new(tmp_path):
+    """The answers the last --continue already had do not lift the cap."""
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, _, spec = _env(tmp_path, questions=answered)
+    run = state.runs[0]
+    stage = run.stages[0]
+    stage.question_rounds = orch.MAX_AUTO_QUESTION_ROUNDS
+    stage.questions_digest = orch._questions_digest(spec / "QUESTIONS.md")
+
+    assert orch._awaits_human(run, stage, overnight=True)
+    (spec / "QUESTIONS.md").write_text(answered + "> Q2: sessions expire after a day.\n")
+    assert not orch._awaits_human(run, stage, overnight=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("code", "failures"), [(0, 1), (1, 1)])
+async def test_continue_round_that_asks_nothing_new(tmp_path, monkeypatch, code, failures):
+    """A clean round that asks nothing new is counted; a failed one keeps its answers usable."""
+    answered = QUESTIONS.replace("**Answer:**\n", "**Answer:**\n> Use JWT\n")
+    state, storage, _ = _env(tmp_path, questions=answered)
+    state.overnight = False
+    tmux = _tmux()
+
+    def spawn(name, cmd, *, exit_file, **_):
+        Path(exit_file).write_text(str(code))  # QUESTIONS.md left as it was
+
+    tmux.spawn_runner_in_window = AsyncMock(side_effect=spawn)
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    stage = state.runs[0].stages[0]
+    assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+    assert stage.spec_failures == failures
+    # After a clean round the same answers are stale; after a failed one they are not.
+    assert orch._awaits_human(state.runs[0], stage, overnight=False) == (code == 0)
+
+
 # ---------------------------------------------------------------------------
 # speccer exits that leave the spec waiting for input
 # ---------------------------------------------------------------------------
@@ -352,3 +408,65 @@ def test_clean_speccer_exit_resets_the_failure_count(tmp_path):
 
     assert stage.spec_failures == 1
     assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+
+
+@pytest.mark.parametrize("overnight", [True, False])
+def test_speccer_stopped_for_a_human_waits_without_counting(tmp_path, overnight):
+    """EXIT_NEEDS_HUMAN after rejected SPEC_COMPLETEs: no failure, a person's turn."""
+    from speccer.cli import EXIT_NEEDS_HUMAN, MAX_REJECTED_COMPLETIONS
+
+    state, storage, spec = _env(tmp_path, questions="")
+    with (spec / "PROGRESS.md").open("a") as f:
+        f.write(f"REJECTED_COMPLETIONS: {MAX_REJECTED_COMPLETIONS}\n")
+    stage = state.runs[0].stages[0]
+    stage.spec_failures = orch.MAX_SPEC_FAILURES - 1  # the two rejections before
+
+    _speccer_exits(state, storage, EXIT_NEEDS_HUMAN)
+
+    assert stage.status == StageStatus.SPEC_NEEDS_INPUT
+    assert stage.spec_failures == 0
+    run = state.runs[0]
+    assert orch._awaits_human(run, stage, overnight)
+
+    # A person resolved the markers and reset the count: conductor goes on.
+    (spec / "PROGRESS.md").write_text("STATUS: NEEDS_INPUT\nREJECTED_COMPLETIONS: 0\n")
+    assert not orch._awaits_human(run, stage, overnight)
+
+
+# ---------------------------------------------------------------------------
+# rounds speccer continues without answers
+# ---------------------------------------------------------------------------
+
+# What spec agents leave in QUESTIONS.md when they have no questions.
+NO_OPEN_QUESTIONS = "# Questions\n\nNo open questions. Spec is complete.\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overnight", [True, False])
+@pytest.mark.parametrize(
+    ("questions", "rejected"),
+    [("", 0), (NO_OPEN_QUESTIONS, 1), (QUESTIONS, 1)],
+    ids=["blank", "no-open-questions-after-rejection", "open-questions-after-rejection"],
+)
+async def test_no_answers_asked_when_speccer_needs_none(
+    tmp_path, monkeypatch, overnight, questions, rejected
+):
+    """A rejected SPEC_COMPLETE or a blank QUESTIONS.md: speccer goes on without answers."""
+    state, storage, spec = _env(tmp_path, questions=questions)
+    state.overnight = overnight
+    if rejected:
+        with (spec / "PROGRESS.md").open("a") as f:
+            f.write(f"REJECTED_COMPLETIONS: {rejected}\n")
+    fake = _answer("unused")
+    monkeypatch.setattr(brain, "run_claude", fake)
+    tmux = _tmux()
+
+    run = state.runs[0]
+    assert not orch._awaits_human(run, run.stages[0], overnight)
+    assert await orch.answer_questions(state, 0, 0, storage)
+    with patch.object(orch, "atomic_save"):
+        await advance_run(state, 0, tmux, storage, ConductorConfig())
+
+    assert fake.calls == []
+    assert (spec / "QUESTIONS.md").read_text() == questions
+    assert "--continue" in tmux.spawn_runner_in_window.await_args.args[1]

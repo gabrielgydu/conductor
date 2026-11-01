@@ -19,21 +19,31 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "conductor" / "prompts" 
 # Codex second-opinion snippet (appended to planning prompts)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# The request goes to Codex in a file. The codex-rescue subagent passes its
+# task as one quoted argument, which the Codex companion splits again and
+# scans for flags: in live runs "python -m pytest" in the request became
+# `--model pytest`, and every call failed.
 _CODEX_SECOND_OPINION = """
 
 ## Second Opinion — Codex (non-blocking)
 
-Before finalizing your plans or answers, get a second opinion from Codex (OpenAI o3).
-Use the Agent tool with `subagent_type="codex:codex-rescue"` and ask it to review your
-draft output. Incorporate its feedback where it makes good points, then finalize.
+Before finalizing your plans or answers, get a second opinion from Codex.
+
+1. Write your review request (what to review, which files, what feedback you want) to a
+   new file outside the repository, made with `mktemp /tmp/codex-request-XXXXXX.md`.
+2. Use the Agent tool with `subagent_type="codex:codex-rescue"`, giving it this prompt
+   with the file's path filled in: "Read-only review. Run the companion `task` command
+   once with exactly the arguments `--prompt-file <path>`: no task text, no `--write`,
+   no `--model` and no other flags. Return its output, or its error verbatim."
+3. Incorporate Codex's feedback where it makes good points, then finalize.
 
 This is non-blocking: if the agent call fails, errors, or times out, proceed with your
 own judgment. Do not let Codex failures delay or block your output. So:
 
 - Make one Agent call, in the foreground (not `run_in_background`), and do not
   schedule wakeups or poll while it runs.
-- Tell the subagent to make a single Codex attempt and to report any error straight
-  back, without retrying or switching models.
+- That call is a single Codex attempt: do not retry it or switch models when it
+  reports an error.
 
 **Logging requirement:** At the end of your output, include a `## Codex Second Opinion` section.
 If Codex responded, summarize what it said and what you incorporated or disagreed with.
@@ -397,18 +407,20 @@ def build_generate_prompt(
 def _final_message_text(output: str) -> str:
     """Return the text of the session's final top-level assistant message.
 
-    The CLI reports it as the ``result`` of the last ``result`` event. A
-    session that waits for a background subagent ends more than one turn and
-    the CLI emits one result per turn, in order, so the last one wins. If the
-    stream has no result event, fall back to the last top-level assistant
-    event that carries text.
+    The CLI reports it as the ``result`` of a ``result`` event, one per turn,
+    in order. A session that waits for a background task ends more than one
+    turn: the verdict can follow a "WAITING" turn, or come before a turn that
+    only acknowledges the task's notification. So the last result that holds
+    a promise token wins, and without one the last result. If the stream has
+    no result event, fall back to the last top-level assistant event that
+    carries text.
 
     Events with a ``parent_tool_use_id`` come from subagents and are skipped,
     and tool inputs and results are never read: a promise token quoted in a
     file the agent wrote, or in a reviewer's reply, is not the agent's verdict.
     """
     import json
-    result_text: str | None = None
+    results: list[str] = []
     last_text = ""
     for line in output.splitlines():
         line = line.strip()
@@ -422,7 +434,7 @@ def _final_message_text(output: str) -> str:
             continue
         if event.get("type") == "result":
             result = event.get("result")
-            result_text = result if isinstance(result, str) else ""
+            results.append(result if isinstance(result, str) else "")
         elif event.get("type") == "assistant":
             content = event.get("message", {}).get("content", [])
             if isinstance(content, str):
@@ -438,7 +450,9 @@ def _final_message_text(output: str) -> str:
             text = "\n".join(t for t in texts if t)
             if text:
                 last_text = text
-    return result_text if result_text is not None else last_text
+    if not results:
+        return last_text
+    return next((r for r in reversed(results) if _detect_promise(r)), results[-1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -526,6 +540,33 @@ def _record_rejection(spec_dir: Path, iteration: int, markers: list[str], reject
     handoff = spec_dir / "HANDOFF.md"
     existing = handoff.read_text(encoding="utf-8").rstrip("\n") if handoff.exists() else ""
     handoff.write_text(existing + "\n" + "\n".join(note), encoding="utf-8")
+
+
+def needs_human(spec_dir: Path) -> bool:
+    """Whether every run refuses with EXIT_NEEDS_HUMAN until a person steps in.
+
+    That is the case once SPEC_COMPLETE was rejected MAX_REJECTED_COMPLETIONS
+    times in a row, until someone sets REJECTED_COMPLETIONS back below it.
+    """
+    return (
+        read_rejected_completions(spec_dir) >= MAX_REJECTED_COMPLETIONS
+        and read_status(spec_dir) not in ("COMPLETE", "GENERATED")
+    )
+
+
+def continue_needs_answers(spec_dir: Path) -> bool:
+    """Whether `run --continue` on a NEEDS_INPUT spec wants answers in QUESTIONS.md.
+
+    Only when QUESTIONS.md asks something. After a rejected SPEC_COMPLETE
+    none are needed either: the next session's job is to resolve the markers
+    listed in HANDOFF.md. That rejection may have come from a first
+    iteration that wrote no questions at all, and once a human has fixed the
+    markers and reset the rejection count, an empty QUESTIONS.md is all that
+    is left.
+    """
+    if read_rejected_completions(spec_dir) > 0:
+        return False
+    return bool(_read_file(spec_dir / "QUESTIONS.md").strip())
 
 
 def _stop_for_human(spec_dir: Path, rejected: int) -> None:
@@ -681,15 +722,18 @@ Immutable principles that ALL specs and implementations must respect. The spec a
     print("")
 
 
-def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejection: bool) -> None:
+# Where a person writes answers in QUESTIONS.md, as the question template
+# lays it out. Conductor credits answers to questions the same way.
+ANSWER_HOW = (
+    "under each question's **Answer:** line, in lines starting with '> ' "
+    "(start a line with '> Q2:' to answer another question)"
+)
+
+
+def _prepare_continue(spec_dir: Path, iteration: int, cont: bool) -> None:
     """Check that a NEEDS_INPUT spec may continue, and archive its questions round.
 
-    Answers are required only when QUESTIONS.md asks something. After a
-    rejected SPEC_COMPLETE none are needed either: the next session's job is
-    to resolve the markers listed in HANDOFF.md. That rejection may have
-    come from a first iteration that wrote no questions at all, and once a
-    human has fixed the markers and reset the rejection count, an empty
-    QUESTIONS.md is all that is left.
+    Answers are required only when continue_needs_answers says so.
     """
     if not cont:
         _log(f"{_YELLOW}Status is NEEDS_INPUT. Answer questions in:{_RESET}")
@@ -701,8 +745,9 @@ def _prepare_continue(spec_dir: Path, iteration: int, cont: bool, after_rejectio
     questions = _read_file(questions_file)
     has_questions = bool(questions.strip())
     has_answers = any(line.startswith("> ") for line in questions.splitlines())
-    if has_questions and not has_answers and not after_rejection:
-        _die("No answers found in QUESTIONS.md. Add answers as lines starting with '> '")
+    after_rejection = read_rejected_completions(spec_dir) > 0
+    if continue_needs_answers(spec_dir) and not has_answers:
+        _die(f"No answers found in QUESTIONS.md. Answer {ANSWER_HOW}.")
     if has_questions:
         archive_dir = spec_dir / "questions-archive"
         archive_dir.mkdir(exist_ok=True)
@@ -736,7 +781,7 @@ async def _cmd_run_async(
     rejected  = read_rejected_completions(spec_dir)
 
     # ── Validate state ──────────────────────────────────────────────────────
-    if rejected >= MAX_REJECTED_COMPLETIONS and status not in ("COMPLETE", "GENERATED"):
+    if needs_human(spec_dir):
         _stop_for_human(spec_dir, rejected)
 
     if status == "INIT":
@@ -746,7 +791,7 @@ async def _cmd_run_async(
         _log(f"First spec iteration for {_CYAN}{feature_name}{_RESET}")
 
     elif status == "NEEDS_INPUT":
-        _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
+        _prepare_continue(spec_dir, iteration, cont)
 
     elif status == "COMPLETE":
         _log(f"{_GREEN}Spec is already complete.{_RESET} Run generate to produce artifacts:")
@@ -767,7 +812,7 @@ async def _cmd_run_async(
             if not desc_file.exists() or desc_file.stat().st_size == 0:
                 _die("FEATURE-DESCRIPTION.md is empty. Write your feature description first.")
         elif status == "NEEDS_INPUT":
-            _prepare_continue(spec_dir, iteration, cont, after_rejection=rejected > 0)
+            _prepare_continue(spec_dir, iteration, cont)
 
     else:
         _die(f"Unknown status: {status}")
@@ -858,7 +903,7 @@ async def _cmd_run_async(
         _log("  1. Review and answer questions in:")
         _log(f"     {_CYAN}{spec_dir}/QUESTIONS.md{_RESET}")
         _log("")
-        _log(f"  2. Add your answers as lines starting with {_CYAN}> {_RESET}")
+        _log(f"  2. Answer {ANSWER_HOW}")
         _log("")
         _log("  3. Continue the spec loop:")
         _log(f"     {_CYAN}speccer run --continue --spec-dir {spec_dir}{_RESET}")

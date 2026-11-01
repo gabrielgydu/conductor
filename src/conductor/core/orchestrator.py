@@ -26,6 +26,7 @@ from conductor.core.logging import live_log
 from conductor.core.models import ConductorState, RunState, StageState, atomic_save
 from conductor.core.presets import Preset, PresetConfig, load_preset
 from conductor.core.storage import StorageResolver
+from speccer import cli as speccer_cli
 
 
 def _module_cmd(module: str, *args: str) -> str:
@@ -1131,6 +1132,17 @@ def _count_spec_failure(
     return failed
 
 
+def _needs_human_text(spec_dir: Path) -> str:
+    """What a person does when speccer refuses to start another spec session."""
+    return (
+        f"speccer rejected SPEC_COMPLETE {speccer_cli.read_rejected_completions(spec_dir)} "
+        f"times in a row and starts no spec session until a person steps in. Resolve "
+        f"the [NEEDS CLARIFICATION: ...] markers listed in {spec_dir}/HANDOFF.md in "
+        f"{spec_dir}/domains/, set REJECTED_COMPLETIONS: 0 in {spec_dir}/PROGRESS.md "
+        "and re-run conductor."
+    )
+
+
 def speccer_exit_code_handler(
     state: ConductorState,
     run_idx: int,
@@ -1139,9 +1151,16 @@ def speccer_exit_code_handler(
     storage: StorageResolver,
     log_path: Path | None = None,
     audit_path: Path | None = None,
+    *,
+    continued: bool = False,
 ) -> None:
-    """Check speccer exit file and PROGRESS.md to set the correct stage status."""
-    stage = state.runs[run_idx].stages[stage_idx]
+    """Check speccer exit file and PROGRESS.md to set the correct stage status.
+
+    *continued*: the exit is from `speccer run --continue`, whose start
+    recorded stage.questions_digest.
+    """
+    run = state.runs[run_idx]
+    stage = run.stages[stage_idx]
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
 
     exit_code = _read_exit_code(exit_file)
@@ -1150,14 +1169,53 @@ def speccer_exit_code_handler(
     _recoverable = {"NEEDS_INPUT", "COMPLETE", "GENERATED"}
     if exit_code is not None:
         stage.last_exit_code = exit_code
+    if continued and exit_code != 0:
+        # The round did not finish: its answers were not used up.
+        stage.questions_digest = None
 
     if exit_code == 0:
-        stage.spec_failures = 0
         sync_speccer_status(state, run_idx, stage_idx, storage, log_path, audit_path)
+        if (
+            continued
+            and stage.status == StageStatus.SPEC_NEEDS_INPUT
+            and not _answers_missing(_questions_file(run, stage))
+        ):
+            # Asked for input again, but QUESTIONS.md asks nothing open (the
+            # file as it was, or a rewrite without a new question): another
+            # round with the same answers would end the same way.
+            _count_spec_failure(
+                state, run_idx, stage_idx,
+                "speccer asked for input again without a new question",
+                log_path, audit_path,
+            )
+        else:
+            stage.spec_failures = 0
     elif exit_code is not None:
         # Non-zero exit — check PROGRESS.md for recoverable state
         if progress_file is not None and progress_file.exists():
             pstatus = _read_progress_status(progress_file)
+            spec_dir = progress_file.parent
+            if pstatus == "NEEDS_INPUT" and (
+                exit_code == speccer_cli.EXIT_NEEDS_HUMAN or speccer_cli.needs_human(spec_dir)
+            ):
+                # speccer starts no session until a person resolves the markers
+                # that blocked SPEC_COMPLETE: the stage waits for them
+                # (_awaits_human), and nothing failed that a retry could fix.
+                stage.spec_failures = 0
+                _log(
+                    "BLOCKED",
+                    f"Run {run.name} stage {stage.name}: {_needs_human_text(spec_dir)}",
+                    log_path,
+                    audit_path,
+                    run=run_idx,
+                    stage=stage_idx,
+                    reason="spec_needs_human",
+                    exit_code=exit_code,
+                )
+                sync_speccer_status(
+                    state, run_idx, stage_idx, storage, log_path, audit_path
+                )
+                return
             if pstatus == "NEEDS_INPUT" and _count_spec_failure(
                 state, run_idx, stage_idx,
                 f"speccer exited {exit_code} with the spec still waiting for input",
@@ -1284,8 +1342,10 @@ MAX_AUTO_QUESTION_ROUNDS = 8
 
 _QUESTION_HEADING = re.compile(r"^#{2,4}[ \t]*Q(\d+)\b", re.MULTILINE | re.IGNORECASE)
 # An answer line labelled with its question, as in the block answer_questions
-# appends ("> ### Q2") or a person's "> Q2: ...".
-_ANSWER_LABEL = re.compile(r"^> [\s#*>_-]*Q(\d+)\b", re.IGNORECASE)
+# appends ("> ### Q2"), a person's "> Q2: ..." or a numbered "> 1. **Q1 (Scope):**".
+_ANSWER_LABEL = re.compile(r"^> [\s#*>_-]*(?:\d+[.)][\s#*_-]*)?Q(\d+)\b", re.IGNORECASE)
+# An answer line that starts with a list number ("> 1. Postgres", "> **2)** JWT").
+_ANSWER_NUMBER = re.compile(r"^> [\s*_]*(\d+)[.)]")
 
 
 def _questions_file(run: RunState, stage: StageState) -> Path | None:
@@ -1306,18 +1366,29 @@ def _open_questions(text: str) -> list[str] | None:
 
     An answer line belongs to the question whose section it is in (a
     person's answer, or speccer's own "> Self-answered ...") unless it is
-    labelled with another question's number. A question asked again further
-    down is open again. None when the file has no '### Qn' headings.
+    labelled with another question's number. A line that starts with a list
+    number answers that question, as in a block "> 1. ...", "> 2. ..."
+    below the last question, only while it is still open and not after the
+    section's own: a numbered list inside one answer stays with its section.
+    A question asked again further down is open again. None when the file
+    has no '### Qn' headings.
     """
     answered: dict[str, bool] = {}
     current: str | None = None
+    section: str | None = None
     for line in text.splitlines():
         if heading := _QUESTION_HEADING.match(line):
-            current = heading.group(1)
+            current = section = heading.group(1)
             answered[current] = False
         elif _is_answer(line):
             if label := _ANSWER_LABEL.match(line):
                 current = label.group(1)
+            elif (number := _ANSWER_NUMBER.match(line)) and (
+                answered.get(number.group(1)) is False
+                and section is not None
+                and int(number.group(1)) <= int(section)
+            ):
+                current = number.group(1)
             if current in answered:
                 answered[current] = True
     if not answered:
@@ -1328,12 +1399,15 @@ def _open_questions(text: str) -> list[str] | None:
 def _answers_missing(questions_file: Path | None) -> bool:
     """Whether speccer's questions still need answers before it can continue.
 
-    True while any '### Qn' question is open, or, without such headings,
-    while the file has no answer at all. A missing or unreadable file has
-    nothing answered.
+    Never when speccer goes on without answers (a blank QUESTIONS.md, or a
+    rejected SPEC_COMPLETE to fix first). Otherwise True while any '### Qn'
+    question is open, or, without such headings, while the file has no
+    answer at all. An unreadable file has nothing answered.
     """
     if questions_file is None:
         return True
+    if not speccer_cli.continue_needs_answers(questions_file.parent):
+        return False
     try:
         text = questions_file.read_text(encoding="utf-8")
     except OSError:
@@ -1344,20 +1418,45 @@ def _answers_missing(questions_file: Path | None) -> bool:
     return bool(still_open)
 
 
+def _questions_digest(questions_file: Path | None) -> str:
+    try:
+        data = questions_file.read_bytes() if questions_file is not None else b""
+    except OSError:
+        data = b""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _answers_stale(run: RunState, stage: StageState) -> bool:
+    """Whether QUESTIONS.md is as the last `--continue` got it, though answers are due.
+
+    speccer then asked for input again without a new question, and the
+    answers in the file are the ones that round already had.
+    """
+    questions = _questions_file(run, stage)
+    return (
+        questions is not None
+        and stage.questions_digest == _questions_digest(questions)
+        and speccer_cli.continue_needs_answers(questions.parent)
+    )
+
+
 def _awaits_human(run: RunState, stage: StageState, overnight: bool) -> bool:
     """Whether a SPEC_NEEDS_INPUT stage can only be moved on by a person.
 
-    Overnight, questions are answered automatically up to
-    MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise, and after that, the stage
-    waits until someone has answered every question in QUESTIONS.md.
+    Always while speccer refuses to start a session after rejected
+    SPEC_COMPLETE claims (speccer_cli.needs_human); that clears once someone
+    sets REJECTED_COMPLETIONS back. Overnight, questions are answered
+    automatically up to MAX_AUTO_QUESTION_ROUNDS rounds. Otherwise, and
+    after that, the stage waits until someone has answered every question
+    in QUESTIONS.md, and has changed it since the last `--continue`.
     """
     questions = _questions_file(run, stage)
+    if questions is not None and speccer_cli.needs_human(questions.parent):
+        return True
+    unanswered = _answers_missing(questions) or _answers_stale(run, stage)
     if overnight:
-        return (
-            stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS
-            and _answers_missing(questions)
-        )
-    return questions is not None and questions.exists() and _answers_missing(questions)
+        return stage.question_rounds >= MAX_AUTO_QUESTION_ROUNDS and unanswered
+    return questions is not None and questions.exists() and unanswered
 
 
 def _q_list(numbers: list[str]) -> str:
@@ -1394,11 +1493,9 @@ async def answer_questions(
     wt = stage.worktree
 
     questions_file = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
-    if not questions_file.exists():
-        return True
+    if not speccer_cli.continue_needs_answers(questions_file.parent):
+        return True  # speccer goes on without answers
     questions = questions_file.read_text(encoding="utf-8").strip()
-    if not questions:
-        return True
     still_open = _open_questions(questions)
     if still_open == []:
         return True  # all answered already (by a person or by speccer itself)
@@ -2822,7 +2919,8 @@ def _waiting_reason(
 
     "executing": a runner is working in its tmux window; only monitoring is due.
     "backoff":   the stage waits out a transient-failure backoff.
-    "human":     speccer asked questions and nobody auto-answers them.
+    "human":     speccer asked questions and nobody auto-answers them, or it
+                 stopped for a person after rejected SPEC_COMPLETE claims.
     """
     if run.current_stage >= len(run.stages):
         return None
@@ -2839,28 +2937,37 @@ def _waiting_reason(
 def _questions_waiting_message(
     state: ConductorState, run: RunState, overnight: bool
 ) -> str:
-    """How a human answers a stage's speccer questions and lets conductor go on."""
+    """How a person lets a stage waiting for them go on (see _awaits_human)."""
     stage = run.stages[run.current_stage]
     fname = run.name + stage.feature_suffix
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
     continue_cmd = shlex.join(["speccer", "run", "--feature", fname, "--project-dir", wt, "--continue"])
     continue_cmd = f"`{continue_cmd}`"
+    if speccer_cli.needs_human(questions.parent):
+        return f"Run {run.name} stage {stage.name}: {_needs_human_text(questions.parent)}"
     try:
         still_open = _open_questions(questions.read_text(encoding="utf-8"))
     except OSError:
         still_open = None
+    if not still_open and _answers_stale(run, stage):
+        return (
+            f"Run {run.name} stage {stage.name}: speccer asked for input again but "
+            f"left {questions} as the last `--continue` had it. See what it needs in "
+            f"{questions.parent}/HANDOFF.md, answer in QUESTIONS.md "
+            f"{speccer_cli.ANSWER_HOW} and re-run conductor."
+        )
     which = f"questions {_q_list(still_open)}" if still_open else "the questions"
     if overnight:
         return (
             f"Run {run.name} stage {stage.name}: still asking questions after "
             f"{stage.question_rounds} automatic answer rounds. Answer {which} in "
-            f"{questions} (lines starting with '> ') and re-run conductor, or run "
+            f"{questions} {speccer_cli.ANSWER_HOW} and re-run conductor, or run "
             f"{continue_cmd} and then re-run conductor."
         )
     return (
         f"Run {run.name} stage {stage.name}: answer {which} in {questions} "
-        "(lines starting with '> ') and re-run conductor, or re-run it without "
+        f"{speccer_cli.ANSWER_HOW} and re-run conductor, or re-run it without "
         "--no-overnight to have them answered automatically."
     )
 
@@ -3070,12 +3177,14 @@ async def advance_run(
                 return
         if overnight:
             stage.question_rounds += 1
+        stage.questions_digest = _questions_digest(_questions_file(run, stage))
         await run_speccer_continue(
             state, run_idx, stage_idx, tmux, storage, log_path, audit_path
         )
         fname = run.name + stage.feature_suffix
         speccer_exit_code_handler(
-            state, run_idx, stage_idx, fname, storage, log_path, audit_path
+            state, run_idx, stage_idx, fname, storage, log_path, audit_path,
+            continued=True,
         )
         atomic_save(state, storage.conductor_state(state.project_name))
         return
