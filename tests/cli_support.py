@@ -77,9 +77,15 @@ class FakeTmux:
         self.calls: list[tuple[str, ...]] = []
 
     def _session(self, target: str) -> str | None:
-        assert target.startswith("=") and target.endswith(":"), f"inexact session target {target!r}"
-        name = target[1:-1]
+        # "=session:" or "=session:=window"
+        assert target.startswith("=") and ":" in target, f"inexact session target {target!r}"
+        name = target[1:].split(":", 1)[0]
         return name if name in self.sessions else None
+
+    @staticmethod
+    def _window(target: str) -> str | None:
+        window = target.split(":", 1)[1]
+        return window[1:] if window.startswith("=") else None
 
     def __call__(self, *args: str) -> subprocess.CompletedProcess:
         self.calls.append(args)
@@ -88,8 +94,22 @@ class FakeTmux:
         if cmd == "has-session":
             rc = 0 if self._session(args[2]) else 1
         elif cmd == "list-panes":
-            name = self._session(args[3])
-            out = "".join("\t".join(p) + "\n" for p in self.sessions.get(name or "", []))
+            target = args[args.index("-t") + 1]
+            name = self._session(target)
+            window = self._window(target)
+            panes = [p for p in self.sessions.get(name or "", []) if window in (None, p[2])]
+            out = "".join("\t".join(p) + "\n" for p in panes)
+        elif cmd == "kill-window":
+            target = args[2]
+            name, window = self._session(target), self._window(target)
+            if name:
+                self.sessions[name] = [p for p in self.sessions[name] if p[2] != window]
+        elif cmd == "new-window":
+            name = self._session(args[args.index("-t") + 1])
+            if name:
+                self.sessions[name].append(("0", "998", args[args.index("-n") + 1], "python3"))
+            else:
+                rc = 1
         elif cmd == "kill-session":
             name = self._session(args[2])
             if name:
@@ -153,4 +173,5 @@ def execvp_fixture(monkeypatch):
         raise SystemExit(0)
 
     monkeypatch.setattr(cli.os, "execvp", fake_execvp)
+    monkeypatch.setattr(cli, "_has_tty", lambda: True)
     return calls

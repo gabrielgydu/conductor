@@ -23,6 +23,7 @@ from conductor.core.models import (
     validate_dag,
 )
 from conductor.core.storage import StorageResolver
+from conductor.core.tmux import forwarded_env, forwarded_vars
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -216,23 +217,31 @@ def _has_children(pid: str) -> bool:
         return True  # cannot tell: assume busy
 
 
-def _busy_tmux_panes(session: str) -> list[str]:
-    """Describe the panes of *session* that are still running something.
+def _busy_tmux_panes(session: str, window: str | None = None) -> list[str]:
+    """Describe the panes of *session* (or just of its *window*) still running something.
 
     A pane is idle when it is dead (remain-on-exit keeps finished windows
     around) or sits at a shell prompt with no child processes.
     """
+    scope = ["-t", _tmux_target(session, window)] if window else ["-s", "-t", _tmux_target(session)]
     r = _tmux(
-        "list-panes", "-s", "-t", _tmux_target(session),
+        "list-panes", *scope,
         "-F", "#{pane_dead}\t#{pane_pid}\t#{window_name}\t#{pane_current_command}",
     )
     busy = []
     for line in r.stdout.splitlines():
-        dead, pid, window, command = (line.split("\t") + ["", "", "", ""])[:4]
+        dead, pid, name, command = (line.split("\t") + ["", "", "", ""])[:4]
         if dead == "1" or (command in _SHELLS and not _has_children(pid)):
             continue
-        busy.append(f"{window} ({command}, pid {pid})")
+        busy.append(f"{name} ({command}, pid {pid})")
     return busy
+
+
+def _refuse_live_session(session: str, busy: list[str]) -> None:
+    print(f"Error: tmux session '{session}' is still running: {', '.join(busy)}")
+    print(f"  Watch it:  tmux attach -t '={session}:'")
+    print(f"  Stop it:   tmux kill-session -t '={session}:'")
+    sys.exit(1)
 
 
 def _kill_stale_tmux_session(session: str) -> bool:
@@ -245,49 +254,70 @@ def _kill_stale_tmux_session(session: str) -> bool:
         return False
     busy = _busy_tmux_panes(session)
     if busy:
-        print(f"Error: tmux session '{session}' is still running: {', '.join(busy)}")
-        print(f"  Watch it:  tmux attach -t '={session}:'")
-        print(f"  Stop it:   tmux kill-session -t '={session}:'")
-        sys.exit(1)
+        _refuse_live_session(session, busy)
     _tmux("kill-session", "-t", _tmux_target(session))
     return True
 
 
-def _forwarded_env() -> list[str]:
-    """`-e NAME=VALUE` options for the variables the re-exec'd conductor must see.
-
-    A command started by an already running tmux server gets the server's
-    environment, not ours: without these, `CONDUCTOR_HOME=... conductor run`
-    would read the state in one place and run from another. Values end up in
-    tmux's argv, so only non-secret variables are forwarded.
-    """
-    names = sorted(k for k in os.environ if k.startswith("CONDUCTOR_")) + ["PATH", "PYTHONPATH"]
-    opts: list[str] = []
-    for name in names:
-        if name in os.environ:
-            opts += ["-e", f"{name}={os.environ[name]}"]
-    return opts
+def _has_tty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _launch_in_tmux(
-    session: str, window: str, argv: list[str], log_file: Path, *, login_shell: bool = False
+    session: str,
+    window: str,
+    argv: list[str],
+    log_file: Path,
+    *,
+    login_shell: bool = False,
+    adopt_runners: bool = False,
 ) -> None:
-    """Run *argv* in a new detached tmux session, then attach or switch to it."""
-    _kill_stale_tmux_session(session)
+    """Run *argv* in a detached tmux session, then attach or switch to it.
+
+    Without a terminal on stdin/stdout the session is left running detached.
+    With *adopt_runners*, a session whose own *window* is dead but which still
+    has busy panes (runners the previous orchestrator left working) is reused:
+    the new orchestrator adopts those runners. Otherwise any busy pane refuses.
+    """
     shell = "bash -lc" if login_shell else "bash -c"
+    command = f"{shell} {shlex.quote(shlex.join(argv))}"
     target = _tmux_target(session, window)
+    log_cmd = f"cat >> {shlex.quote(str(log_file))}"
+
+    reuse = False
+    if _tmux("has-session", "-t", _tmux_target(session)).returncode == 0:
+        busy = _busy_tmux_panes(session)
+        if busy and adopt_runners and not _busy_tmux_panes(session, window):
+            reuse = True
+        elif busy:
+            _refuse_live_session(session, busy)
+        else:
+            _tmux("kill-session", "-t", _tmux_target(session))
+
     # One tmux invocation, so remain-on-exit and the log pipe are in place even
     # when the command exits immediately.
-    r = _tmux(
-        "new-session", "-d", "-s", session, *_forwarded_env(), "-n", window,
-        f"{shell} {shlex.quote(shlex.join(argv))}",
-        ";", "set-option", "-t", target, "remain-on-exit", "on",
-        ";", "pipe-pane", "-t", target, f"cat >> {shlex.quote(str(log_file))}",
-    )
+    if reuse:
+        _tmux("kill-window", "-t", target)  # the dead orchestrator's pane, if still there
+        for name, value in forwarded_vars().items():
+            _tmux("set-environment", "-t", f"={session}", name, value)
+        r = _tmux(
+            "new-window", "-t", _tmux_target(session), "-n", window, command,
+            ";", "set-option", "-t", target, "remain-on-exit", "on",
+            ";", "pipe-pane", "-t", target, log_cmd,
+        )
+    else:
+        r = _tmux(
+            "new-session", "-d", "-s", session, *forwarded_env(), "-n", window, command,
+            ";", "set-option", "-t", target, "remain-on-exit", "on",
+            ";", "pipe-pane", "-t", target, log_cmd,
+        )
     if r.returncode != 0:
         print(f"Error: could not start tmux session '{session}': {r.stderr.strip()}")
         sys.exit(1)
 
+    if not _has_tty():
+        print(f"started in tmux session {session}; attach with: tmux attach -t {_tmux_target(session)}")
+        sys.exit(0)
     if not os.environ.get("TMUX"):
         os.execvp("tmux", ["tmux", "attach-session", "-t", _tmux_target(session)])
     # Already in tmux — switch client
@@ -309,6 +339,26 @@ def _validate_name(name: str) -> None:
             "branch names and storage paths."
         )
         sys.exit(1)
+
+
+def _resolve_plan_path(plan: str, repo_path: Path) -> Path:
+    """Existing file for a --plan value: relative paths mean cwd, as in `go`.
+
+    Loops used to resolve them against --project-dir, so that location is still
+    tried (with a note) when nothing exists under the current directory.
+    """
+    path = Path(plan)
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [Path.cwd() / path, repo_path / path]
+    for i, candidate in enumerate(candidates):
+        if candidate.exists():
+            if i:
+                print(f"Note: {candidates[0]} does not exist; using {candidate}", file=sys.stderr)
+            return candidate
+    print(f"Error: Plan file not found: {candidates[0]}")
+    sys.exit(1)
 
 
 # ─── Project lock ────────────────────────────────────────────────────────────
@@ -1001,6 +1051,7 @@ def _cmd_run(args):
             "conductor",
             reexec,
             storage.tmux_log(state.project_name, "conductor-main"),
+            adopt_runners=True,
         )
     else:
         # Inside tmux — run the loop directly
@@ -1232,6 +1283,7 @@ def _cmd_learnings(args):
         print("Error: No state found. Run 'conductor plan' first.")
         sys.exit(1)
 
+    _lock_project(storage, args.name, "learnings")
     state = ConductorState.model_validate_json(state_path.read_text(encoding="utf-8"))
 
     from conductor.core.orchestrator import _review_learnings
@@ -1261,12 +1313,7 @@ def _cmd_loop(args):
         if not args.plan:
             print("Error: --plan is required for new loops.")
             sys.exit(1)
-        plan_path = Path(args.plan)
-        if not plan_path.is_absolute():
-            plan_path = repo_path / plan_path
-        if not plan_path.exists():
-            print(f"Error: Plan file not found: {plan_path}")
-            sys.exit(1)
+        plan_path = _resolve_plan_path(args.plan, repo_path)
 
         plan_content = plan_path.read_text(encoding="utf-8")
 
@@ -1438,12 +1485,7 @@ def _cmd_manual_test(args):
             print("Error: --plan is required for new manual-test runs.")
             sys.exit(1)
 
-        plan_path = Path(args.plan)
-        if not plan_path.is_absolute():
-            plan_path = repo_path / plan_path
-        if not plan_path.exists():
-            print(f"Error: Plan file not found: {plan_path}")
-            sys.exit(1)
+        plan_path = _resolve_plan_path(args.plan, repo_path)
 
         preset_name = _resolve_preset(getattr(args, "preset", None), repo_path)
         try:

@@ -6,8 +6,8 @@ Usage:
              [--start-phase <n>] [--no-push] [--no-fixer]
              [--max-iterations <n>]
 
-  runner fixer --feature <name> --branch <branch> --pr <number>
-               [--phase <n>] [--model <name>] [--storage-dir <path>]
+  runner fixer --feature <name> --branch <branch> --pr <number> --phase <n>
+               [--project-dir <path>] [--model <name>] [--storage-dir <path>]
                [--base-branch <branch>]
 """
 from __future__ import annotations
