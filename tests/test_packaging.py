@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import conductor.cli as cli
+import conductor.core.orchestrator as orch
 from tests.cli_support import (  # noqa: F401
     NAME,
     execvp_fixture,
@@ -19,6 +20,7 @@ from tests.cli_support import (  # noqa: F401
     seed_state,
     write_brief,
 )
+from tests.test_orchestrator_launch import launch_env
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +63,26 @@ def test_loop_reexecs_through_the_running_interpreter(repo, fake_tmux, execvp):
 
     assert code == 0, out
     assert _reexec_argv(fake_tmux)[:5] == [sys.executable, "-P", "-m", "conductor", "loop"]
+
+
+@pytest.mark.parametrize(
+    "launch, module",
+    [
+        (orch.run_speccer_init, "speccer"),
+        (orch.run_speccer_run, "speccer"),
+        (orch.run_speccer_continue, "speccer"),
+        (orch.run_speccer_generate, "speccer"),
+        (orch.start_runner, "runner"),
+    ],
+)
+async def test_speccer_and_runner_run_on_the_running_interpreter(tmp_path, launch, module):
+    """<checkout>/speccer and <checkout>/runner do not exist in a wheel install (exit 127)."""
+    state, storage, tmux, _ = launch_env(tmp_path)
+
+    await launch(state, 0, 0, tmux, storage)
+
+    cmd = tmux.spawn_runner_in_window.await_args.args[1]
+    assert shlex.split(cmd)[:4] == [sys.executable, "-P", "-m", module]
 
 
 @pytest.mark.parametrize("missing", ["plan", "completeness-review"])

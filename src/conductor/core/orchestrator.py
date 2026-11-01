@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,13 +27,19 @@ from conductor.core.models import ConductorState, RunState, StageState, atomic_s
 from conductor.core.presets import Preset, PresetConfig, load_preset
 from conductor.core.storage import StorageResolver
 
-# Resolve paths to our own speccer/runner wrappers (sibling to the conductor package root)
-# so we never accidentally invoke the old bash versions via PATH.
-_PACKAGE_ROOT = (
-    Path(__file__).resolve().parents[3]
-)  # src/conductor/core/orchestrator.py -> repo root
-_SPECCER_BIN = str(_PACKAGE_ROOT / "speccer")
-_RUNNER_BIN = str(_PACKAGE_ROOT / "runner")
+
+def _module_cmd(module: str, *args: str) -> str:
+    """Bash command that runs ``python -m <module> <args>`` on conductor's own interpreter.
+
+    speccer and runner get the interpreter and installed package of this
+    conductor (a wheel, or the checkout's .venv behind the ./conductor
+    wrapper), not a path into the repo checkout, which a wheel install does
+    not have. -P keeps the cwd (the target project's worktree) off sys.path,
+    so a project's own `runner` or `speccer` module can't shadow ours. Every
+    argument is quoted: worktree paths may contain spaces.
+    """
+    return shlex.join([sys.executable, "-P", "-m", module, *args])
+
 
 # A runner pane whose process tree stays shallow (the runner is alive but
 # no Claude or gate process under it) is a zombie. When each window was first
@@ -734,7 +741,6 @@ async def run_speccer_init(
     exit_file.unlink(missing_ok=True)
 
     args = [
-        _SPECCER_BIN,
         "init",
         "--feature",
         fname,
@@ -793,7 +799,7 @@ async def run_speccer_init(
                 else:
                     args += ["--spec-context", full_ctx]
 
-    cmd = f"cd {wt} && {' '.join(args)}"
+    cmd = _module_cmd("speccer", *args)
     _log(
         "SPECCER_INVOKE",
         f"speccer init {fname} (mode={mode}) [window: {window_name}]",
@@ -855,7 +861,7 @@ async def run_speccer_run(
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
-    cmd = f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt}"
+    cmd = _module_cmd("speccer", "run", "--feature", fname, "--project-dir", wt)
     _log(
         "SPECCER_INVOKE",
         f"speccer run {fname} [window: {window_name}]",
@@ -901,9 +907,7 @@ async def run_speccer_continue(
     exit_file = _speccer_exit_file(storage, state.project_name, fname)
     exit_file.unlink(missing_ok=True)
 
-    cmd = (
-        f"cd {wt} && {_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue"
-    )
+    cmd = _module_cmd("speccer", "run", "--feature", fname, "--project-dir", wt, "--continue")
     _log(
         "SPECCER_INVOKE",
         f"speccer run --continue {fname} [window: {window_name}]",
@@ -949,7 +953,7 @@ async def run_speccer_generate(
     exit_file = _speccer_exit_file(storage, state.project_name, f"{fname}-gen")
     exit_file.unlink(missing_ok=True)
 
-    cmd = f"cd {wt} && {_SPECCER_BIN} generate --feature {fname} --project-dir {wt}"
+    cmd = _module_cmd("speccer", "generate", "--feature", fname, "--project-dir", wt)
     _log(
         "SPECCER_INVOKE",
         f"speccer generate {fname} [window: {window_name}]",
@@ -1704,7 +1708,7 @@ async def start_runner(
         return
 
     storage_dir = str(docs_dir)
-    cmd = f"cd {wt} && {_RUNNER_BIN} run --feature {fname} --storage-dir {storage_dir}"
+    cmd = _module_cmd("runner", "run", "--feature", fname, "--storage-dir", storage_dir)
     log_file = storage.tmux_log(state.project_name, f"runner_{fname}")
     await tmux.spawn_runner_in_window(
         window_name, cmd, exit_file=exit_file, fail_log=fail_log, cwd=wt, log_file=log_file
@@ -2787,7 +2791,8 @@ def _questions_waiting_message(
     fname = run.name + stage.feature_suffix
     wt = stage.worktree or "<worktree>"
     questions = Path(wt) / "docs" / fname / "spec" / "QUESTIONS.md"
-    continue_cmd = f"`{_SPECCER_BIN} run --feature {fname} --project-dir {wt} --continue`"
+    continue_cmd = shlex.join(["speccer", "run", "--feature", fname, "--project-dir", wt, "--continue"])
+    continue_cmd = f"`{continue_cmd}`"
     try:
         still_open = _open_questions(questions.read_text(encoding="utf-8"))
     except OSError:
