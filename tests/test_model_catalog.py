@@ -9,7 +9,7 @@ from conductor.core.model_catalog import MODEL_ALIASES, canonical_model_id, pric
 @pytest.mark.parametrize(
     "alias, model_id",
     [
-        ("opus", "claude-opus-4-8[1m]"),
+        ("opus", "claude-opus-5-5"),
         ("opus-200k", "claude-opus-4-8"),
         ("sonnet", "claude-sonnet-4-6"),
         ("haiku", "claude-haiku-4-5"),
@@ -21,7 +21,7 @@ def test_aliases(alias, model_id):
 
 @pytest.mark.parametrize("alias", ["Opus", "OPUS", " opus "])
 def test_alias_lookup_ignores_case_and_whitespace(alias):
-    assert resolve_model(alias) == "claude-opus-4-8[1m]"
+    assert resolve_model(alias) == "claude-opus-5-5"
 
 
 @pytest.mark.parametrize(
@@ -44,7 +44,7 @@ def test_claude_and_stats_share_one_resolver():
 @pytest.mark.parametrize(
     "model, canonical",
     [
-        ("opus", "claude-opus-4-8"),
+        ("opus", "claude-opus-5-5"),
         ("claude-opus-4-8[1m]", "claude-opus-4-8"),
         ("Claude-Haiku-4-5-20251001", "claude-haiku-4-5"),
         ("claude-opus-5-5", "claude-opus-5-5"),

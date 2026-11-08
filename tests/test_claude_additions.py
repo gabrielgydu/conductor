@@ -18,7 +18,7 @@ from conductor.core.claude import (
 
 
 def test_resolve_model_opus():
-    assert resolve_model("opus") == "claude-opus-4-8[1m]"
+    assert resolve_model("opus") == "claude-opus-5-5"
 
 
 def test_resolve_model_opus_200k():

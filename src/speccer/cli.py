@@ -845,7 +845,7 @@ async def _cmd_run_async(
 
     result = await run_claude(
         prompt,
-        model=resolve_model("opus-200k"),
+        model=resolve_model("opus"),
         max_turns=200,
         append_args=_SESSION_ARGS,
         cwd=str(spec_dir),
@@ -968,7 +968,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
 
     result = await run_claude(
         prompt,
-        model=resolve_model("opus-200k"),
+        model=resolve_model("opus"),
         max_turns=200,
         append_args=_SESSION_ARGS,
         cwd=str(docs_dir),

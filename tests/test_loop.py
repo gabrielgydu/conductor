@@ -196,14 +196,14 @@ async def run_loop(state: LoopState, repo: Path) -> tuple[LoopState, list[dict]]
 ONE_TASK = "- [ ] **Add notes** — create notes.txt\n"
 
 
-async def test_default_model_reaches_claude_verbatim(repo, claude, tmux):
-    """opus resolves to claude-opus-4-8[1m]: a zsh glob, and under bash one that matches files."""
+async def test_bracketed_model_reaches_claude_verbatim(repo, claude, tmux):
+    """claude-opus-4-8[1m] is a zsh glob, and under bash one that matches files."""
     (repo / "claude-opus-4-8m").write_text("glob bait\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bait")
     claude.script([{"events": [say("done\n<task-completed/>")], "write": {"notes.txt": "n\n"}}])
 
-    saved, events = await run_loop(make_state(repo, ONE_TASK, model="opus"), repo)
+    saved, events = await run_loop(make_state(repo, ONE_TASK, model="claude-opus-4-8[1m]"), repo)
 
     (call,) = claude.calls
     assert call["argv"][call["argv"].index("--model") + 1] == "claude-opus-4-8[1m]"

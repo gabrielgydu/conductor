@@ -12,9 +12,10 @@ from dataclasses import dataclass
 
 # Short names accepted wherever conductor takes a model: presets, --model and
 # run.sh's CONDUCTOR_MODEL. Anything that is not an alias is passed to
-# `claude --model` unchanged, so full IDs such as "claude-opus-5-5" just work.
+# `claude --model` unchanged, so full IDs such as "claude-sonnet-5-5" just work.
 MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-8[1m]",
+    "opus": "claude-opus-5-5",
+    # Opus 5.5 only comes with a 1M context window, so this alias stays on 4.8.
     "opus-200k": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
@@ -64,7 +65,7 @@ KNOWN_MODELS: dict[str, ModelPricing] = {
 # CLI lowers a level the model lacks (Sonnet 4.6 stops at high) and drops it for
 # models without effort (Haiku 4.5), so one level works for every session.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_EFFORT = "xhigh"
+DEFAULT_EFFORT = "medium"
 # Carries the level to speccer and runner: tmux forwards CONDUCTOR_* variables.
 EFFORT_ENV = "CONDUCTOR_EFFORT"
 

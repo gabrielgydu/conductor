@@ -31,7 +31,7 @@ local_review_command = "./scripts/local-review.sh"
 local_review_full_command = "./scripts/local-review.sh --full"
 fix_model = "sonnet"              # model used by fix/retry loops
 # phase_models = { 1 = "sonnet" } # per-phase model overrides
-# effort = "high"                 # low, medium, high, xhigh or max, for every Claude session (default xhigh)
+# effort = "high"                 # low, medium, high, xhigh or max, for every Claude session (default medium)
 # worktrees_base = "~/worktrees"  # where feature worktrees are created
 
 [preflight]

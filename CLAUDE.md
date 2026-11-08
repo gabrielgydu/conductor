@@ -91,7 +91,7 @@ With `--inside-tmux` you create the session and send the command yourself, as in
 - `--quick` / `--no-quick`: quick mode is turned on when `go` plans the project; on resume the saved setting is kept unless one of these flags is given
 - `--max-parallel`: the saved setting, 1 (sequential runs) for a new project
 - `--worktrees-base`: base directory for worktrees, the integration worktree included (`<base>/integration-<name>`); defaults to the preset's `worktrees_base`, else `<project>/../worktrees`
-- `--effort`: effort of every Claude session in the project (`low`, `medium`, `high`, `xhigh`, `max`); defaults to the saved setting, else the preset's `effort`, else `xhigh`, and never to the `effortLevel` in `~/.claude/settings.json`
+- `--effort`: effort of every Claude session in the project (`low`, `medium`, `high`, `xhigh`, `max`); defaults to the saved setting, else the preset's `effort`, else `medium`, and never to the `effortLevel` in `~/.claude/settings.json`
 - `--reintegrate`: attempt the integration again when all runs are finished, even if it is not due (a failure that is not retried automatically)
 - All `run` flags: `--no-overnight`, `--quick`/`--no-quick`, `--max-parallel`, `--worktrees-base`, `--effort`, `--reintegrate`, `--inside-tmux`
 - Settings saved by an earlier run (quick, max parallel, worktrees base, effort) are kept when the flag is left out; `--no-overnight` applies only to the invocation that passes it
@@ -159,7 +159,7 @@ Pane logs are in the conductor dir's `logs/`; the per-session prompt and output 
 
 - `--no-worktree`: work directly in the project dir instead of creating a worktree
 - `--model`: override the Claude model (default: from preset or opus)
-- `--effort`: effort of every session (default: the saved setting, else the preset's `effort`, else `xhigh`)
+- `--effort`: effort of every session (default: the saved setting, else the preset's `effort`, else `medium`)
 - `--reset`: discard previous loop state and start fresh
 - `--preset`: preset supplying the default `model` and `worktrees_base` (auto-detected if omitted)
 

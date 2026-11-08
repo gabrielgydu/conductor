@@ -42,8 +42,8 @@ def load_stream_json(name: str) -> str:
 
 
 def test_resolve_model_opus():
-    # Same 1M-context Opus that fix sessions and the orchestrator get.
-    assert resolve_model("opus") == "claude-opus-4-8[1m]"
+    # Same Opus that fix sessions and the orchestrator get.
+    assert resolve_model("opus") == "claude-opus-5-5"
 
 
 def test_resolve_model_opus_200k():
@@ -77,7 +77,7 @@ def test_get_pricing_opus():
 
 def test_get_pricing_resolves_aliases_and_variants():
     opus = get_pricing("claude-opus-4-8")
-    assert get_pricing("opus") == opus
+    assert get_pricing("opus-200k") == opus
     assert get_pricing("claude-opus-4-8[1m]") == opus
     # modelUsage reports dated snapshot IDs
     assert get_pricing("claude-haiku-4-5-20251001") == get_pricing("haiku")

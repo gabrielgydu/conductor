@@ -83,7 +83,7 @@ The top-level orchestrator. Manages a DAG of runs, each with one or more stages.
 |---------|-------------|
 | `conductor init --name <name>` | Create a project with feature brief template |
 | `conductor plan --name <name> [--force]` | Generate run plan via Claude Opus (`--force` re-plans a project whose runs have started) |
-| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N] [--effort LEVEL] [--reintegrate]` | Execute the orchestration loop (`--reintegrate` attempts the integration again even when it is not due; `--effort` sets the effort of every Claude session, default the preset's `effort`, else `xhigh`) |
+| `conductor run --name <name> [--no-overnight] [--quick\|--no-quick] [--max-parallel N] [--effort LEVEL] [--reintegrate]` | Execute the orchestration loop (`--reintegrate` attempts the integration again even when it is not due; `--effort` sets the effort of every Claude session, default the preset's `effort`, else `medium`) |
 | `conductor status --name <name>` | Show run/stage status table, the integration PR and how a failed integration is retried |
 | `conductor log --name <name> [--tail N]` | Tail the conductor log |
 | `conductor cleanup --name <name> [--force]` | Remove worktrees and branches; keeps uncommitted, unpushed or unmerged work unless `--force`; branch names stay in state, so later runs still find work saved on origin |

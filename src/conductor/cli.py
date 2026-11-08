@@ -604,7 +604,7 @@ def _generate_plan_once(prompt: str, repo_path: Path, run_claude) -> tuple[list,
     result = asyncio.run(
         run_claude(
             prompt,
-            model=resolve_model("opus-200k"),
+            model=resolve_model("opus"),
             max_turns=10,
             cwd=str(repo_path),
             on_event=_plan_progress_callback,
@@ -1746,7 +1746,7 @@ def _cmd_validate(args):
 
 _EFFORT_HELP = (
     "Effort of every Claude session in this project (default: the saved setting, "
-    "else the preset's effort, else xhigh)"
+    "else the preset's effort, else medium)"
 )
 _REINTEGRATE_HELP = (
     "Attempt the integration once more when all runs are finished, even if "
