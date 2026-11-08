@@ -28,6 +28,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, List, Optional
 
+from conductor.core.model_catalog import EFFORT_LEVELS
 from conductor.core.storage import conductor_home
 
 PROJECT_PRESET_FILE = Path(".conductor") / "preset.toml"
@@ -64,6 +65,7 @@ class PresetConfig:
     model: str = ""
     fix_model: str = ""
     phase_models: dict[int, str] = field(default_factory=dict)
+    effort: str = ""
     fixer_ci_poll_interval: int = 60
     fixer_ci_max_wait: int = 5400
     fixer_skip_patterns: str = "coverage|Coverage|codecov|Codecov"
@@ -243,6 +245,8 @@ def _parse_config(raw: dict) -> PresetConfig:
         data["phase_models"] = {int(k): str(v) for k, v in dict(data["phase_models"]).items()}
     if data.get("worktrees_base"):
         data["worktrees_base"] = str(Path(str(data["worktrees_base"])).expanduser())
+    if data.get("effort") and data["effort"] not in EFFORT_LEVELS:
+        raise ValueError(f"[config] effort must be one of {', '.join(EFFORT_LEVELS)}, got {data['effort']!r}")
     return PresetConfig(**data)
 
 

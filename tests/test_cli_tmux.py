@@ -144,6 +144,18 @@ def test_go_reexec_forwards_only_the_flags_given(project, fake_tmux, execvp):
     assert "--quick" not in argv
     # go has no --max-parallel default any more, so a resume keeps the saved value
     assert "--max-parallel" not in argv
+    assert "--effort" not in argv
+
+
+def test_run_reexec_forwards_the_effort(project, fake_tmux, execvp):
+    seed = ConductorState(project_name="foo", runs=[make_run_state(0, "r0")])
+    atomic_save(seed, StorageResolver(project).conductor_state("foo"))
+
+    _, _, code = run_main(["run", "--name", "foo", "--project-dir", str(project), "--effort", "medium"])
+
+    assert code == 0
+    argv = _reexec_argv(fake_tmux)
+    assert argv[argv.index("--effort") + 1] == "medium"
 
 
 def test_new_session_gets_the_callers_conductor_env_and_path(project, fake_tmux, execvp, monkeypatch):

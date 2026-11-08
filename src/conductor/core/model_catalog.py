@@ -6,6 +6,7 @@ used to resolve through two copies of the map that disagreed on it.)
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 
@@ -58,12 +59,31 @@ KNOWN_MODELS: dict[str, ModelPricing] = {
     "claude-opus-4-6": _list_price(5.00, 25.00, 0.50),
 }
 
+# Levels `claude --effort` accepts. Every session conductor starts passes one,
+# so a run does not depend on the effortLevel in the user's settings.json. The
+# CLI lowers a level the model lacks (Sonnet 4.6 stops at high) and drops it for
+# models without effort (Haiku 4.5), so one level works for every session.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "xhigh"
+# Carries the level to speccer and runner: tmux forwards CONDUCTOR_* variables.
+EFFORT_ENV = "CONDUCTOR_EFFORT"
+
 _SNAPSHOT_DATE = re.compile(r"-\d{8}$")
 
 
 def resolve_model(name: str) -> str:
     """Resolve a short alias (case-insensitive) to a model ID; pass anything else through."""
     return MODEL_ALIASES.get(name.strip().lower(), name)
+
+
+def set_effort(level: str | None) -> None:
+    """Make *level* (or the default) the effort of every session from here on."""
+    os.environ[EFFORT_ENV] = level or DEFAULT_EFFORT
+
+
+def effort_args() -> list[str]:
+    """The `claude` arguments that set this run's effort."""
+    return ["--effort", os.environ.get(EFFORT_ENV) or DEFAULT_EFFORT]
 
 
 def canonical_model_id(model: str) -> str:

@@ -9,6 +9,7 @@ import pytest
 import conductor.cli as cli
 from conductor.core.enums import IntegrationStatus, RunStatus
 from conductor.core.models import IntegrationState
+from conductor.core.storage import conductor_home
 from tests.cli_support import (  # noqa: F401
     NAME,
     repo_fixture,
@@ -46,6 +47,23 @@ def _plan(repo, *extra):
     return run_main(["plan", "--name", NAME, "--project-dir", str(repo), *extra])
 
 
+def _write_user_preset(name: str) -> None:
+    presets = conductor_home() / "presets"
+    presets.mkdir(exist_ok=True)
+    (presets / f"{name}.toml").write_text(f'name = "{name}"\n')
+
+
+def test_plan_refuses_a_missing_preset_before_calling_claude(repo, claude_calls):
+    seed_state(repo, runs=[], preset="gone")
+    write_brief(repo)
+
+    out, _, code = _plan(repo)
+
+    assert code == 1
+    assert "gone" in out
+    assert claude_calls == []
+
+
 def test_plan_keeps_the_base_branch_chosen_at_init(repo, claude_calls):
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "feature-x"], check=True)
     run_main(["init", "--name", NAME, "--project-dir", str(repo), "--base-branch", "develop"])
@@ -69,6 +87,7 @@ def test_replan_keeps_project_settings_and_resets_integration(repo, claude_calls
         check_interval_s=30,
         integration=IntegrationState(branch="integration/proj", status=IntegrationStatus.NEEDS_FIX, pr_url="u"),
     )
+    _write_user_preset("myapp")
     write_brief(repo)
 
     _, _, code = _plan(repo, "--force")

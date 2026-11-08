@@ -90,6 +90,32 @@ def test_run_no_quick_and_max_parallel_override_state(repo, loop_calls):
     assert (state.quick, state.max_parallel, config.max_parallel) == (False, 2, 2)
 
 
+def test_run_effort_flag_overrides_saved_effort(repo, loop_calls):
+    seed_state(repo, effort="high")
+
+    _, _, code = run_main(_inside(repo, "--effort", "low"))
+
+    assert code == 0
+    assert loop_calls[0][0].effort == "low"
+
+
+def test_run_without_effort_flag_keeps_saved_effort(repo, loop_calls):
+    seed_state(repo, effort="high")
+
+    run_main(_inside(repo))
+
+    assert loop_calls[0][0].effort == "high"
+
+
+def test_run_rejects_an_unknown_effort(repo, loop_calls):
+    seed_state(repo)
+
+    _, _, code = run_main(_inside(repo, "--effort", "turbo"))
+
+    assert code != 0
+    assert loop_calls == []
+
+
 def test_run_without_quick_flag_keeps_saved_quick(repo, loop_calls):
     seed_state(repo, quick=True)
 

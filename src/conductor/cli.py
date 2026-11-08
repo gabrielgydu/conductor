@@ -24,6 +24,7 @@ from conductor.core.models import (
     validate_dag,
 )
 from conductor.core.storage import StorageResolver
+from conductor.core.model_catalog import EFFORT_LEVELS, set_effort
 from conductor.core.tmux import forwarded_env, forwarded_vars
 
 
@@ -760,6 +761,17 @@ def _run_completeness_review(
     return feedback
 
 
+def _use_project_effort(level: str | None, preset_name: str | None, repo_path: Path) -> None:
+    """Set the effort of sessions started outside the run loop: *level*, else the preset's."""
+    from conductor.core.presets import load_preset
+
+    try:
+        set_effort(level or load_preset(preset_name, repo_path).config.effort)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+
 def _cmd_plan(args, *, next_steps: bool = True):
     """Generate a plan using Claude."""
     repo_path = Path(args.project_dir or ".").resolve()
@@ -829,6 +841,11 @@ def _cmd_plan(args, *, next_steps: bool = True):
         sys.exit(1)
     prompt = template.replace("{CONTEXT}", context)
 
+    _use_project_effort(
+        getattr(args, "effort", None) or (existing.effort if existing else None),
+        existing.preset if existing else None,
+        repo_path,
+    )
     runs_json, descriptions = _generate_and_review_plan(
         prompt, brief_content, repo_path, run_claude
     )
@@ -1011,6 +1028,8 @@ def _run_overrides(args) -> dict:
         overrides["max_parallel"] = args.max_parallel
     if getattr(args, "worktrees_base", None):
         overrides["worktrees_base"] = str(Path(args.worktrees_base).resolve())
+    if getattr(args, "effort", None):
+        overrides["effort"] = args.effort
     return overrides
 
 
@@ -1025,6 +1044,8 @@ def _run_override_flags(overrides: dict) -> list[str]:
         flags.extend(["--max-parallel", str(overrides["max_parallel"])])
     if "worktrees_base" in overrides:
         flags.extend(["--worktrees-base", overrides["worktrees_base"]])
+    if "effort" in overrides:
+        flags.extend(["--effort", overrides["effort"]])
     return flags
 
 
@@ -1332,6 +1353,7 @@ def _cmd_learnings(args):
 
     from conductor.core.orchestrator import _review_learnings
 
+    _use_project_effort(state.effort, state.preset, storage.repo_root)
     log_path = storage.conductor_log(args.name)
     audit_path = storage.conductor_audit(args.name)
     asyncio.run(_review_learnings(state, storage, log_path, audit_path))
@@ -1351,6 +1373,7 @@ def _cmd_loop(args):
         # Resume existing loop
         from conductor.core.loop import LoopState
         state = LoopState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        state.effort = getattr(args, "effort", None) or state.effort
         print(f"Resuming loop: {state.name} ({sum(1 for t in state.tasks if t.status == 'completed')}/{len(state.tasks)} done)")
     else:
         # Initialize new loop
@@ -1365,6 +1388,7 @@ def _cmd_loop(args):
 
         # Before decomposing, so a broken preset doesn't cost a Claude call
         preset_name = _resolve_preset(getattr(args, "preset", None), repo_path)
+        _use_project_effort(getattr(args, "effort", None), preset_name, repo_path)
 
         # Try parsing as checklist first; if no tasks found, use Claude to decompose
         tasks = parse_checklist(plan_content)
@@ -1387,6 +1411,7 @@ def _cmd_loop(args):
             tasks=tasks,
             created_at=datetime.now(timezone.utc),
             model=getattr(args, "model", None),
+            effort=getattr(args, "effort", None),
         )
 
         # Create worktree if requested
@@ -1438,6 +1463,8 @@ def _cmd_loop(args):
             reexec.append("--no-worktree")
         if state.model:
             reexec.extend(["--model", state.model])
+        if state.effort:
+            reexec.extend(["--effort", state.effort])
 
         _unlock_project(storage, args.name)
         _launch_in_tmux(
@@ -1522,6 +1549,7 @@ def _cmd_manual_test(args):
 
     if state_path.exists() and not getattr(args, "reset", False):
         state = load_manual_state(conductor_dir)
+        state.effort = getattr(args, "effort", None) or state.effort
         done = sum(1 for s in state.scenarios if s.status in {"passed", "failed", "blocked", "policy_violation"})
         print(f"Resuming manual-test: {state.name} ({done}/{len(state.scenarios)} scenarios terminal)")
     else:
@@ -1539,6 +1567,7 @@ def _cmd_manual_test(args):
                 plan_file=plan_path,
                 preset=preset_name,
                 model=getattr(args, "model", None),
+                effort=getattr(args, "effort", None),
                 max_turns=getattr(args, "max_turns", 200),
                 conductor_dir=conductor_dir,
             )
@@ -1564,6 +1593,8 @@ def _cmd_manual_test(args):
             reexec.extend(["--preset", state.preset])
         if state.model:
             reexec.extend(["--model", state.model])
+        if state.effort:
+            reexec.extend(["--effort", state.effort])
         reexec.extend(["--max-turns", str(state.max_turns)])
 
         _unlock_project(storage, args.name)
@@ -1649,6 +1680,7 @@ def _cmd_validate(args):
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
+    set_effort(state.effort or preset.config.effort)
 
     # Determine project directory: the integration worktree while it exists
     # (a merge in progress or interrupted), otherwise the given checkout
@@ -1712,6 +1744,10 @@ def _cmd_validate(args):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
+_EFFORT_HELP = (
+    "Effort of every Claude session in this project (default: the saved setting, "
+    "else the preset's effort, else xhigh)"
+)
 _REINTEGRATE_HELP = (
     "Attempt the integration once more when all runs are finished, even if "
     "it is not due (e.g. after a failure that is not retried automatically)"
@@ -1756,6 +1792,7 @@ def main():
     )
     p_go.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project)")
     p_go.add_argument("--worktrees-base", default=None, help="Base directory for worktrees")
+    p_go.add_argument("--effort", choices=EFFORT_LEVELS, default=None, help=_EFFORT_HELP)
     p_go.add_argument("--reintegrate", action="store_true", help=_REINTEGRATE_HELP)
     p_go.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
@@ -1769,6 +1806,7 @@ def main():
     )
     p_run.add_argument("--max-parallel", type=int, default=None, help="Max parallel runs (default: the saved setting, 1 for a new project; 0=unlimited)")
     p_run.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../worktrees)")
+    p_run.add_argument("--effort", choices=EFFORT_LEVELS, default=None, help=_EFFORT_HELP)
     p_run.add_argument("--reintegrate", action="store_true", help=_REINTEGRATE_HELP)
     p_run.add_argument("--inside-tmux", action="store_true", help=argparse.SUPPRESS)
 
@@ -1798,6 +1836,7 @@ def main():
     p_loop.add_argument("--preset", default=None, help="Preset name (auto-detected if omitted)")
     p_loop.add_argument("--base-branch", default=None, help="Base branch (auto-detected if omitted)")
     p_loop.add_argument("--model", default=None, help="Claude model to use")
+    p_loop.add_argument("--effort", choices=EFFORT_LEVELS, default=None, help=_EFFORT_HELP)
     p_loop.add_argument("--no-worktree", action="store_true", help="Work in project dir instead of creating a worktree")
     p_loop.add_argument("--worktrees-base", default=None, help="Base directory for worktrees (default: from preset or <project>/../<name>-<branch>)")
     p_loop.add_argument("--reset", action="store_true", help="Reset and re-initialize the loop")
@@ -1811,6 +1850,7 @@ def main():
     p_manual_test.add_argument("--plan", required=False, help="Path to manual-test plan markdown file")
     p_manual_test.add_argument("--preset", default=None, help="Preset name (auto-detected if omitted)")
     p_manual_test.add_argument("--model", default=None, help="Claude model to use")
+    p_manual_test.add_argument("--effort", choices=EFFORT_LEVELS, default=None, help=_EFFORT_HELP)
     p_manual_test.add_argument("--max-turns", type=int, default=200, help="Max Claude turns per generation")
     p_manual_test.add_argument("--init-only", action="store_true", help="Initialize state without launching Claude")
     p_manual_test.add_argument("--reset", action="store_true", help="Reset and re-initialize manual-test state")

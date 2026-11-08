@@ -6,6 +6,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from conductor.core.model_catalog import effort_args
+
 _STREAM_FILTER = Path(__file__).resolve().with_name("stream_filter.py")
 
 
@@ -44,7 +46,7 @@ def claude_session_script(
     """
     claude = shlex.join([
         "claude", "-p", "-", "--dangerously-skip-permissions",
-        "--max-turns", str(max_turns), "--model", model,
+        "--max-turns", str(max_turns), "--model", model, *effort_args(),
         "--output-format", "stream-json", "--verbose",
     ])
     stderr = shlex.quote(str(stderr_file)) if stderr_file else "/dev/null"

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 from conductor.core.claude import resolve_model, run_claude
 from conductor.core.launch import claude_session_script
 from conductor.core.logging import live_log
+from conductor.core.model_catalog import set_effort
 from conductor.core.models import atomic_save
 from conductor.core.presets import load_preset
 from conductor.core.storage import StorageResolver
@@ -63,6 +64,7 @@ class LoopState(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     model: Optional[str] = None
+    effort: Optional[str] = None
     max_turns: int = 200
 
 
@@ -550,6 +552,7 @@ async def _loop_main(state: LoopState, project_dir: Path, storage: StorageResolv
     session_dir = storage.conductor_dir(state.name) / "session"
 
     preset = load_preset(state.preset, project_dir)
+    set_effort(state.effort or preset.config.effort)
     tmux = TmuxManager(session_name=f"conductor-loop-{state.name}")
     await tmux.ensure_session()
 

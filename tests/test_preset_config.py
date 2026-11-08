@@ -38,6 +38,7 @@ EXPECTED_FIELDS = {
     "model",
     "fix_model",
     "phase_models",
+    "effort",
     "fixer_ci_poll_interval",
     "fixer_ci_max_wait",
     "fixer_skip_patterns",

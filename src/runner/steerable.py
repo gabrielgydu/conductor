@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Awaitable
 
 from conductor.core.claude import progress_on_event
+from conductor.core.model_catalog import effort_args
 from runner.activity import append_event_to_activity_log
 
 
@@ -84,6 +85,7 @@ class SteerableSession:
         ]
         if model:
             cmd += ["--model", model]
+        cmd += effort_args()
         if append_args:
             cmd.extend(append_args)
 

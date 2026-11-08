@@ -28,6 +28,7 @@ from conductor.core.enums import (
 )
 from conductor.core.lock import acquire_project_lock, release_project_lock
 from conductor.core.logging import live_log
+from conductor.core.model_catalog import set_effort
 from conductor.core.models import (
     ConductorState,
     IntegrationState,
@@ -4176,6 +4177,9 @@ async def _conductor_run_loop(
     # Apply worktrees_base from preset if not set from CLI
     if not state.worktrees_base and preset and preset.config.worktrees_base:
         state.worktrees_base = preset.config.worktrees_base
+
+    # Before ensure_session, which hands the level on to the tmux windows.
+    set_effort(state.effort or preset.config.effort)
 
     tmux = _tmux_module.TmuxManager(session_name=f"conductor-{state.project_name}")
     await tmux.ensure_session()

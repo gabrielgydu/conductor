@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from conductor.core.claude import resolve_model
 from conductor.core.launch import stream_filter_pipe
 from conductor.core.logging import live_log
+from conductor.core.model_catalog import effort_args, set_effort
 from conductor.core.models import atomic_save
 from conductor.core.presets import ManualTestPolicy, load_preset
 from conductor.core.storage import StorageResolver
@@ -195,6 +196,7 @@ class ManualTestState(BaseModel):
     current_scenario_index: int = 0
     session_count: int = 0
     model: str | None = None
+    effort: str | None = None
     max_turns: int = 200
     scenarios: list[ManualScenario] = Field(default_factory=list)
     findings: list[ManualFinding] = Field(default_factory=list)
@@ -529,6 +531,7 @@ def initialize_manual_state(
     plan_file: Path,
     preset: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     max_turns: int = 200,
     conductor_dir: Path,
 ) -> ManualTestState:
@@ -548,6 +551,7 @@ def initialize_manual_state(
         plan_file=str(plan_path),
         preset=preset,
         model=model,
+        effort=effort,
         max_turns=max_turns,
         scenarios=scenarios,
         created_at=now,
@@ -2261,7 +2265,7 @@ async def _run_generation(
     quoted_stderr = shlex.quote(str(stderr_file))
     pipeline = (
         f"claude -p - --dangerously-skip-permissions "
-        f"--max-turns {state.max_turns} --model {shlex.quote(model)} "
+        f"--max-turns {state.max_turns} --model {shlex.quote(model)} {shlex.join(effort_args())} "
         f"--output-format stream-json --verbose < {quoted_prompt} 2> {quoted_stderr} "
         f"| {stream_filter_pipe(output_file)}; "
         f"echo ${{PIPESTATUS[0]}} > {quoted_exit}"
@@ -2818,6 +2822,7 @@ async def _manual_main(
     preset = load_preset(state.preset, project_dir)
     policy = preset.manual_test
     model = resolve_model(state.model or preset.config.model or "opus")
+    set_effort(state.effort or preset.config.effort)
     tmux = TmuxManager(session_name=f"conductor-manual-test-{state.name}")
     await tmux.ensure_session()
 

@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import AsyncIterator, Callable
 
 # Re-exported: callers resolve aliases through conductor.core.claude.
+from conductor.core.model_catalog import effort_args
 from conductor.core.model_catalog import resolve_model as resolve_model  # noqa: PLC0414
 from conductor.core.stats import (
     result_cost_usd,
@@ -360,6 +361,7 @@ async def run_claude(
     ]
     if model:
         cmd += ["--model", model]
+    cmd += effort_args()
     if append_args:
         cmd.extend(append_args)
 
@@ -566,6 +568,7 @@ async def run_claude_steerable(
     ]
     if model:
         cmd += ["--model", model]
+    cmd += effort_args()
     if append_args:
         cmd.extend(append_args)
 

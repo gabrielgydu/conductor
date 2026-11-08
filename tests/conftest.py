@@ -13,6 +13,7 @@ from conductor.core.models import (
     ConflictRecord,
     E2ETestState,
 )
+from conductor.core.model_catalog import DEFAULT_EFFORT, EFFORT_ENV
 from conductor.core.storage import CONDUCTOR_HOME_ENV
 from conductor.core.presets import PRESETS_DIR_ENV
 
@@ -80,6 +81,8 @@ def _isolate_conductor_home(monkeypatch, tmp_path_factory):
     """Keep StorageResolver and user-preset discovery off the real ~/.conductor."""
     monkeypatch.setenv(CONDUCTOR_HOME_ENV, str(tmp_path_factory.mktemp("conductor-home")))
     monkeypatch.delenv(PRESETS_DIR_ENV, raising=False)
+    # Set, not deleted: teardown then removes what set_effort writes to os.environ.
+    monkeypatch.setenv(EFFORT_ENV, DEFAULT_EFFORT)
 
 
 @pytest.fixture(autouse=True)

@@ -198,6 +198,7 @@ class ConductorState(BaseModel):
     quick: bool = False
     max_parallel: int = 1
     worktrees_base: Optional[str] = None
+    effort: Optional[str] = None
     # sha256 of the LEARNINGS.md set last reviewed, so an unchanged set is
     # not reviewed (and appended to CLAUDE.md) again on every loop exit.
     learnings_reviewed: Optional[str] = None
