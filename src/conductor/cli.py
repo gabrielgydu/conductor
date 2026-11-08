@@ -24,7 +24,7 @@ from conductor.core.models import (
     validate_dag,
 )
 from conductor.core.storage import StorageResolver
-from conductor.core.model_catalog import EFFORT_LEVELS, set_effort
+from conductor.core.model_catalog import EFFORT_LEVELS, resolve_model, set_effort
 from conductor.core.tmux import forwarded_env, forwarded_vars
 
 
@@ -604,7 +604,7 @@ def _generate_plan_once(prompt: str, repo_path: Path, run_claude) -> tuple[list,
     result = asyncio.run(
         run_claude(
             prompt,
-            model="claude-opus-4-8",
+            model=resolve_model("opus-200k"),
             max_turns=10,
             cwd=str(repo_path),
             on_event=_plan_progress_callback,
@@ -695,7 +695,7 @@ def _run_completeness_review(
     result = asyncio.run(
         run_claude(
             review_prompt,
-            model="claude-sonnet-4-6",
+            model=resolve_model("sonnet"),
             max_turns=1,
             cwd=str(repo_path),
         )

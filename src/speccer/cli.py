@@ -768,6 +768,7 @@ async def _cmd_run_async(
 ) -> None:
     """Async implementation of the run subcommand."""
     from conductor.core.claude import run_claude  # type: ignore[import]
+    from conductor.core.model_catalog import resolve_model  # type: ignore[import]
 
     if not spec_dir.is_dir():
         _die(f"Spec directory not found: {spec_dir}. Run 'init' first.")
@@ -844,7 +845,7 @@ async def _cmd_run_async(
 
     result = await run_claude(
         prompt,
-        model="claude-opus-4-8",
+        model=resolve_model("opus-200k"),
         max_turns=200,
         append_args=_SESSION_ARGS,
         cwd=str(spec_dir),
@@ -925,6 +926,7 @@ def cmd_run(spec_dir: Path, cont: bool) -> None:
 async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
     """Async implementation of the generate subcommand."""
     from conductor.core.claude import run_claude  # type: ignore[import]
+    from conductor.core.model_catalog import resolve_model  # type: ignore[import]
 
     if not spec_dir.is_dir():
         _die(f"Spec directory not found: {spec_dir}")
@@ -966,7 +968,7 @@ async def _cmd_generate_async(spec_dir: Path, split_prs: bool) -> None:
 
     result = await run_claude(
         prompt,
-        model="claude-opus-4-8",
+        model=resolve_model("opus-200k"),
         max_turns=200,
         append_args=_SESSION_ARGS,
         cwd=str(docs_dir),

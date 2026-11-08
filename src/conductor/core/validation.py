@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from conductor.core.claude import run_claude
+from conductor.core.model_catalog import resolve_model
 from conductor.core.presets import CommandSpec, Preset, ValidationSettings, load_preset
 
 if TYPE_CHECKING:
@@ -519,7 +520,7 @@ async def validate_and_fix(
         try:
             await run_claude(
                 prompt,
-                model="claude-opus-4-8[1m]",
+                model=resolve_model("opus"),
                 max_turns=30,
                 cwd=str(ctx.project_dir),
             )

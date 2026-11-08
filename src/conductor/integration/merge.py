@@ -13,6 +13,7 @@ from pathlib import Path
 
 from conductor.core.claude import run_claude
 from conductor.core.enums import IntegrationFailure, IntegrationStatus, RunStatus
+from conductor.core.model_catalog import resolve_model
 from conductor.core.models import (
     ConductorState,
     ConflictRecord,
@@ -380,7 +381,7 @@ async def resolve_conflicts_with_claude(
 
         result = await run_claude(
             prompt,
-            model="claude-sonnet-4-6",
+            model=resolve_model("sonnet"),
             max_turns=50,
             cwd=str(cwd),
         )

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from conductor.core.claude import run_claude
+from conductor.core.model_catalog import resolve_model
 from conductor.core.models import ConductorState, ConflictRecord, E2ETestState, RunState
 from conductor.core.smoke_test import playwright_unavailable
 
@@ -129,7 +130,7 @@ async def generate_integration_tests(
     try:
         await run_claude(
             prompt,
-            model="claude-opus-4-8[1m]",
+            model=resolve_model("opus"),
             max_turns=50,
             cwd=str(worktree_path),
         )
